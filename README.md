@@ -77,8 +77,9 @@ El workflow ya fija `platforms: linux/amd64`; el Dockerfile deja que Buildx apli
 | Segundo build en GitHub Actions | `FAIL` — [run #2](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36602803603): instalación Jupyter completada; el verificador falló porque esperaba PyTorch 2.4.0 y la base contiene `2.4.1+cu124`. `jupyter_server extension enable` también informó que no encontraba el módulo, aunque su comando devolvió éxito. |
 | Tercer build en GitHub Actions | `FAIL` — [run #3](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36608666952): falló el verificador al acceder a `jupyter_server.ServerApp`; esa clase está en `jupyter_server.serverapp`. La instalación de pip sí terminó. |
 | Cuarto build en GitHub Actions | `FAIL` — [run #4](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36609873658): el listado muestra `jupyter_server_terminals enabled` y validación `OK`, pero el verificador no reconoce la línea como habilitada; se normaliza la salida ANSI y se validan sus tokens. |
+| Quinto build en GitHub Actions | `FAIL` — [run #5](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36611124163): el contenedor pasó healthcheck IPv6, pero la primera petición del smoke test desde el runner a `127.0.0.1` terminó en `ConnectionResetError`; ahora la prueba HTTP corre dentro del contenedor por `[::1]:8888`. |
 | Reintento con esta corrección | `GITHUB_ACTIONS_RETEST = UNRUN` — awaiting user push/re-run. |
-| Validaciones estáticas tras la corrección del run #4 | `PASS` — sintaxis Bash y Python embebido, parseo YAML, `git diff --check`, paths, versiones, invariantes de runtime, orden build/smoke/login/push y escaneo de secretos del worktree. |
+| Validaciones estáticas tras la corrección del run #5 | `PASS` — sintaxis Bash y Python embebido, parseo YAML, `git diff --check`, paths, versiones, invariantes de runtime, orden build/smoke/login/push y escaneo de secretos del worktree. |
 | Publicación Docker Hub | `DOCKERHUB_PUBLICATION = UNRUN` |
 | Despliegue real en Salad | `SALAD_REAL_DEPLOYMENT = UNRUN` |
 | Prueba real con GPU / entrenamiento | `GPU_RUNTIME_TEST = UNRUN` |

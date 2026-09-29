@@ -29,15 +29,8 @@ JUPYTER_PASSWORD="$smoke_password" docker run \
   --detach \
   --rm \
   --name "$container_name" \
-  --publish 127.0.0.1::8888 \
   --env JUPYTER_PASSWORD \
   "$image" >/dev/null
-
-host_port="$(docker port "$container_name" 8888/tcp | awk -F: 'NR == 1 {print $NF}')"
-if [[ -z "$host_port" ]]; then
-  printf '%s\n' 'Could not resolve the temporary host port for Jupyter.' >&2
-  exit 1
-fi
 
 health_status='starting'
 for _ in $(seq 1 45); do
@@ -58,9 +51,12 @@ fi
 
 docker exec "$container_name" sh -c 'touch /workspace/ci-smoke-root-marker.txt'
 
-JUPYTER_SMOKE_BASE_URL="http://127.0.0.1:${host_port}" \
+# Exercise the same IPv6 listener used by Salad, without an IPv4 host-port mapping.
 CI_JUPYTER_TEST_PASSWORD="$smoke_password" \
-python3 - <<'PY'
+docker exec --interactive \
+  --env CI_JUPYTER_TEST_PASSWORD \
+  "$container_name" \
+  python3 - <<'PY'
 import http.cookiejar
 import json
 import os
@@ -74,7 +70,7 @@ from urllib.request import (
     build_opener,
 )
 
-base_url = os.environ["JUPYTER_SMOKE_BASE_URL"]
+base_url = "http://[::1]:8888"
 password = os.environ["CI_JUPYTER_TEST_PASSWORD"]
 
 
@@ -138,7 +134,7 @@ with authenticated.open(base_url + "/api/contents", timeout=10) as response:
 names = {entry.get("name") for entry in contents.get("content", [])}
 assert "ci-smoke-root-marker.txt" in names, "Authenticated contents root is not /workspace"
 
-print("Container smoke test: IPv6 health, password gate, login, and /workspace root passed")
+print("Container smoke test: IPv6 loopback, password gate, login, and /workspace root passed")
 PY
 
 docker logs "$container_name" >"$container_logs" 2>&1
