@@ -88,15 +88,18 @@ result = subprocess.run(
     text=True,
     check=False,
 )
-print(result.stdout, end="")
+output = re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", result.stdout).replace("\r", "")
+print(output, end="")
 if result.returncode != 0:
     raise SystemExit(f"jupyter server extension list exited with {result.returncode}")
-if "Validation failed" in result.stdout:
+if "Validation failed" in output:
     raise SystemExit("Jupyter Server reported an extension validation failure")
-if not re.search(r"(?m)^\s*jupyter_server_terminals\s+enabled\s*$", result.stdout):
+lines = [line.split() for line in output.splitlines()]
+if not any(line[:2] == ["jupyter_server_terminals", "enabled"] for line in lines):
     raise SystemExit("jupyter_server_terminals was not discovered as enabled")
-if not re.search(
-    r"(?m)^\s*jupyter_server_terminals(?:\s+\S+)?\s+OK\s*$", result.stdout
+if not any(
+    line and line[0] == "jupyter_server_terminals" and line[-1] == "OK"
+    for line in lines
 ):
     raise SystemExit("Jupyter Server did not validate jupyter_server_terminals as OK")
 print("Jupyter Server discovered and validated jupyter_server_terminals: OK")
