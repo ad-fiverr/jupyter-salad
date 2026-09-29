@@ -16,7 +16,8 @@ COPY requirements-jupyter.txt /tmp/requirements-jupyter.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check \
       -r /tmp/requirements-jupyter.txt
 
-RUN jupyter server extension enable --py jupyter_server_terminals --sys-prefix
+# jupyter_server_terminals 0.5.4 ships its auto-enable Jupyter config fragment.
+# verify-runtime checks the installed fragment and Jupyter Server discovery.
 
 COPY salad-jupyter-entrypoint.sh /usr/local/bin/salad-jupyter-entrypoint
 COPY verify-runtime.sh /usr/local/bin/salad-jupyter-verify-runtime

@@ -104,9 +104,9 @@ jobs:
         run: |
           set -euo pipefail
           image="myblockchaincompany/jupyter-salad"
-          docker tag "${image}:ci" "${image}:2.4.0-py3.11-cuda12.4.1"
+          docker tag "${image}:ci" "${image}:2.4.1-py3.11-cuda12.4.1"
           docker tag "${image}:ci" "${image}:latest"
           docker tag "${image}:ci" "${image}:sha-${SHORT_SHA}"
-          docker push "${image}:2.4.0-py3.11-cuda12.4.1"
+          docker push "${image}:2.4.1-py3.11-cuda12.4.1"
           docker push "${image}:latest"
           docker push "${image}:sha-${SHORT_SHA}"

@@ -9,7 +9,7 @@ Imagen independiente de JupyterLab para Salad Container Engine, basada en la ima
 | Imagen base | `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` |
 | Digest base | `sha256:61a4aafb0094cd773f11eefa378929d5a687bd775febeb78eac62fc824141fb5` (`linux/amd64`) |
 | Python | 3.11 |
-| PyTorch | 2.4.0 |
+| PyTorch | 2.4.1+cu124 (contenido observado en el digest fijado) |
 | CUDA runtime / toolkit | 12.4 / 12.4.1 |
 | JupyterLab | 4.6.4 |
 | Notebook | 7.6.3 |
@@ -19,6 +19,10 @@ Imagen independiente de JupyterLab para Salad Container Engine, basada en la ima
 | IPython kernel | 7.3.0 |
 
 El digest de la imagen base está fijado. Los paquetes Jupyter directos tienen versiones fijadas en `requirements-jupyter.txt`; sus dependencias transitivas se resuelven durante el build, por lo que esto no afirma reproducibilidad bit a bit. PyTorch, Python y CUDA se heredan de la imagen base.
+
+El tag de RunPod conserva `2.4.0` en su nombre, pero el runtime que contiene el digest fijado informa `torch.__version__ == 2.4.1+cu124`. El verificador exige la versión base `2.4.1` (ignorando el sufijo local `+cu124`) y CUDA de PyTorch `12.4.x`; no instala ni degrada PyTorch durante el build. La etiqueta publicada de esta imagen refleja el runtime observado: `2.4.1-py3.11-cuda12.4.1`.
+
+`jupyter_server_terminals==0.5.4` incluye un fragmento de configuración que habilita la extensión automáticamente. El Dockerfile no ejecuta `jupyter server extension enable --py`; el verificador comprueba que el fragmento instalado la habilita y que `jupyter server extension list` la descubre y valida como `OK`.
 
 Se conserva el `ENTRYPOINT` de NVIDIA heredado de la imagen base. El Dockerfile reemplaza únicamente `CMD` para iniciar JupyterLab y omitir `/start.sh` de RunPod mientras mantiene la inicialización del runtime NVIDIA.
 
@@ -56,7 +60,7 @@ Configura estos GitHub Actions Secrets en el repositorio:
 
 El workflow publica estos tags desde la misma imagen que pasó el smoke test:
 
-- `myblockchaincompany/jupyter-salad:2.4.0-py3.11-cuda12.4.1`
+- `myblockchaincompany/jupyter-salad:2.4.1-py3.11-cuda12.4.1`
 - `myblockchaincompany/jupyter-salad:latest`
 - `myblockchaincompany/jupyter-salad:sha-<short-commit>`
 
@@ -70,7 +74,9 @@ El workflow ya fija `platforms: linux/amd64`; el Dockerfile deja que Buildx apli
 | --- | --- |
 | Build Docker local | `LOCAL_DOCKER_BUILD = UNRUN` — Build intentionally delegated to GitHub Actions per user instruction. |
 | Primer build en GitHub Actions | `FAIL` — [run #1](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36597467763): `notebook==7.6.3` requiere `jupyterlab>=4.6.4,<4.7`; estaba fijado `jupyterlab==4.6.3`. |
-| Reintento después de la corrección | `GITHUB_ACTIONS_RETEST = UNRUN` — awaiting user push/re-run. |
+| Segundo build en GitHub Actions | `FAIL` — [run #2](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36602803603): instalación Jupyter completada; el verificador falló porque esperaba PyTorch 2.4.0 y la base contiene `2.4.1+cu124`. `jupyter_server extension enable` también informó que no encontraba el módulo, aunque su comando devolvió éxito. |
+| Reintento con esta corrección | `GITHUB_ACTIONS_RETEST = UNRUN` — awaiting user push/re-run. |
+| Validaciones estáticas de esta corrección | `PASS` — sintaxis Bash y Python embebido, parseo YAML, `git diff --check`, paths, versiones, invariantes de runtime, orden build/smoke/login/push y escaneo de secretos del worktree. |
 | Publicación Docker Hub | `DOCKERHUB_PUBLICATION = UNRUN` |
 | Despliegue real en Salad | `SALAD_REAL_DEPLOYMENT = UNRUN` |
 | Prueba real con GPU / entrenamiento | `GPU_RUNTIME_TEST = UNRUN` |
@@ -84,4 +90,7 @@ El workflow ya fija `platforms: linux/amd64`; el Dockerfile deja que Buildx apli
 - [Health probes de Salad](https://docs.salad.com/container-engine/explanation/infrastructure-platform/health-probes)
 - [Seguridad de Jupyter Server](https://jupyter-server.readthedocs.io/en/latest/operators/security.html)
 - [Configuración de Jupyter Server](https://jupyter-server.readthedocs.io/en/stable/other/full-config.html)
+- [Cómo Jupyter Server descubre y valida extensiones](https://jupyter-server.readthedocs.io/en/stable/operators/multiple-extensions.html)
+- [jupyter_server_terminals 0.5.4 en PyPI](https://pypi.org/project/jupyter-server-terminals/0.5.4/)
+- [Configuración auto-enable incluida en la etiqueta 0.5.4](https://github.com/jupyter-server/jupyter_server_terminals/blob/v0.5.4/jupyter-config/jupyter_server_terminals.json)
 - [PyTorch 2.7 y soporte para Blackwell](https://pytorch.org/blog/pytorch-2-7/)

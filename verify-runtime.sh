@@ -3,8 +3,10 @@ set -euo pipefail
 
 python - <<'PY'
 import importlib.metadata
+import json
 import platform
 import sys
+from pathlib import Path
 
 import ipykernel
 import ipywidgets
@@ -26,7 +28,7 @@ expected = {
 }
 
 assert sys.version_info[:2] == (3, 11), f"Expected Python 3.11, got {platform.python_version()}"
-assert torch.__version__.split("+", 1)[0] == "2.4.0", f"Unexpected PyTorch {torch.__version__}"
+assert torch.__version__.split("+", 1)[0] == "2.4.1", f"Unexpected PyTorch {torch.__version__}"
 assert torch.version.cuda and torch.version.cuda.startswith("12.4"), (
     f"Expected PyTorch CUDA 12.4 runtime, got {torch.version.cuda!r}"
 )
@@ -43,6 +45,25 @@ assert jupyter_server_terminals.__name__ == "jupyter_server_terminals"
 assert jupyterlab_widgets.__name__ == "jupyterlab_widgets"
 assert ipykernel.__version__ == expected["ipykernel"]
 
+terminals_distribution = importlib.metadata.distribution("jupyter_server_terminals")
+terminals_config_files = [
+    Path(terminals_distribution.locate_file(file)).resolve()
+    for file in terminals_distribution.files or ()
+    if file.name == "jupyter_server_terminals.json"
+    and "jupyter_server_config.d" in Path(str(file)).parts
+]
+assert len(terminals_config_files) == 1, (
+    "Expected jupyter_server_terminals to install one Jupyter server config fragment; "
+    f"found {terminals_config_files}"
+)
+terminals_config = json.loads(terminals_config_files[0].read_text(encoding="utf-8"))
+assert (
+    terminals_config.get("ServerApp", {})
+    .get("jpserver_extensions", {})
+    .get("jupyter_server_terminals")
+    is True
+), f"Jupyter auto-enable config is invalid: {terminals_config_files[0]}"
+
 print(f"Python: {platform.python_version()}")
 print(f"PyTorch: {torch.__version__}")
 print(f"PyTorch CUDA runtime: {torch.version.cuda}")
@@ -56,5 +77,27 @@ else:
     print("GPU_RUNTIME_TEST=UNRUN (validate CUDA execution on a Salad GPU)")
 PY
 
-jupyter server extension list 2>&1 | grep -Eq 'jupyter_server_terminals.*enabled'
-printf '%s\n' 'Jupyter server terminal extension: enabled'
+python - <<'PY'
+import re
+import subprocess
+
+result = subprocess.run(
+    ["jupyter", "server", "extension", "list"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    check=False,
+)
+print(result.stdout, end="")
+if result.returncode != 0:
+    raise SystemExit(f"jupyter server extension list exited with {result.returncode}")
+if "Validation failed" in result.stdout:
+    raise SystemExit("Jupyter Server reported an extension validation failure")
+if not re.search(r"(?m)^\s*jupyter_server_terminals\s+enabled\s*$", result.stdout):
+    raise SystemExit("jupyter_server_terminals was not discovered as enabled")
+if not re.search(
+    r"(?m)^\s*jupyter_server_terminals(?:\s+\S+)?\s+OK\s*$", result.stdout
+):
+    raise SystemExit("Jupyter Server did not validate jupyter_server_terminals as OK")
+print("Jupyter Server discovered and validated jupyter_server_terminals: OK")
+PY
