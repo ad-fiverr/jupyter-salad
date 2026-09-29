@@ -1,0 +1,112 @@
+name: Build and publish Jupyter Salad image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'requirements-jupyter.txt'
+      - 'salad-jupyter-entrypoint.sh'
+      - 'verify-runtime.sh'
+      - 'ci-smoke-test.sh'
+      - '.dockerignore'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Reclaim and preflight GitHub runner disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          for path in \
+            /usr/local/lib/android/sdk \
+            /usr/share/dotnet \
+            /usr/local/share/boost \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift; do
+            if [[ -e "$path" ]]; then
+              sudo du -sh "$path"
+              sudo rm -rf -- "$path"
+            fi
+          done
+          sudo docker system prune --all --force
+          df -h /
+          available_kib="$(df -Pk / | awk 'NR == 2 {print $4}')"
+          available_gib="$((available_kib / 1024 / 1024))"
+          if (( available_gib < 20 )); then
+            printf 'Need at least 20 GiB free after cleanup; runner has %s GiB.\n' "$available_gib" >&2
+            exit 1
+          fi
+
+      - name: Check YAML and shell syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -e 'require "yaml"; YAML.parse_file(".github/workflows/build.yml")'
+          bash -n \
+            salad-jupyter-entrypoint.sh \
+            verify-runtime.sh \
+            ci-smoke-test.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build linux/amd64 image for runner smoke tests
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          tags: myblockchaincompany/jupyter-salad:ci
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Free Buildx cache before container smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx prune --all --force
+          df -h /
+
+      - name: Test built image before publication
+        shell: bash
+        run: bash ci-smoke-test.sh myblockchaincompany/jupyter-salad:ci
+
+      - name: Log in to Docker Hub after validation
+        uses: docker/login-action@v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get short commit SHA
+        id: short-sha
+        shell: bash
+        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and publish the tested image
+        shell: bash
+        env:
+          SHORT_SHA: ${{ steps.short-sha.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          image="myblockchaincompany/jupyter-salad"
+          docker tag "${image}:ci" "${image}:2.4.0-py3.11-cuda12.4.1"
+          docker tag "${image}:ci" "${image}:latest"
+          docker tag "${image}:ci" "${image}:sha-${SHORT_SHA}"
+          docker push "${image}:2.4.0-py3.11-cuda12.4.1"
+          docker push "${image}:latest"
+          docker push "${image}:sha-${SHORT_SHA}"
