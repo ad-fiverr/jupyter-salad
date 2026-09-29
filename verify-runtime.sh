@@ -10,12 +10,12 @@ from pathlib import Path
 
 import ipykernel
 import ipywidgets
-import jupyter_server
 import jupyter_server_terminals
 import jupyterlab
 import jupyterlab_widgets
 import notebook
 import torch
+from jupyter_server.serverapp import ServerApp
 
 expected = {
     "jupyterlab": "4.6.4",
@@ -38,7 +38,7 @@ for package, wanted in expected.items():
     assert actual == wanted, f"Expected {package}=={wanted}, got {actual}"
 
 assert ipywidgets.IntSlider is not None
-assert jupyter_server.ServerApp is not None
+assert ServerApp is not None
 assert jupyterlab.__version__ == expected["jupyterlab"]
 assert notebook.__version__ == expected["notebook"]
 assert jupyter_server_terminals.__name__ == "jupyter_server_terminals"

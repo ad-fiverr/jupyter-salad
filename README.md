@@ -75,8 +75,9 @@ El workflow ya fija `platforms: linux/amd64`; el Dockerfile deja que Buildx apli
 | Build Docker local | `LOCAL_DOCKER_BUILD = UNRUN` — Build intentionally delegated to GitHub Actions per user instruction. |
 | Primer build en GitHub Actions | `FAIL` — [run #1](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36597467763): `notebook==7.6.3` requiere `jupyterlab>=4.6.4,<4.7`; estaba fijado `jupyterlab==4.6.3`. |
 | Segundo build en GitHub Actions | `FAIL` — [run #2](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36602803603): instalación Jupyter completada; el verificador falló porque esperaba PyTorch 2.4.0 y la base contiene `2.4.1+cu124`. `jupyter_server extension enable` también informó que no encontraba el módulo, aunque su comando devolvió éxito. |
+| Tercer build en GitHub Actions | `FAIL` — [run #3](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36608666952): falló el verificador al acceder a `jupyter_server.ServerApp`; esa clase está en `jupyter_server.serverapp`. La instalación de pip sí terminó. |
 | Reintento con esta corrección | `GITHUB_ACTIONS_RETEST = UNRUN` — awaiting user push/re-run. |
-| Validaciones estáticas de esta corrección | `PASS` — sintaxis Bash y Python embebido, parseo YAML, `git diff --check`, paths, versiones, invariantes de runtime, orden build/smoke/login/push y escaneo de secretos del worktree. |
+| Validaciones estáticas tras la corrección del run #3 | `PASS` — sintaxis Bash y Python embebido, parseo YAML, `git diff --check`, paths, versiones, invariantes de runtime, orden build/smoke/login/push y escaneo de secretos del worktree. |
 | Publicación Docker Hub | `DOCKERHUB_PUBLICATION = UNRUN` |
 | Despliegue real en Salad | `SALAD_REAL_DEPLOYMENT = UNRUN` |
 | Prueba real con GPU / entrenamiento | `GPU_RUNTIME_TEST = UNRUN` |
