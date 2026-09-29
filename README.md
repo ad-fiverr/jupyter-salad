@@ -11,7 +11,7 @@ Imagen independiente de JupyterLab para Salad Container Engine, basada en la ima
 | Python | 3.11 |
 | PyTorch | 2.4.0 |
 | CUDA runtime / toolkit | 12.4 / 12.4.1 |
-| JupyterLab | 4.6.3 |
+| JupyterLab | 4.6.4 |
 | Notebook | 7.6.3 |
 | Jupyter Server | 2.21.1 |
 | ipywidgets / JupyterLab widgets | 8.1.9 / 3.0.17 |
@@ -62,12 +62,15 @@ El workflow publica estos tags desde la misma imagen que pasó el smoke test:
 
 El runner libera espacio y exige al menos 20 GiB disponibles antes del build; la imagen base ocupa aproximadamente 6.92 GB comprimida. No se necesita `HF_TOKEN` ni una credencial de Salad para construir y publicar esta imagen.
 
+El workflow ya fija `platforms: linux/amd64`; el Dockerfile deja que Buildx aplique esa plataforma a `FROM`, evitando un `--platform` constante redundante.
+
 ## Estado de validación
 
 | Validación | Estado |
 | --- | --- |
 | Build Docker local | `LOCAL_DOCKER_BUILD = UNRUN` — Build intentionally delegated to GitHub Actions per user instruction. |
-| GitHub Actions build y smoke test | `GITHUB_ACTIONS_BUILD = UNRUN` hasta ejecutar el workflow en GitHub |
+| Primer build en GitHub Actions | `FAIL` — [run #1](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36597467763): `notebook==7.6.3` requiere `jupyterlab>=4.6.4,<4.7`; estaba fijado `jupyterlab==4.6.3`. |
+| Reintento después de la corrección | `GITHUB_ACTIONS_RETEST = UNRUN` — awaiting user push/re-run. |
 | Publicación Docker Hub | `DOCKERHUB_PUBLICATION = UNRUN` |
 | Despliegue real en Salad | `SALAD_REAL_DEPLOYMENT = UNRUN` |
 | Prueba real con GPU / entrenamiento | `GPU_RUNTIME_TEST = UNRUN` |

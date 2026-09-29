@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # Pinned to the exact RunPod PyTorch 2.4 / Python 3.11 / CUDA 12.4.1 image.
-FROM --platform=linux/amd64 runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04@sha256:61a4aafb0094cd773f11eefa378929d5a687bd775febeb78eac62fc824141fb5
+# GitHub Actions selects linux/amd64 through Buildx; keep FROM platform selection implicit.
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04@sha256:61a4aafb0094cd773f11eefa378929d5a687bd775febeb78eac62fc824141fb5
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -13,8 +14,9 @@ WORKDIR /workspace
 
 COPY requirements-jupyter.txt /tmp/requirements-jupyter.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check \
-      -r /tmp/requirements-jupyter.txt \
-    && jupyter server extension enable --py jupyter_server_terminals --sys-prefix
+      -r /tmp/requirements-jupyter.txt
+
+RUN jupyter server extension enable --py jupyter_server_terminals --sys-prefix
 
 COPY salad-jupyter-entrypoint.sh /usr/local/bin/salad-jupyter-entrypoint
 COPY verify-runtime.sh /usr/local/bin/salad-jupyter-verify-runtime

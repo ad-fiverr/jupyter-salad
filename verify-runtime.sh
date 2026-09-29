@@ -16,7 +16,7 @@ import notebook
 import torch
 
 expected = {
-    "jupyterlab": "4.6.3",
+    "jupyterlab": "4.6.4",
     "notebook": "7.6.3",
     "jupyter_server": "2.21.1",
     "ipywidgets": "8.1.9",
