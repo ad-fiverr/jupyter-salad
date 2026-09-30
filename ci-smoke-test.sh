@@ -16,6 +16,38 @@ cleanup() {
 }
 trap cleanup EXIT
 
+redact_diagnostics() {
+  sed -E \
+    -e "s|${smoke_password}|[REDACTED_JUPYTER_PASSWORD]|g" \
+    -e "s|${smoke_asr_token}|[REDACTED_ASR_TOKEN]|g" \
+    -e 's/((PASSWORD|PASSWD|TOKEN|SECRET|API[_-]?KEY)=)[^[:space:]]+/\1[REDACTED]/Ig' \
+    -e 's/([?&]([^=&]*(token|password|secret|api[_-]?key))=)[^&[:space:]]+/\1[REDACTED]/Ig' \
+    -e 's/(Authorization:[[:space:]]*Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+    -e 's/(hf_|ghp_|github_pat_)[A-Za-z0-9_-]{16,}/[REDACTED_TOKEN]/g'
+}
+
+capture_failure_diagnostics() {
+  local state
+  printf '%s\n' '--- Container diagnostics (secret fields are redacted) ---' >&2
+  if ! docker inspect "$container_name" >/dev/null 2>&1; then
+    printf '%s\n' 'Container is no longer inspectable.' >&2
+    return
+  fi
+
+  printf '%s\n' '[docker inspect state]' >&2
+  docker inspect --format '{{json .State}}' "$container_name" 2>&1 | redact_diagnostics >&2 || true
+  printf '%s\n' '[docker inspect health]' >&2
+  docker inspect --format '{{json .State.Health}}' "$container_name" 2>&1 | redact_diagnostics >&2 || true
+  printf '%s\n' '[docker logs]' >&2
+  docker logs --timestamps "$container_name" 2>&1 | redact_diagnostics >&2 || true
+
+  state="$(docker inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null || true)"
+  if [[ "$state" == 'running' ]]; then
+    printf '%s\n' '[active processes]' >&2
+    docker top "$container_name" 2>&1 | redact_diagnostics >&2 || true
+  fi
+}
+
 if timeout 30s docker run --rm "$image" >"$missing_password_log" 2>&1; then
   printf '%s\n' 'Image unexpectedly started without JUPYTER_PASSWORD.' >&2
   exit 1
@@ -33,7 +65,6 @@ ASR_BACKEND=parakeet \
 ASR_API_TOKEN="$smoke_asr_token" \
 docker run \
   --detach \
-  --rm \
   --name "$container_name" \
   --env JUPYTER_PASSWORD \
   --env CI \
@@ -44,17 +75,26 @@ docker run \
 
 health_status='starting'
 for _ in $(seq 1 45); do
+  container_state="$(docker inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null || true)"
+  if [[ "$container_state" != 'running' ]]; then
+    capture_failure_diagnostics
+    printf 'Container exited before becoming healthy (state: %s).\n' "${container_state:-unavailable}" >&2
+    exit 1
+  fi
+
   health_status="$(docker inspect --format '{{.State.Health.Status}}' "$container_name" 2>/dev/null || true)"
   if [[ "$health_status" == 'healthy' ]]; then
     break
   fi
-  if [[ "$health_status" == 'unhealthy' ]] || ! docker inspect "$container_name" >/dev/null 2>&1; then
+  if [[ "$health_status" == 'unhealthy' ]]; then
+    capture_failure_diagnostics
     printf 'Jupyter did not become healthy (state: %s).\n' "$health_status" >&2
     exit 1
   fi
   sleep 2
 done
 if [[ "$health_status" != 'healthy' ]]; then
+  capture_failure_diagnostics
   printf 'Timed out waiting for the IPv6 /login healthcheck (state: %s).\n' "$health_status" >&2
   exit 1
 fi

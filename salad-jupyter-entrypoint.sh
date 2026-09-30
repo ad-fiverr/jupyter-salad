@@ -51,7 +51,19 @@ path.chmod(0o600)
 PY
 
 unset JUPYTER_PASSWORD
-/usr/local/bin/salad-jupyter-verify-runtime
+case "${SALAD_FULL_RUNTIME_VERIFY:-0}" in
+  0)
+    /usr/local/bin/salad-jupyter-verify-runtime startup
+    ;;
+  1)
+    printf '%s\n' 'Running the optional full runtime verifier before starting services.'
+    /usr/local/bin/salad-jupyter-verify-runtime full
+    ;;
+  *)
+    printf '%s\n' 'SALAD_FULL_RUNTIME_VERIFY must be 0 or 1.' >&2
+    exit 64
+    ;;
+esac
 
 printf '%s\n' 'Starting selected ASR backend on 127.0.0.1:8765, JupyterLab on 127.0.0.1:8889, and the IPv6 gateway proxy on [::]:8888.'
 /opt/asr-venv/bin/uvicorn asr_lab.service:app \

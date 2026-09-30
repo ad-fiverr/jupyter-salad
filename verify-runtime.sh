@@ -1,6 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+verify_mode="${1:-full}"
+if (($# > 1)); then
+  printf 'Usage: %s [full|startup]\n' "$0" >&2
+  exit 64
+fi
+
+case "$verify_mode" in
+  full)
+    ;;
+  startup)
+    # The image already ran the complete verifier during docker build. Keep the
+    # normal container startup path to cheap metadata reads; importing NeMo and
+    # Jupyter here can delay all listening services on every replica restart.
+    /opt/asr-venv/bin/python - <<'PY'
+import importlib.metadata
+import sys
+
+assert sys.version_info[:2] == (3, 11), f"Expected Python 3.11, got {sys.version}"
+startup_expected = {
+    "torch": "2.4.1+cu124",
+    "nemo-toolkit": "2.4.0",
+    "jupyterlab": "4.6.4",
+    "jupyter_server": "2.21.1",
+}
+for package, wanted in startup_expected.items():
+    actual = importlib.metadata.version(package)
+    assert actual == wanted, f"Expected startup metadata {package}=={wanted}, got {actual}"
+print("RUNTIME_VERIFIER_MODE=STARTUP_METADATA_ONLY")
+print("PARAKEET_RUNTIME=NEMO")
+PY
+    exit 0
+    ;;
+  *)
+    printf 'Unknown verifier mode: %s (expected full or startup).\n' "$verify_mode" >&2
+    exit 64
+    ;;
+esac
+
 python - <<'PY'
 import importlib.metadata
 import json
