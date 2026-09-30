@@ -14,9 +14,10 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("nginx_diagnostics", ROOT / "salad_nginx_diagnostics.py")
 diag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(diag)
-MAIN = "events {} http { include /etc/nginx/conf.d/*.conf; }"
+MAIN = "user www-data; worker_processes auto; events { worker_connections 1024; } http { default_type application/octet-stream; include /etc/nginx/conf.d/default.conf; }"
 SERVER = (ROOT / "nginx-salad.conf").read_text(encoding="utf-8")
 DUMP = f"# configuration file /etc/nginx/nginx.conf:\n{MAIN}\n# configuration file /etc/nginx/conf.d/default.conf:\n{SERVER}\n"
+RUNPOD_MAIN = "events { worker_connections 1024; } http { server { listen 9091; } server { listen 3001; } server { listen 7861; } server { listen 8081; } server { listen 8001; } server { listen 7270; } }"
 
 
 def output_of(function, *args):
@@ -44,6 +45,8 @@ class ConfigContractTests(unittest.TestCase):
         self.assertIn("NGINX_CONF_D_INCLUDED=NO", output)
         self.assertIn("NGINX_EFFECTIVE_IPV4_8888=NO", output)
         self.assertIn("NGINX_DISK_DEFAULT_IPV4_8888=YES", output)
+        self.assertIn("NGINX_MAIN_ONLY_SALAD_INCLUDE=YES", output)
+        self.assertIn("NGINX_BUILD_CONTRACT=FAIL", output)
         command.assert_called_once_with(["nginx", "-T"], capture_output=True, text=True, timeout=5, check=False)
 
     def test_missing_ipv6_and_split_servers_fail_contract(self):
@@ -52,6 +55,60 @@ class ConfigContractTests(unittest.TestCase):
             "server { listen 0.0.0.0:8888; } server { listen [::]:8888 ipv6only=on; }",
         ):
             self.assertFalse(all(diag.effective_contract({str(diag.MAIN_CONFIG): MAIN, str(diag.SERVER_CONFIG): server}).values()))
+
+    def test_runpod_effective_config_with_correct_disk_file_is_proven_failure(self):
+        # nginx -T shows the inherited main file only; the correct server file
+        # is read separately from disk, as in the supplied failed-build output.
+        dump = f"# configuration file /etc/nginx/nginx.conf:\n{RUNPOD_MAIN}\n"
+        result = subprocess.CompletedProcess(["nginx", "-T"], 0, dump, "test is successful")
+
+        def disk_file(path, *args, **kwargs):
+            return SERVER if path.as_posix() == diag.SERVER_CONFIG else RUNPOD_MAIN
+
+        with patch.object(diag.subprocess, "run", return_value=result), \
+             patch.object(Path, "read_text", autospec=True, side_effect=disk_file):
+            status, output = output_of(diag.capture_config, True)
+        self.assertEqual(status, 1)
+        self.assertIn("NGINX_CONF_D_INCLUDED=NO", output)
+        self.assertIn("NGINX_EFFECTIVE_IPV4_8888=NO", output)
+        self.assertIn("NGINX_EFFECTIVE_IPV6_8888=NO", output)
+        self.assertIn("listen 9091;", output)
+        self.assertIn("listen 7270;", output)
+        self.assertIn("NGINX_DISK_DEFAULT_IPV4_8888=YES", output)
+        self.assertIn("NGINX_DISK_DEFAULT_IPV6_8888=YES", output)
+        self.assertIn("NGINX_BUILD_CONTRACT=FAIL", output)
+
+    def test_owned_main_plus_salad_server_passes_all_effective_contract_flags(self):
+        files = diag.split_effective_config(DUMP)
+        facts = diag.effective_contract(files)
+        self.assertTrue(all(facts.values()), facts)
+
+    def test_contract_rejects_wildcard_additional_include_or_extra_server(self):
+        for main in (
+            MAIN.replace("default.conf", "*.conf"),
+            MAIN.replace("include /etc/nginx/conf.d/default.conf;", "include /etc/nginx/conf.d/default.conf; include /etc/nginx/sites-enabled/*;"),
+        ):
+            facts = diag.effective_contract({str(diag.MAIN_CONFIG): main, str(diag.SERVER_CONFIG): SERVER})
+            self.assertFalse(all(facts.values()), facts)
+        extra_server = SERVER + "\nserver { listen 9091; }\n"
+        facts = diag.effective_contract({str(diag.MAIN_CONFIG): MAIN, str(diag.SERVER_CONFIG): extra_server})
+        self.assertFalse(all(facts.values()), facts)
+
+    def test_contract_rejects_server_block_declared_in_owned_main_config(self):
+        main_with_server = MAIN.replace("http {", "http { server { listen 9091; }")
+        facts = diag.effective_contract({
+            str(diag.MAIN_CONFIG): main_with_server,
+            str(diag.SERVER_CONFIG): SERVER,
+        })
+        self.assertFalse(facts["NGINX_EFFECTIVE_SERVER_TOPOLOGY_OWNED"], facts)
+        self.assertFalse(all(facts.values()), facts)
+
+    def test_contract_rejects_inherited_effective_file_markers(self):
+        files = diag.split_effective_config(DUMP.replace(
+            "# configuration file /etc/nginx/conf.d/default.conf:",
+            "# configuration file /etc/nginx/extra-runpod.conf:",
+        ))
+        self.assertFalse(all(diag.effective_contract(files).values()))
 
     def test_comments_and_quoted_text_cannot_spoof_listeners(self):
         config = '# server { listen 0.0.0.0:8888; }\nserver { set $x "listen [::]:8888 ipv6only=on;"; }'

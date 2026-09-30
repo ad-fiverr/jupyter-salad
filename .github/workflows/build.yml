@@ -8,6 +8,7 @@ on:
       - 'Dockerfile'
       - 'requirements-jupyter.txt'
       - 'nginx-salad.conf'
+      - 'nginx-main.conf'
       - 'salad-jupyter-entrypoint.sh'
       - 'salad_healthcheck.py'
       - 'salad_nginx_diagnostics.py'

@@ -15,7 +15,7 @@ import sys
 
 MAIN_CONFIG = "/etc/nginx/nginx.conf"
 SERVER_CONFIG = "/etc/nginx/conf.d/default.conf"
-CONF_D_INCLUDE = "/etc/nginx/conf.d/*.conf"
+CONF_D_INCLUDE = "/etc/nginx/conf.d/default.conf"
 TCP_PROBES = {
     "nginx_tcp_ipv4": (socket.AF_INET, "127.0.0.1", 8888),
     "jupyter_tcp": (socket.AF_INET, "127.0.0.1", 8889),
@@ -79,11 +79,17 @@ def effective_contract(files):
     server = config_facts(files.get(str(SERVER_CONFIG), ""))
     ipv4 = ("0.0.0.0:8888",)
     ipv6 = ("[::]:8888", "ipv6only=on")
+    expected_servers = [[ipv4, ipv6]]
+    conf_d_includes = [path for path in main["includes"] if path.startswith("/etc/nginx/conf.d/")]
     return {
+        "NGINX_MAIN_CONFIG_EFFECTIVE": str(MAIN_CONFIG) in files,
         "NGINX_CONF_D_INCLUDED": CONF_D_INCLUDE in main["includes"] and str(SERVER_CONFIG) in files,
+        "NGINX_MAIN_ONLY_SALAD_INCLUDE": conf_d_includes == [CONF_D_INCLUDE] and main["includes"] == [CONF_D_INCLUDE],
+        "NGINX_EFFECTIVE_FILE_SET_OWNED": set(files) == {str(MAIN_CONFIG), str(SERVER_CONFIG)},
         "NGINX_EFFECTIVE_IPV4_8888": any(ipv4 in listeners for listeners in server["servers"]),
         "NGINX_EFFECTIVE_IPV6_8888": any(ipv6 in listeners for listeners in server["servers"]),
         "NGINX_EFFECTIVE_SAME_SERVER": any(ipv4 in listeners and ipv6 in listeners for listeners in server["servers"]),
+        "NGINX_EFFECTIVE_SERVER_TOPOLOGY_OWNED": not main["servers"] and server["servers"] == expected_servers,
     }
 
 
@@ -117,7 +123,7 @@ def capture_config(strict=False):
         print(f"NGINX_EFFECTIVE_CONFIG_CAPTURED={'YES' if captured else 'NO'}")
         print(f"nginx_T_exit_code={result.returncode}")
         # nginx's success message identifies its main configuration path.
-        for path in re.findall(r"configuration file (\S+) (?:syntax is ok|test is successful)", result.stderr):
+        for path in dict.fromkeys(re.findall(r"configuration file (\S+) (?:syntax is ok|test is successful)", result.stderr)):
             print(f"nginx_conf_path={json.dumps(safe_path(path))}")
         for path, config in files.items():
             print_config_summary(path, config)

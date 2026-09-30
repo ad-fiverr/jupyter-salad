@@ -30,6 +30,7 @@ RUN python -m venv --system-site-packages /opt/asr-venv \
       --requirement /tmp/asr-requirements.txt
 
 COPY asr-lab /opt/asr-lab
+COPY nginx-main.conf /etc/nginx/nginx.conf
 COPY nginx-salad.conf /etc/nginx/conf.d/default.conf
 COPY salad_healthcheck.py /usr/local/bin/salad-healthcheck.py
 COPY salad_nginx_diagnostics.py /usr/local/bin/salad-nginx-diagnostics.py
