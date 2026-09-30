@@ -1,10 +1,10 @@
-"""Container-local HTTP readiness check for the IPv6 nginx listener."""
+"""Container-local HTTP readiness check for nginx over IPv4 loopback."""
 
 import sys
 from urllib.request import ProxyHandler, build_opener
 
 
-HEALTH_URL = "http://[::1]:8888/login"
+HEALTH_URL = "http://127.0.0.1:8888/login"
 
 
 def check_health() -> int:

@@ -7,6 +7,7 @@ on:
     paths:
       - 'Dockerfile'
       - 'requirements-jupyter.txt'
+      - 'nginx-salad.conf'
       - 'salad-jupyter-entrypoint.sh'
       - 'salad_healthcheck.py'
       - 'verify-runtime.sh'
@@ -63,6 +64,7 @@ jobs:
             ci-smoke-test.sh \
             tests/test-ci-smoke-diagnostics.sh
           python3 tests/test_salad_healthcheck.py
+          python3 tests/test_nginx_listeners.py
           bash tests/test-ci-smoke-diagnostics.sh
 
       - name: Set up Docker Buildx

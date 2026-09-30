@@ -80,7 +80,7 @@ case "$1" in
     if [[ " $* " == *" touch /workspace/ci-smoke-root-marker.txt "* ]]; then
       exit 0
     elif [[ " $* " == *" --interactive "* ]]; then
-      printf '%s\n' 'Container smoke test: IPv6 loopback, password gate, login, and /workspace root passed'
+      printf '%s\n' 'Container smoke test: IPv4 loopback, password gate, login, and /workspace root passed'
     elif [[ " $* " == *" CI_ASR_SMOKE_TOKEN "* ]]; then
       printf '%s\n' 'WebSocket auth check: passed' 'Credential isolation check: passed'
     else
@@ -192,7 +192,7 @@ timeout_output="$(run_smoke normal starting 1)"
 for expected in \
   'health_wait attempt=5 container_state=running health_status=starting' \
   'health_wait attempt=45 container_state=running health_status=starting' \
-  'Timed out waiting for the IPv6 /login healthcheck'; do
+  'Timed out waiting for the IPv4 loopback /login healthcheck'; do
   if ! grep -Fq -- "$expected" "$timeout_output"; then
     printf 'Expected health-wait marker missing: %s\n' "$expected" >&2
     cat "$timeout_output" >&2

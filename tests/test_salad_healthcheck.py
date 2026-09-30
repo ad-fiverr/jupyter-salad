@@ -29,7 +29,7 @@ class HealthcheckTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"http_proxy": "http://proxy.invalid:3128", "HTTP_PROXY": "http://proxy.invalid:3128"})
     @patch.object(healthcheck, "build_opener")
-    def test_uses_proxy_disabled_opener_for_ipv6_loopback(self, build_opener):
+    def test_uses_proxy_disabled_opener_for_ipv4_loopback(self, build_opener):
         response = contextlib.nullcontext(Mock(status=200))
         opener = Mock()
         opener.open.return_value = response
@@ -40,7 +40,7 @@ class HealthcheckTests(unittest.TestCase):
         handler = build_opener.call_args.args[0]
         self.assertIsInstance(handler, ProxyHandler)
         self.assertEqual(handler.proxies, {})
-        opener.open.assert_called_once_with("http://[::1]:8888/login", timeout=3)
+        opener.open.assert_called_once_with("http://127.0.0.1:8888/login", timeout=3)
 
     @patch.object(healthcheck, "build_opener")
     def test_failure_reports_exception_type_without_exception_details(self, build_opener):

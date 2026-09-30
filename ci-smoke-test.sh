@@ -90,7 +90,7 @@ capture_failure_diagnostics() {
     diagnostic_command 'active processes' docker top "$container_name"
     printf '%s\n' '[direct loopback probes]' >&2
     set_phase health_probe
-    run_loopback_probe nginx_direct 'http://[::1]:8888/login' || true
+    run_loopback_probe nginx_direct 'http://127.0.0.1:8888/login' || true
     run_loopback_probe jupyter_direct 'http://127.0.0.1:8889/login' || true
     run_loopback_probe asr_direct 'http://127.0.0.1:8765/asr/health' || true
   fi
@@ -184,13 +184,13 @@ for attempt in {1..45}; do
   sleep 2
 done
 if [[ "$health_status" != 'healthy' ]]; then
-  printf 'Timed out waiting for the IPv6 /login healthcheck (state: %s).\n' "$health_status" >&2
+  printf 'Timed out waiting for the IPv4 loopback /login healthcheck (state: %s).\n' "$health_status" >&2
   exit 1
 fi
 
 set_phase health_probe
 probe_failures=0
-run_loopback_probe nginx_direct 'http://[::1]:8888/login' || probe_failures=$((probe_failures + 1))
+run_loopback_probe nginx_direct 'http://127.0.0.1:8888/login' || probe_failures=$((probe_failures + 1))
 run_loopback_probe jupyter_direct 'http://127.0.0.1:8889/login' || probe_failures=$((probe_failures + 1))
 run_loopback_probe asr_direct 'http://127.0.0.1:8765/asr/health' || probe_failures=$((probe_failures + 1))
 if ((probe_failures != 0)); then
@@ -201,7 +201,7 @@ fi
 set_phase jupyter_login_test
 timeout 5s docker exec "$container_name" sh -c 'touch /workspace/ci-smoke-root-marker.txt'
 
-# Exercise the same IPv6 listener used by Salad, without an IPv4 host-port mapping.
+# Exercise nginx over IPv4 loopback inside the container without a host-port mapping.
 CI_JUPYTER_TEST_PASSWORD="$smoke_password" \
 timeout 45s docker exec --interactive \
   --env CI_JUPYTER_TEST_PASSWORD \
@@ -221,7 +221,7 @@ from urllib.request import (
     build_opener,
 )
 
-base_url = "http://[::1]:8888"
+base_url = "http://127.0.0.1:8888"
 password = os.environ["CI_JUPYTER_TEST_PASSWORD"]
 
 
@@ -285,7 +285,7 @@ with authenticated.open(base_url + "/api/contents", timeout=10) as response:
 names = {entry.get("name") for entry in contents.get("content", [])}
 assert "ci-smoke-root-marker.txt" in names, "Authenticated contents root is not /workspace"
 
-print("Container smoke test: IPv6 loopback, password gate, login, and /workspace root passed")
+print("Container smoke test: IPv4 loopback, password gate, login, and /workspace root passed")
 PY
 
 set_phase asr_health_test

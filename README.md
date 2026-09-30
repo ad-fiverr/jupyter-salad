@@ -34,13 +34,13 @@ Configura el Container Gateway y la aplicación con estos valores:
 | --- | --- |
 | Gateway port | `8888` |
 | Protocol | HTTP |
-| Dirección de escucha | IPv6 `::` |
+| Dirección de escucha | IPv4 `0.0.0.0` e IPv6 `[::]` |
 | Secreto de runtime | `JUPYTER_PASSWORD`, con una contraseña larga y única |
 | Startup/readiness | HTTP `GET /login` en el puerto `8888` |
 | Autenticación del Gateway | Deshabilitada para permitir WebSockets del navegador; Jupyter conserva su autenticación por contraseña |
 | Liveness | Déjalo sin configurar inicialmente |
 
-El healthcheck interno usa `salad_healthcheck.py` para consultar `http://[::1]:8888/login` con `urllib` y `ProxyHandler({})`; las variables de proxy del contenedor no deben sacar un probe de loopback del contenedor.
+nginx escucha en IPv4 `0.0.0.0:8888` e IPv6 `[::]:8888` (`ipv6only=on`). El Container Gateway público de Salad conserva el listener IPv6. El Docker HEALTHCHECK y las pruebas funcionales de CI consultan `http://127.0.0.1:8888/login` con bypass de proxy; así CI no depende del soporte de loopback IPv6 de Docker. Las probes directas a Jupyter (`127.0.0.1:8889`) y ASR (`127.0.0.1:8765`) se mantienen. `nginx -t` sigue ejecutándose durante el build de la imagen.
 
 JupyterLab usa `/workspace` como directorio de trabajo y raíz del servidor. El acceso sin autenticar está deshabilitado y los tokens de Jupyter también; la contraseña `JUPYTER_PASSWORD` es obligatoria. El servidor envía pings WebSocket cada 30 segundos para mantenerse por debajo del timeout de inactividad documentado por Salad. Si el puerto `8888` está ocupado, el servidor falla en vez de cambiar de puerto.
 
@@ -53,7 +53,7 @@ El contenedor no configura almacenamiento persistente. El contenido de `/workspa
 Repositorio: [ad-fiverr/jupyter-salad](https://github.com/ad-fiverr/jupyter-salad)
 Imagen: [myblockchaincompany/jupyter-salad en Docker Hub](https://hub.docker.com/repository/docker/myblockchaincompany/jupyter-salad/general)
 
-El workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) se ejecuta al hacer push a `main` cuando cambia un archivo de build o smoke test y también permite `workflow_dispatch`. Antes del build valida YAML/shell y ejecuta los tests sin Docker para fases/diagnósticos y proxy bypass. Usa el contexto `.` y `./Dockerfile`, prepara Buildx y construye `linux/amd64`. Después ejecuta el smoke test sobre la imagen cargada. El login a Docker Hub y los pushes ocurren únicamente si el build y el smoke test pasan.
+El workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) se ejecuta al hacer push a `main` cuando cambia un archivo de build o smoke test y también permite `workflow_dispatch`. Antes del build valida YAML/shell y ejecuta tests sin Docker para fases/diagnósticos, bypass de proxy y presencia de listeners nginx IPv4/IPv6. El build ejecuta `nginx -t`. Usa el contexto `.` y `./Dockerfile`, prepara Buildx y construye `linux/amd64`. Después ejecuta el smoke test sobre la imagen cargada usando IPv4 loopback. El login a Docker Hub y los pushes ocurren únicamente si el build y el smoke test pasan.
 
 Configura estos GitHub Actions Secrets en el repositorio:
 
@@ -79,7 +79,7 @@ El workflow ya fija `platforms: linux/amd64`; el Dockerfile deja que Buildx apli
 | Segundo build en GitHub Actions | `FAIL` — [run #2](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36602803603): instalación Jupyter completada; el verificador falló porque esperaba PyTorch 2.4.0 y la base contiene `2.4.1+cu124`. `jupyter_server extension enable` también informó que no encontraba el módulo, aunque su comando devolvió éxito. |
 | Tercer build en GitHub Actions | `FAIL` — [run #3](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36608666952): falló el verificador al acceder a `jupyter_server.ServerApp`; esa clase está en `jupyter_server.serverapp`. La instalación de pip sí terminó. |
 | Cuarto build en GitHub Actions | `FAIL` — [run #4](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36609873658): el listado muestra `jupyter_server_terminals enabled` y validación `OK`, pero el verificador no reconoce la línea como habilitada; se normaliza la salida ANSI y se validan sus tokens. |
-| Quinto build en GitHub Actions | `FAIL` — [run #5](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36611124163): el contenedor pasó healthcheck IPv6, pero la primera petición del smoke test desde el runner a `127.0.0.1` terminó en `ConnectionResetError`; ahora la prueba HTTP corre dentro del contenedor por `[::1]:8888`. |
+| Quinto build en GitHub Actions | `FAIL` — [run #5](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36611124163): el contenedor pasó el healthcheck IPv6, pero la primera petición del smoke test desde el runner a `127.0.0.1` terminó en `ConnectionResetError`; en esa revisión, el smoke del contenedor probó luego el listener por `[::1]:8888`. Un run posterior mostró que ese probe IPv6 loopback también falla en el Docker runner ([run #36680271147](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36680271147)); la ruta funcional actual de CI usa `127.0.0.1:8888`, mientras Salad conserva el listener público IPv6. |
 | Reintento con esta corrección | `GITHUB_ACTIONS_RETEST = UNRUN` — awaiting user push/re-run. |
 | Validaciones estáticas tras la corrección del run #5 | `PASS` — sintaxis Bash y Python embebido, parseo YAML, `git diff --check`, paths, versiones, invariantes de runtime, orden build/smoke/login/push y escaneo de secretos del worktree. |
 | Publicación Docker Hub | `DOCKERHUB_PUBLICATION = UNRUN` |
