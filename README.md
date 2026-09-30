@@ -97,3 +97,30 @@ El workflow ya fija `platforms: linux/amd64`; el Dockerfile deja que Buildx apli
 - [jupyter_server_terminals 0.5.4 en PyPI](https://pypi.org/project/jupyter-server-terminals/0.5.4/)
 - [Configuración auto-enable incluida en la etiqueta 0.5.4](https://github.com/jupyter-server/jupyter_server_terminals/blob/v0.5.4/jupyter-config/jupyter_server_terminals.json)
 - [PyTorch 2.7 y soporte para Blackwell](https://pytorch.org/blog/pytorch-2-7/)
+
+## ASR Lab (experimental)
+
+This image now includes an optional ASR laboratory behind the same Salad Container Gateway. The public listener remains IPv6 port `8888`; nginx routes `/` to password-protected JupyterLab at `127.0.0.1:8889` and `/asr/*` to FastAPI at `127.0.0.1:8765`. Only `8888` is intended for the Container Gateway.
+
+Set these in the Salad Container Group as runtime values:
+
+| Variable | Value |
+| --- | --- |
+| `JUPYTER_PASSWORD` | Required unique password Secret |
+| `ASR_BACKEND` | Exactly one: `parakeet` or `faster_whisper` |
+| `ASR_API_TOKEN` | Unique random Secret, minimum 24 bytes; use at least 32 random bytes |
+| `ASR_WORKERS` | Any positive integer; each worker loads its own full model, with no configured hard maximum |
+| `HF_TOKEN` | Optional Salad Secret only when Hugging Face access requires it |
+
+There is no image default backend. `parakeet` uses the previously tested NVIDIA NeMo runtime (`nemo_toolkit[asr]==2.4.0`) and the historical RMS/blacklist behavior. Changing `ASR_BACKEND` requires restarting the container; the unselected backend is not loaded. Parakeet jobs are distributed round-robin among workers. More workers increase concurrency/throughput, not the speed of one inference; VRAM fit and practical limits must be measured on a real GPU. `ASR_API_TOKEN` is accepted as `?token=` for the browser WebSocket client. This is a lab credential, so avoid sharing the URL and use a dedicated token. ASR and nginx access logs are disabled; the Jupyter process does not inherit the ASR/Hugging Face secrets.
+
+Public paths:
+
+- Jupyter UI: `https://<salad-host>/`
+- ASR WebSocket: `wss://<salad-host>/asr/ws?token=<ASR_API_TOKEN>`
+- ASR process health: `https://<salad-host>/asr/health`
+- ASR model readiness: `https://<salad-host>/asr/readiness` (503 until model warm-up finishes)
+
+The ASR protocol is mono PCM16LE at 16 kHz, base64 encoded, compatible with the existing MyBrainAssistant message. Segments are finalized by server silence/inactivity handling; the API does not emit partial-token transcripts. A full reproducible guide and honest test status are maintained in the C2C workspace at `ASR/ASR_SALAD_LAB.md`.
+
+The image build and runner smoke test remain in GitHub Actions. This implementation was not built locally, published, or deployed to Salad. Do not point a Group that is actively training at a new image until you have saved its work and intentionally scheduled a separate test.

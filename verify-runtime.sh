@@ -104,3 +104,66 @@ if not any(
     raise SystemExit("Jupyter Server did not validate jupyter_server_terminals as OK")
 print("Jupyter Server discovered and validated jupyter_server_terminals: OK")
 PY
+
+/opt/asr-venv/bin/python - <<'PY'
+import importlib.metadata
+import sys
+
+expected = {
+    "fastapi": "0.142.1",
+    "uvicorn": "0.54.0",
+    "websockets": "17.1",
+    "faster-whisper": "1.2.1",
+    "ctranslate2": "4.8.2",
+    "numpy": "1.26.4",
+    "librosa": "0.11.0",
+    "nemo-toolkit": "2.4.0",
+    "cuda-python": "12.3.0",
+}
+for package, wanted in expected.items():
+    actual = importlib.metadata.version(package)
+    assert actual == wanted, f"Expected ASR {package}=={wanted}, got {actual}"
+
+import torch
+assert torch.__version__ == "2.4.1+cu124", f"ASR environment changed base Torch: {torch.__version__}"
+assert torch.version.cuda and torch.version.cuda.startswith("12.4"), (
+    f"ASR environment changed base CUDA runtime: {torch.version.cuda!r}"
+)
+
+from packaging.markers import default_environment
+from packaging.requirements import Requirement
+
+nemo_distribution = importlib.metadata.distribution("nemo-toolkit")
+marker_environment = {**default_environment(), "extra": "asr"}
+checked_nemo_requirements = 0
+for raw_requirement in nemo_distribution.requires or ():
+    requirement = Requirement(raw_requirement)
+    if requirement.marker and not requirement.marker.evaluate(marker_environment):
+        continue
+    actual = importlib.metadata.version(requirement.name)
+    if requirement.specifier and not requirement.specifier.contains(actual, prereleases=True):
+        raise AssertionError(
+            f"Installed NeMo ASR dependency {requirement.name}=={actual} does not satisfy "
+            f"{requirement.specifier} from {raw_requirement}"
+        )
+    checked_nemo_requirements += 1
+
+import nemo.collections.asr as nemo_asr
+assert nemo_asr.models.ASRModel is not None
+
+from asr_lab.config import MODEL_IDS
+assert MODEL_IDS["parakeet"] == "nvidia/parakeet-tdt-0.6b-v3"
+
+from asr_lab.service import app
+assert app.title == "Salad ASR Lab"
+assert "asr_lab.backends.parakeet" not in sys.modules
+assert "asr_lab.backends.faster_whisper" not in sys.modules
+print("ASR environment: pinned direct versions, NeMo ASR dependencies, inherited Torch, and lazy backend selection: OK")
+print(f"NeMo ASR metadata dependencies checked: {checked_nemo_requirements}")
+print("VERIFY_RUNTIME_BASELINE=NEMO")
+print("PARAKEET_RUNTIME=NEMO")
+print("PARAKEET_MODEL=nvidia/parakeet-tdt-0.6b-v3")
+if tuple(int(part) for part in torch.__version__.split("+", 1)[0].split(".")[:2]) < (2, 5):
+    print("NEMO_TORCH_CONFIGURATION=OUTSIDE_DOCUMENTED_SUPPORT (NeMo 2.4 documents PyTorch >=2.5)")
+print("PARAKEET_NEMO_GPU_RUNTIME=UNRUN (model download, CUDA inference, and transcription require Salad GPU validation)")
+PY

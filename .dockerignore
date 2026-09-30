@@ -13,3 +13,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+**/.cache/
+**/.venv/
+**/__pycache__/
+**/*.safetensors
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/node_modules/

@@ -1,0 +1,4 @@
+# The shared-site venv must keep these versions from the pinned base.
+torch==2.4.1+cu124
+# Keep NumPy stable for the pinned NeMo and CTranslate2 audio adapters.
+numpy==1.26.4

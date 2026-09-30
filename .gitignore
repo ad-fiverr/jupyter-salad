@@ -8,5 +8,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+**/.cache/
+**/*.safetensors
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/node_modules/
 build/
 dist/

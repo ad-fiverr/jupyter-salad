@@ -8,6 +8,7 @@ container_name="salad-jupyter-smoke-${run_id}-${run_attempt}"
 missing_password_log="$(mktemp)"
 container_logs="$(mktemp)"
 smoke_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+smoke_asr_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 
 cleanup() {
   docker rm --force "$container_name" >/dev/null 2>&1 || true
@@ -25,11 +26,20 @@ if ! grep -Fq 'JUPYTER_PASSWORD must be set' "$missing_password_log"; then
 fi
 printf '%s\n' 'Missing-password check: passed'
 
-JUPYTER_PASSWORD="$smoke_password" docker run \
+JUPYTER_PASSWORD="$smoke_password" \
+CI=true \
+ASR_TEST_NO_MODEL=1 \
+ASR_BACKEND=parakeet \
+ASR_API_TOKEN="$smoke_asr_token" \
+docker run \
   --detach \
   --rm \
   --name "$container_name" \
   --env JUPYTER_PASSWORD \
+  --env CI \
+  --env ASR_TEST_NO_MODEL \
+  --env ASR_BACKEND \
+  --env ASR_API_TOKEN \
   "$image" >/dev/null
 
 health_status='starting'
@@ -137,9 +147,93 @@ assert "ci-smoke-root-marker.txt" in names, "Authenticated contents root is not 
 print("Container smoke test: IPv6 loopback, password gate, login, and /workspace root passed")
 PY
 
+docker exec "$container_name" python3 - <<'PY'
+import json
+import time
+from urllib.error import HTTPError
+from urllib.request import urlopen
+
+deadline = time.monotonic() + 30
+while True:
+    try:
+        response = urlopen("http://127.0.0.1:8765/asr/health", timeout=2)
+        break
+    except OSError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(1)
+with response:
+    health = json.load(response)
+    assert response.status == 200 and health["status"] == "ok"
+    assert health["model_loaded"] is False
+try:
+    urlopen("http://127.0.0.1:8765/asr/readiness", timeout=5)
+except HTTPError as error:
+    assert error.code == 503
+    assert json.load(error)["ready"] is False
+else:
+    raise AssertionError("CI smoke mode incorrectly reported a model as ready")
+print("ASR health/readiness check: process alive and no-model readiness correctly reported")
+PY
+
+CI_ASR_SMOKE_TOKEN="$smoke_asr_token" \
+docker exec --env CI_ASR_SMOKE_TOKEN \
+  "$container_name" \
+  /opt/asr-venv/bin/python - <<'PY'
+import asyncio
+import json
+import os
+from urllib.parse import urlencode
+
+import websockets
+
+base = "ws://127.0.0.1:8765/asr/ws"
+
+async def check():
+    try:
+        async with websockets.connect(base + "?" + urlencode({"token": "wrong" * 8}), open_timeout=5):
+            raise AssertionError("An invalid ASR token was accepted")
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        assert status == 403, f"Unexpected unauthorized status {status}"
+
+    url = base + "?" + urlencode({"token": os.environ["CI_ASR_SMOKE_TOKEN"]})
+    async with websockets.connect(url, open_timeout=5) as socket:
+        message = json.loads(await socket.recv())
+        assert message["event"] == "error" and message["code"] == "model_not_ready"
+
+asyncio.run(check())
+
+import pathlib
+found_jupyter = False
+for proc in pathlib.Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    try:
+        command = (proc / "cmdline").read_bytes().lower()
+        if b"jupyter" not in command or b"lab" not in command:
+            continue
+        found_jupyter = True
+        environment = (proc / "environ").read_bytes().split(b"\0")
+        keys = {entry.split(b"=", 1)[0] for entry in environment if b"=" in entry}
+        assert b"ASR_API_TOKEN" not in keys
+        assert b"HF_TOKEN" not in keys
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        continue
+assert found_jupyter, "Could not locate the JupyterLab process for credential isolation check"
+print("WebSocket auth check: invalid token rejected; valid token receives test-mode not-ready response")
+print("Credential isolation check: Jupyter process does not inherit ASR_API_TOKEN or HF_TOKEN")
+PY
+
 docker logs "$container_name" >"$container_logs" 2>&1
 if grep -Fq "$smoke_password" "$container_logs"; then
   printf '%s\n' 'The temporary password appeared in container logs.' >&2
+  exit 1
+fi
+if grep -Fq "$smoke_asr_token" "$container_logs"; then
+  printf '%s\n' 'The temporary ASR token appeared in container logs.' >&2
   exit 1
 fi
 if grep -Eiq 'https?://[^[:space:]]+\?token=[[:alnum:]_-]{24,}' "$container_logs"; then

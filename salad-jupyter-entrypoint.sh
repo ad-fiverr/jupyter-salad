@@ -6,7 +6,7 @@ if [[ -z "${JUPYTER_PASSWORD:-}" ]]; then
   exit 64
 fi
 
-mkdir -p /workspace "${JUPYTER_CONFIG_DIR:-/tmp/jupyter-config}" "${JUPYTER_RUNTIME_DIR:-/tmp/jupyter-runtime}"
+mkdir -p /workspace "${JUPYTER_CONFIG_DIR:-/tmp/jupyter-config}" "${JUPYTER_RUNTIME_DIR:-/tmp/jupyter-runtime}" "${HF_HOME:-/workspace/.cache/huggingface}"
 chmod 0700 "${JUPYTER_CONFIG_DIR:-/tmp/jupyter-config}" "${JUPYTER_RUNTIME_DIR:-/tmp/jupyter-runtime}"
 umask 077
 
@@ -26,8 +26,8 @@ hashed_password = passwd(password)
 config = "\n".join(
     (
         "c = get_config()",
-        "c.ServerApp.ip = '::'",
-        "c.ServerApp.port = 8888",
+        "c.ServerApp.ip = '127.0.0.1'",
+        "c.ServerApp.port = 8889",
         "c.ServerApp.root_dir = '/workspace'",
         "c.ServerApp.allow_unauthenticated_access = False",
         "c.ServerApp.port_retries = 0",
@@ -45,15 +45,38 @@ config = "\n".join(
         "",
     )
 )
-
 path = Path(sys.argv[1])
 path.write_text(config, encoding="utf-8")
 path.chmod(0o600)
 PY
 
-# Do not pass the plaintext runtime secret into the Jupyter server or kernels.
 unset JUPYTER_PASSWORD
-
 /usr/local/bin/salad-jupyter-verify-runtime
-printf '%s\n' 'Starting password-protected JupyterLab on [::]:8888 with /workspace as its root.'
-exec jupyter lab --config="$config_file"
+
+printf '%s\n' 'Starting selected ASR backend on 127.0.0.1:8765, JupyterLab on 127.0.0.1:8889, and the IPv6 gateway proxy on [::]:8888.'
+/opt/asr-venv/bin/uvicorn asr_lab.service:app \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --no-access-log \
+  --log-level info \
+  --ws-ping-interval 30 \
+  --ws-ping-timeout 20 \
+  --timeout-graceful-shutdown 30 &
+asr_pid=$!
+
+# Keep model-download credentials available to ASR only. The shell, Jupyter, and
+# Nginx lose them before either process starts; ASR retains its private copy.
+unset ASR_API_TOKEN HF_TOKEN
+jupyter lab --config="$config_file" --ip=127.0.0.1 --port=8889 &
+jupyter_pid=$!
+nginx -g 'daemon off;' &
+nginx_pid=$!
+
+source /usr/local/bin/salad-supervisor-watch
+if salad_supervise_children "$asr_pid" "$jupyter_pid" "$nginx_pid"; then
+  exit 0
+else
+  supervisor_status=$?
+  printf 'A required container service exited unexpectedly (status %s).\n' "$supervisor_status" >&2
+  exit "$supervisor_status"
+fi
