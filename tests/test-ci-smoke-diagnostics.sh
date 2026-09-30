@@ -135,7 +135,7 @@ run_smoke() {
   local status=0
   if PATH="$fake_bin:$PATH" SMOKE_FAKE_DIR="$temporary_directory" \
     SMOKE_FAKE_MODE="$mode" SMOKE_FAKE_HEALTH="$health" \
-    "$repo_root/ci-smoke-test.sh" fixture-image >"$output_file" 2>&1; then
+    bash "$repo_root/ci-smoke-test.sh" fixture-image >"$output_file" 2>&1; then
     status=0
   else
     status=$?
