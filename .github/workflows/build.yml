@@ -8,8 +8,10 @@ on:
       - 'Dockerfile'
       - 'requirements-jupyter.txt'
       - 'salad-jupyter-entrypoint.sh'
+      - 'salad_healthcheck.py'
       - 'verify-runtime.sh'
       - 'ci-smoke-test.sh'
+      - 'tests/**'
       - '.dockerignore'
       - '.github/workflows/build.yml'
   workflow_dispatch:
@@ -58,7 +60,10 @@ jobs:
           bash -n \
             salad-jupyter-entrypoint.sh \
             verify-runtime.sh \
-            ci-smoke-test.sh
+            ci-smoke-test.sh \
+            tests/test-ci-smoke-diagnostics.sh
+          python3 tests/test_salad_healthcheck.py
+          bash tests/test-ci-smoke-diagnostics.sh
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.4.1

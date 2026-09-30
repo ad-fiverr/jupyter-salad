@@ -31,6 +31,7 @@ RUN python -m venv --system-site-packages /opt/asr-venv \
 
 COPY asr-lab /opt/asr-lab
 COPY nginx-salad.conf /etc/nginx/conf.d/default.conf
+COPY salad_healthcheck.py /usr/local/bin/salad-healthcheck.py
 COPY salad-jupyter-entrypoint.sh /usr/local/bin/salad-jupyter-entrypoint
 COPY salad-supervisor-watch.sh /usr/local/bin/salad-supervisor-watch
 COPY verify-runtime.sh /usr/local/bin/salad-jupyter-verify-runtime
@@ -45,7 +46,7 @@ RUN chmod 0755 \
 EXPOSE 8888
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-  CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://[::1]:8888/login', timeout=3)"]
+  CMD ["python", "/usr/local/bin/salad-healthcheck.py"]
 
 # Preserve NVIDIA's inherited ENTRYPOINT and replace only CMD.
 CMD ["/usr/local/bin/salad-jupyter-entrypoint"]

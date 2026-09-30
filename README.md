@@ -40,6 +40,8 @@ Configura el Container Gateway y la aplicación con estos valores:
 | Autenticación del Gateway | Deshabilitada para permitir WebSockets del navegador; Jupyter conserva su autenticación por contraseña |
 | Liveness | Déjalo sin configurar inicialmente |
 
+El healthcheck interno usa `salad_healthcheck.py` para consultar `http://[::1]:8888/login` con `urllib` y `ProxyHandler({})`; las variables de proxy del contenedor no deben sacar un probe de loopback del contenedor.
+
 JupyterLab usa `/workspace` como directorio de trabajo y raíz del servidor. El acceso sin autenticar está deshabilitado y los tokens de Jupyter también; la contraseña `JUPYTER_PASSWORD` es obligatoria. El servidor envía pings WebSocket cada 30 segundos para mantenerse por debajo del timeout de inactividad documentado por Salad. Si el puerto `8888` está ocupado, el servidor falla en vez de cambiar de puerto.
 
 Jupyter permite ejecutar código con la identidad del usuario autenticado. No despliegues la imagen sin establecer `JUPYTER_PASSWORD` como secreto de runtime. `.env.example` contiene únicamente un marcador y no debe usarse como contraseña real.
@@ -51,7 +53,7 @@ El contenedor no configura almacenamiento persistente. El contenido de `/workspa
 Repositorio: [ad-fiverr/jupyter-salad](https://github.com/ad-fiverr/jupyter-salad)
 Imagen: [myblockchaincompany/jupyter-salad en Docker Hub](https://hub.docker.com/repository/docker/myblockchaincompany/jupyter-salad/general)
 
-El workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) se ejecuta al hacer push a `main` cuando cambia un archivo de build y también permite `workflow_dispatch`. Usa el contexto `.` y `./Dockerfile`, valida la sintaxis YAML y shell, prepara Buildx y construye `linux/amd64`. Después ejecuta el smoke test sobre la imagen cargada. El login a Docker Hub y los pushes ocurren únicamente si el build y el smoke test pasan.
+El workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) se ejecuta al hacer push a `main` cuando cambia un archivo de build o smoke test y también permite `workflow_dispatch`. Antes del build valida YAML/shell y ejecuta los tests sin Docker para fases/diagnósticos y proxy bypass. Usa el contexto `.` y `./Dockerfile`, prepara Buildx y construye `linux/amd64`. Después ejecuta el smoke test sobre la imagen cargada. El login a Docker Hub y los pushes ocurren únicamente si el build y el smoke test pasan.
 
 Configura estos GitHub Actions Secrets en el repositorio:
 
