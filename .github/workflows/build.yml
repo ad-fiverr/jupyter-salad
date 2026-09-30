@@ -10,6 +10,7 @@ on:
       - 'nginx-salad.conf'
       - 'salad-jupyter-entrypoint.sh'
       - 'salad_healthcheck.py'
+      - 'salad_nginx_diagnostics.py'
       - 'verify-runtime.sh'
       - 'ci-smoke-test.sh'
       - 'tests/**'
@@ -65,6 +66,7 @@ jobs:
             tests/test-ci-smoke-diagnostics.sh
           python3 tests/test_salad_healthcheck.py
           python3 tests/test_nginx_listeners.py
+          python3 tests/test_salad_nginx_diagnostics.py
           bash tests/test-ci-smoke-diagnostics.sh
 
       - name: Set up Docker Buildx

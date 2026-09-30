@@ -40,7 +40,7 @@ Configura el Container Gateway y la aplicación con estos valores:
 | Autenticación del Gateway | Deshabilitada para permitir WebSockets del navegador; Jupyter conserva su autenticación por contraseña |
 | Liveness | Déjalo sin configurar inicialmente |
 
-nginx escucha en IPv4 `0.0.0.0:8888` e IPv6 `[::]:8888` (`ipv6only=on`). El Container Gateway público de Salad conserva el listener IPv6. El Docker HEALTHCHECK y las pruebas funcionales de CI consultan `http://127.0.0.1:8888/login` con bypass de proxy; así CI no depende del soporte de loopback IPv6 de Docker. Las probes directas a Jupyter (`127.0.0.1:8889`) y ASR (`127.0.0.1:8765`) se mantienen. `nginx -t` sigue ejecutándose durante el build de la imagen.
+La configuración versionada declara IPv4 `0.0.0.0:8888` e IPv6 `[::]:8888` (`ipv6only=on`) para conservar el acceso del Gateway de Salad. El Docker HEALTHCHECK y las pruebas funcionales de CI consultan `http://127.0.0.1:8888/login` con bypass de proxy; así CI no depende del soporte de loopback IPv6 de Docker. Las probes directas a Jupyter (`127.0.0.1:8889`) y ASR (`127.0.0.1:8765`) se mantienen. El build ejecuta `nginx -t` y un contrato sobre `nginx -T` que exige el include de `conf.d`, el marker efectivo de `default.conf` y ambos listeners en el mismo bloque `server`.
 
 JupyterLab usa `/workspace` como directorio de trabajo y raíz del servidor. El acceso sin autenticar está deshabilitado y los tokens de Jupyter también; la contraseña `JUPYTER_PASSWORD` es obligatoria. El servidor envía pings WebSocket cada 30 segundos para mantenerse por debajo del timeout de inactividad documentado por Salad. Si el puerto `8888` está ocupado, el servidor falla en vez de cambiar de puerto.
 
@@ -53,7 +53,21 @@ El contenedor no configura almacenamiento persistente. El contenido de `/workspa
 Repositorio: [ad-fiverr/jupyter-salad](https://github.com/ad-fiverr/jupyter-salad)
 Imagen: [myblockchaincompany/jupyter-salad en Docker Hub](https://hub.docker.com/repository/docker/myblockchaincompany/jupyter-salad/general)
 
-El workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) se ejecuta al hacer push a `main` cuando cambia un archivo de build o smoke test y también permite `workflow_dispatch`. Antes del build valida YAML/shell y ejecuta tests sin Docker para fases/diagnósticos, bypass de proxy y presencia de listeners nginx IPv4/IPv6. El build ejecuta `nginx -t`. Usa el contexto `.` y `./Dockerfile`, prepara Buildx y construye `linux/amd64`. Después ejecuta el smoke test sobre la imagen cargada usando IPv4 loopback. El login a Docker Hub y los pushes ocurren únicamente si el build y el smoke test pasan.
+El workflow [`.github/workflows/build.yml`](.github/workflows/build.yml) se ejecuta al hacer push a `main` cuando cambia un archivo de build o smoke test y también permite `workflow_dispatch`. Antes del build valida YAML/shell y ejecuta tests sin Docker para fases/diagnósticos, bypass de proxy, configuración efectiva y listeners nginx IPv4/IPv6. Usa el contexto `.` y `./Dockerfile`, prepara Buildx y construye `linux/amd64`. Después ejecuta el smoke test sobre la imagen cargada usando IPv4 loopback. El login a Docker Hub y los pushes ocurren únicamente si el build y el smoke test pasan.
+
+### Diagnóstico de nginx en CI
+
+El [run 36724378654](https://github.com/ad-fiverr/jupyter-salad/actions/runs/36724378654/job/109917342589) mostró procesos nginx vivos, Jupyter/ASR directos con HTTP 200 y fallo en `127.0.0.1:8888/login`, según la evidencia aportada por el usuario. Esos datos no demuestran qué configuración incluyó nginx ni qué sockets abrió. `ROOT_CAUSE = UNDETERMINED` hasta capturar la configuración efectiva y los listeners en un nuevo runner. Esta microtarea no cambia la configuración nginx ni ASR.
+
+Ante timeout, unhealthy o salida del contenedor, el smoke conserva el diagnóstico previo y añade, dentro del mismo contenedor:
+
+- `nginx -T`: solo markers de origen, ruta principal, includes y bloques/listeners; lectura de `nginx.conf` y `default.conf` identificada por separado como evidencia de disco.
+- Flags `NGINX_EFFECTIVE_CONFIG_CAPTURED`, `NGINX_CONF_D_INCLUDED`, `NGINX_EFFECTIVE_IPV4_8888` y `NGINX_EFFECTIVE_IPV6_8888`, derivados del dump efectivo; los archivos en disco no pueden satisfacer el contrato.
+- Todos los listeners TCP de `ss -ltnp` cuando está disponible y tablas `/proc/net/tcp{,6}` para confirmar familias/puertos, incluido cualquier puerto distinto de 8888; no instala paquetes. Estado de procesos nginx y override `-c` si existe, sin volcar argumentos completos.
+- Flags `RUNTIME_TCP_8888_IPV4`, `RUNTIME_TCP_8888_IPV6`, `JUPYTER_8889` y `ASR_8765` derivados de sockets en estado LISTEN en `/proc`; `UNAVAILABLE` significa que la tabla no se pudo leer.
+- Cuatro probes TCP puros antes de HTTP: IPv4 8888/8889/8765 e IPv6 `::1:8888`. Solo nombre, resultado, errno y clase de excepción; IPv6 sin soporte queda `UNAVAILABLE`.
+
+Cada llamada Docker de diagnóstico mantiene el límite de 5 s y los probes de socket usan 2 s; el loop de health de 45 × 2 s se conserva. No se imprimen dumps completos de configuración ni errores crudos que puedan contener credenciales. `nginx -T` describe la configuración efectiva en disco en el momento de la prueba, no permite leer la configuración que un master antiguo guarda en memoria; si difiere de los sockets abiertos, hay que investigar esa discrepancia antes de corregir la arquitectura. El contrato nuevo y la captura real de sockets quedan pendientes de GitHub Actions; los tests locales usan fixtures y mocks.
 
 Configura estos GitHub Actions Secrets en el repositorio:
 

@@ -88,6 +88,17 @@ capture_failure_diagnostics() {
   if [[ "$state" == 'running' ]]; then
     printf '%s\n' '[active processes]' >&2
     diagnostic_command 'active processes' docker top "$container_name"
+    printf '%s\n' '[nginx effective configuration and disk files]' >&2
+    diagnostic_command 'nginx effective configuration' docker exec "$container_name" \
+      python3 /usr/local/bin/salad-nginx-diagnostics.py config
+    printf '%s\n' '[TCP listeners: ss with proc fallback]' >&2
+    diagnostic_command 'TCP listeners' docker exec "$container_name" \
+      python3 /usr/local/bin/salad-nginx-diagnostics.py listeners
+    printf '%s\n' '[pure TCP loopback probes before HTTP]' >&2
+    for tcp_probe_name in nginx_tcp_ipv4 jupyter_tcp asr_tcp nginx_tcp_ipv6; do
+      diagnostic_command "$tcp_probe_name" docker exec "$container_name" \
+        python3 /usr/local/bin/salad-nginx-diagnostics.py tcp "$tcp_probe_name"
+    done
     printf '%s\n' '[direct loopback probes]' >&2
     set_phase health_probe
     run_loopback_probe nginx_direct 'http://127.0.0.1:8888/login' || true

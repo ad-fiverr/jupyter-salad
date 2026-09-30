@@ -69,6 +69,38 @@ case "$1" in
       "$(cat "$SMOKE_FAKE_DIR/asr-secret")"
     ;;
   exec)
+    if [[ " $* " == *" /usr/local/bin/salad-nginx-diagnostics.py "* ]]; then
+      for argument in "$@"; do
+        case "$argument" in
+          config)
+            if [[ "${SMOKE_FAKE_MODE:-}" == 'config_timeout' ]]; then
+              exit 124
+            fi
+            printf '%s\n' 'NGINX_EFFECTIVE_CONFIG_CAPTURED=YES' \
+              'config_source="/etc/nginx/nginx.conf"' \
+              'config_source="/etc/nginx/conf.d/default.conf"' \
+              'NGINX_CONF_D_INCLUDED=YES' \
+              'NGINX_EFFECTIVE_IPV4_8888=YES' 'NGINX_EFFECTIVE_IPV6_8888=YES'
+            printf 'HF_TOKEN=%s\n' "$(cat "$SMOKE_FAKE_DIR/asr-secret")"
+            exit 0
+            ;;
+          listeners)
+            printf '%s\n' 'NGINX_PROCESS_RUNNING=YES' 'ss_result=UNAVAILABLE fallback=proc' \
+              'RUNTIME_TCP_8888_IPV4=NOT_LISTENING' 'RUNTIME_TCP_8888_IPV6=NOT_LISTENING' \
+              'JUPYTER_8889=LISTENING' 'ASR_8765=LISTENING'
+            exit 0
+            ;;
+          nginx_tcp_ipv4|nginx_tcp_ipv6)
+            printf 'probe=%s result=FAIL exception=ConnectionRefusedError errno=111\n' "$argument"
+            exit 1
+            ;;
+          jupyter_tcp|asr_tcp)
+            printf 'probe=%s result=PASS exception=NONE errno=NONE\n' "$argument"
+            exit 0
+            ;;
+        esac
+      done
+    fi
     for argument in "$@"; do
       case "$argument" in
         nginx_direct|jupyter_direct|asr_direct)
@@ -160,6 +192,19 @@ for expected in \
   '[docker inspect health]' \
   '[docker logs]' \
   '[active processes]' \
+  '[nginx effective configuration and disk files]' \
+  'NGINX_EFFECTIVE_CONFIG_CAPTURED=YES' \
+  'NGINX_CONF_D_INCLUDED=YES' \
+  'NGINX_EFFECTIVE_IPV4_8888=YES' \
+  'NGINX_EFFECTIVE_IPV6_8888=YES' \
+  'ss_result=UNAVAILABLE fallback=proc' \
+  'RUNTIME_TCP_8888_IPV4=NOT_LISTENING' \
+  'JUPYTER_8889=LISTENING' \
+  'ASR_8765=LISTENING' \
+  'probe=nginx_tcp_ipv4 result=FAIL exception=ConnectionRefusedError errno=111' \
+  'probe=nginx_tcp_ipv6 result=FAIL exception=ConnectionRefusedError errno=111' \
+  'probe=jupyter_tcp result=PASS' \
+  'probe=asr_tcp result=PASS' \
   '[direct loopback probes]' \
   'probe=nginx_direct result=PASS' \
   'probe=jupyter_direct result=PASS' \
@@ -174,6 +219,13 @@ for expected in \
   fi
 done
 
+tcp_line="$(grep -nF 'probe=nginx_tcp_ipv6' "$unhealthy_output" | head -n1 | cut -d: -f1)"
+http_line="$(grep -nF 'probe=nginx_direct' "$unhealthy_output" | head -n1 | cut -d: -f1)"
+if ((tcp_line >= http_line)); then
+  printf '%s\n' 'TCP diagnostics did not precede HTTP probes.' >&2
+  exit 1
+fi
+
 if [[ "$(grep -Fc -- '--- Container diagnostics' "$unhealthy_output")" != '1' ]]; then
   printf '%s\n' 'Failure diagnostics were printed more than once.' >&2
   cat "$unhealthy_output" >&2
@@ -187,6 +239,23 @@ if ! grep -Eq '^5s docker (inspect|logs|top|exec)$' "$SMOKE_FAKE_DIR/bounded-dia
   printf '%s\n' 'Docker diagnostics did not use bounded timeout calls.' >&2
   exit 1
 fi
+if grep -Ev '^5s docker (inspect|logs|top|exec)$' "$SMOKE_FAKE_DIR/bounded-diagnostics"; then
+  printf '%s\n' 'A failure diagnostic call used an unexpected timeout budget.' >&2
+  exit 1
+fi
+
+config_timeout_output="$(run_smoke config_timeout unhealthy 1)"
+for expected in \
+  '[nginx effective configuration] diagnostic command unavailable (exit_code=124)' \
+  'RUNTIME_TCP_8888_IPV4=NOT_LISTENING' \
+  'probe=nginx_tcp_ipv4 result=FAIL' \
+  'probe=asr_direct result=PASS'; do
+  if ! grep -Fq -- "$expected" "$config_timeout_output"; then
+    printf 'Diagnostics stopped after config timeout; missing: %s\n' "$expected" >&2
+    cat "$config_timeout_output" >&2
+    exit 1
+  fi
+done
 
 timeout_output="$(run_smoke normal starting 1)"
 for expected in \

@@ -32,6 +32,7 @@ RUN python -m venv --system-site-packages /opt/asr-venv \
 COPY asr-lab /opt/asr-lab
 COPY nginx-salad.conf /etc/nginx/conf.d/default.conf
 COPY salad_healthcheck.py /usr/local/bin/salad-healthcheck.py
+COPY salad_nginx_diagnostics.py /usr/local/bin/salad-nginx-diagnostics.py
 COPY salad-jupyter-entrypoint.sh /usr/local/bin/salad-jupyter-entrypoint
 COPY salad-supervisor-watch.sh /usr/local/bin/salad-supervisor-watch
 COPY verify-runtime.sh /usr/local/bin/salad-jupyter-verify-runtime
@@ -40,6 +41,7 @@ RUN chmod 0755 \
       /usr/local/bin/salad-supervisor-watch \
       /usr/local/bin/salad-jupyter-verify-runtime \
     && nginx -t \
+    && python /usr/local/bin/salad-nginx-diagnostics.py contract \
     && /usr/local/bin/salad-jupyter-verify-runtime \
     && nvcc --version | grep -Eq 'release 12\.4([,.]|$)'
 
