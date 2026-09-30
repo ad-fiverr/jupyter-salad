@@ -24,6 +24,7 @@ class AudioBuffer:
     has_voice: bool = False
     is_speaking: bool = False
     silence_streak: int = 0
+    request_id: str | None = None
 
     def append(
         self,
@@ -39,6 +40,8 @@ class AudioBuffer:
             raise ValueError("source_mismatch")
         self.last_audio_at = now
         self.speaker = chunk.speaker
+        # Optional client correlation metadata; it never affects segmentation.
+        self.request_id = chunk.request_id
         rms = pcm_rms_normalized(chunk.pcm16le)
 
         if rms >= speech_threshold:
@@ -93,3 +96,4 @@ class AudioBuffer:
         self.has_voice = False
         self.is_speaking = False
         self.silence_streak = 0
+        self.request_id = None

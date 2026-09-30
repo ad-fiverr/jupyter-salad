@@ -137,6 +137,7 @@ async def run_one(ws_url: str, token: str, fixture: Path) -> dict[str, object]:
             "SEGMENT_WAIT_MS": transcript.get("SEGMENT_WAIT_MS"),
             "SERVER_TO_TRANSCRIPT_MS": transcript.get("SERVER_TO_TRANSCRIPT_MS"),
             "SERVER_RECEIVE_TO_TRANSCRIPT_MS": transcript.get("SERVER_RECEIVE_TO_TRANSCRIPT_MS"),
+            "SERVER_AUDIO_END_TO_TRANSCRIPT_MS": transcript.get("SERVER_AUDIO_END_TO_TRANSCRIPT_MS"),
             "audio_duration_ms": transcript.get("audio_duration_ms"),
             "text": str(transcript.get("text", "")),
             "backend": transcript.get("backend"),
@@ -175,6 +176,11 @@ async def run_one(ws_url: str, token: str, fixture: Path) -> dict[str, object]:
         for segment in segment_metrics
         if isinstance(segment.get("SERVER_RECEIVE_TO_TRANSCRIPT_MS"), (int, float))
     ]
+    server_audio_end_values = [
+        float(segment["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"])
+        for segment in segment_metrics
+        if isinstance(segment.get("SERVER_AUDIO_END_TO_TRANSCRIPT_MS"), (int, float))
+    ]
     segment_wait_values = [
         float(segment["SEGMENT_WAIT_MS"])
         for segment in segment_metrics
@@ -196,6 +202,7 @@ async def run_one(ws_url: str, token: str, fixture: Path) -> dict[str, object]:
         "SEGMENT_WAIT_MS": sum(segment_wait_values) if segment_wait_values else None,
         "SERVER_TO_TRANSCRIPT_MS": max(server_values) if server_values else None,
         "SERVER_RECEIVE_TO_TRANSCRIPT_MS": max(server_receive_values) if server_receive_values else None,
+        "SERVER_AUDIO_END_TO_TRANSCRIPT_MS": max(server_audio_end_values) if server_audio_end_values else None,
         "NETWORK_RTT_MS": round(network_rtt_ms, 2),
         "TOTAL_AUDIO_END_TO_TRANSCRIPT_MS": (
             round(total_audio_end_to_transcript_ms, 2)
@@ -228,7 +235,8 @@ def percentile(values: list[float], fraction: float) -> float | None:
 def summarize(rows: list[dict[str, object]]) -> dict[str, object]:
     numeric = (
         "MODEL_INFERENCE_MS", "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS",
-        "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "NETWORK_RTT_MS", "TOTAL_AUDIO_END_TO_TRANSCRIPT_MS",
+        "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS",
+        "NETWORK_RTT_MS", "TOTAL_AUDIO_END_TO_TRANSCRIPT_MS",
         "MODEL_INFERENCE_RTF", "END_TO_END_RTF",
     )
     summary: dict[str, object] = {
@@ -244,7 +252,7 @@ def summarize(rows: list[dict[str, object]]) -> dict[str, object]:
             for segment in row.get("segments", [])
             if key in {
                 "MODEL_INFERENCE_MS", "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS",
-                "SERVER_RECEIVE_TO_TRANSCRIPT_MS",
+                "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS",
             }
             and isinstance(segment, dict)
             and isinstance(segment.get(key), (int, float))

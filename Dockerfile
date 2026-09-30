@@ -46,6 +46,16 @@ RUN chmod 0755 \
     && /usr/local/bin/salad-jupyter-verify-runtime \
     && nvcc --version | grep -Eq 'release 12\.4([,.]|$)'
 
+# Fail the image build if the benchmark UI/worklet/tests are omitted from the
+# image. Unit tests use the CI-safe fakes and never download or load model weights.
+RUN test -s /opt/asr-lab/asr_lab/benchmark_web/index.html \
+    && test -s /opt/asr-lab/asr_lab/benchmark_web/app.mjs \
+    && test -s /opt/asr-lab/asr_lab/benchmark_web/audio-worklet.mjs \
+    && test -s /opt/asr-lab/asr_lab/benchmark_web/core.mjs \
+    && test -s /opt/asr-lab/asr_lab/benchmark_web/style.css \
+    && PYTHONPATH=/opt/asr-lab /opt/asr-venv/bin/python -m unittest discover \
+      -s /opt/asr-lab/tests -v
+
 EXPOSE 8888
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \

@@ -197,6 +197,7 @@ assert app.title == "Salad ASR Lab"
 assert "asr_lab.backends.parakeet" not in sys.modules
 assert "asr_lab.backends.faster_whisper" not in sys.modules
 print("ASR environment: pinned direct versions, NeMo ASR dependencies, inherited Torch, and lazy backend selection: OK")
+print("GPU telemetry: optional NVML binding (GPU device sampling still requires Salad runtime)")
 print(f"NeMo ASR metadata dependencies checked: {checked_nemo_requirements}")
 print("VERIFY_RUNTIME_BASELINE=NEMO")
 print("PARAKEET_RUNTIME=NEMO")

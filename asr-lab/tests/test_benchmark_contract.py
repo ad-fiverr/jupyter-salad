@@ -22,13 +22,15 @@ class FakeWebSocket:
                 "event": "transcript", "type": "transcript", "text": "prueba",
                 "backend": "parakeet", "MODEL_INFERENCE_MS": 25.0,
                 "SEGMENT_WAIT_MS": 10.0, "SERVER_TO_TRANSCRIPT_MS": 30.0,
-                "SERVER_RECEIVE_TO_TRANSCRIPT_MS": 40.0, "audio_duration_ms": 200.0,
+                "SERVER_RECEIVE_TO_TRANSCRIPT_MS": 40.0,
+                "SERVER_AUDIO_END_TO_TRANSCRIPT_MS": 70.0, "audio_duration_ms": 200.0,
             },
             {
                 "event": "transcript", "type": "transcript", "text": "benchmark",
                 "backend": "parakeet", "MODEL_INFERENCE_MS": 5.0,
                 "SEGMENT_WAIT_MS": 20.0, "SERVER_TO_TRANSCRIPT_MS": 50.0,
-                "SERVER_RECEIVE_TO_TRANSCRIPT_MS": 60.0, "audio_duration_ms": 200.0,
+                "SERVER_RECEIVE_TO_TRANSCRIPT_MS": 60.0,
+                "SERVER_AUDIO_END_TO_TRANSCRIPT_MS": 90.0, "audio_duration_ms": 200.0,
             },
         ]
         self.sent = []
@@ -140,6 +142,8 @@ class BenchmarkContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["SEGMENT_WAIT_MS"], 30.0)
         self.assertEqual(result["SERVER_TO_TRANSCRIPT_MS"], 50.0)
         self.assertEqual(result["SERVER_RECEIVE_TO_TRANSCRIPT_MS"], 60.0)
+        self.assertEqual(result["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"], 90.0)
+        self.assertEqual(result["segments"][0]["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"], 70.0)
         self.assertEqual(result["segment_count"], 2)
         self.assertEqual(result["transcript"], "prueba benchmark")
         self.assertIsInstance(result["NETWORK_RTT_MS"], float)
@@ -154,6 +158,7 @@ class BenchmarkContractTests(unittest.IsolatedAsyncioTestCase):
             "SEGMENT_WAIT_MS": None,
             "SERVER_TO_TRANSCRIPT_MS": None,
             "SERVER_RECEIVE_TO_TRANSCRIPT_MS": None,
+            "SERVER_AUDIO_END_TO_TRANSCRIPT_MS": None,
             "NETWORK_RTT_MS": None,
             "TOTAL_AUDIO_END_TO_TRANSCRIPT_MS": None,
             "MODEL_INFERENCE_RTF": None,
@@ -162,6 +167,7 @@ class BenchmarkContractTests(unittest.IsolatedAsyncioTestCase):
         }])
         self.assertIsNone(summary["MODEL_INFERENCE_MS_P50"])
         self.assertIsNone(summary["SEGMENT_WAIT_MS_P95"])
+        self.assertIsNone(summary["SERVER_AUDIO_END_TO_TRANSCRIPT_MS_P50"])
         self.assertIsNone(summary["NETWORK_RTT_MS_P50"])
 
     async def test_no_transcript_keeps_audio_latency_and_end_to_end_rtf_null(self):

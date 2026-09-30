@@ -15,6 +15,7 @@ on:
       - 'verify-runtime.sh'
       - 'ci-smoke-test.sh'
       - 'tests/**'
+      - 'asr-lab/**'
       - '.dockerignore'
       - '.github/workflows/build.yml'
   workflow_dispatch:
@@ -68,7 +69,12 @@ jobs:
           python3 tests/test_salad_healthcheck.py
           python3 tests/test_nginx_listeners.py
           python3 tests/test_salad_nginx_diagnostics.py
+          python3 tests/test_asr_benchmark_assets.py
           bash tests/test-ci-smoke-diagnostics.sh
+          node --check asr-lab/asr_lab/benchmark_web/app.mjs
+          node --check asr-lab/asr_lab/benchmark_web/audio-worklet.mjs
+          node --check asr-lab/asr_lab/benchmark_web/core.mjs
+          node --test asr-lab/tests/core.test.mjs
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4.4.1

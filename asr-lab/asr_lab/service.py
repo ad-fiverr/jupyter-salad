@@ -7,16 +7,18 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from fastapi import FastAPI, Query, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, Query, WebSocket
+from fastapi.responses import FileResponse, JSONResponse
 
 from .broker import InferenceBroker
 from .buffering import AudioBuffer, INACTIVITY_FLUSH_SECONDS
 from .config import Settings
 from .protocol import AudioChunk, FlushRequest, ProtocolError, parse_message
 from .security import token_matches
+from .telemetry import collect_telemetry
 
 settings = Settings.from_env()
 logger = logging.getLogger("asr_lab.service")
@@ -59,6 +61,41 @@ async def _load_backend(target: InferenceBroker) -> None:
 
 
 app = FastAPI(title="Salad ASR Lab", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+BENCHMARK_WEB_ROOT = Path(__file__).with_name("benchmark_web")
+BENCHMARK_ASSETS = {"app.mjs", "audio-worklet.mjs", "core.mjs", "style.css"}
+BENCHMARK_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self' ws: wss:; worker-src 'self'; "
+        "img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    ),
+    "Permissions-Policy": "microphone=(self)",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
+@app.get("/asr/benchmark", include_in_schema=False)
+async def benchmark_page() -> FileResponse:
+    return FileResponse(BENCHMARK_WEB_ROOT / "index.html", headers=BENCHMARK_HEADERS)
+
+
+@app.get("/asr/benchmark/{asset_name}", include_in_schema=False)
+async def benchmark_asset(asset_name: str) -> FileResponse | JSONResponse:
+    if asset_name not in BENCHMARK_ASSETS:
+        return JSONResponse({"detail": "Not found"}, status_code=404, headers=BENCHMARK_HEADERS)
+    return FileResponse(BENCHMARK_WEB_ROOT / asset_name, headers=BENCHMARK_HEADERS)
+
+
+@app.get("/asr/telemetry", include_in_schema=False)
+async def telemetry(authorization: str | None = Header(default=None)) -> JSONResponse:
+    scheme, _, bearer = (authorization or "").partition(" ")
+    if scheme.casefold() != "bearer" or not settings.api_token or not token_matches(bearer, settings.api_token):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
+    snapshot = await asyncio.to_thread(collect_telemetry, broker, settings)
+    return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
 
 
 def _worker_metrics() -> list[dict[str, Any]]:
@@ -237,6 +274,7 @@ async def _flush(
         return
     segment_started_at = audio.started_at
     last_voice_at = audio.last_voice_at
+    client_request_id = getattr(audio, "request_id", None)
     speaker = audio.speaker
     pcm = audio.take()
     try:
@@ -254,9 +292,14 @@ async def _flush(
         if result.pop("_discarded_historical_output", False):
             return
         transcript_ready_at = time.perf_counter()
+        result["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"] = round(
+            max(0.0, transcript_ready_at - last_voice_at) * 1000, 2
+        )
         result["SERVER_RECEIVE_TO_TRANSCRIPT_MS"] = round(
             max(0.0, transcript_ready_at - segment_started_at) * 1000, 2
         )
+        if client_request_id is not None:
+            result["client_request_id"] = client_request_id
         await send_json(result)
     except RuntimeError as exc:
         code = str(exc) if str(exc) in {"backend_not_ready", "inference_queue_full", "inference_failed"} else "inference_failed"

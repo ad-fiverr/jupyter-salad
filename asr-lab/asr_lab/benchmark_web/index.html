@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Live ASR Benchmark · Salad</title>
+  <link rel="stylesheet" href="/asr/benchmark/style.css">
+  <script type="module" src="/asr/benchmark/app.mjs"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">SALAD · GPU LAB</p>
+        <h1>Live ASR Benchmark</h1>
+        <p class="subhead">Habla y mide la transcripción final por segmento. El audio se transmite en vivo y no se guarda.</p>
+      </div>
+      <div class="mode-badge"><span>TRANSCRIPT_MODE</span><strong>FINAL_SEGMENT</strong></div>
+    </header>
+
+    <section class="panel controls" aria-labelledby="controls-title">
+      <div class="panel-heading">
+        <div><p class="eyebrow">SESIÓN</p><h2 id="controls-title">Conexión y captura</h2></div>
+        <div class="status-grid">
+          <span class="status-pill" id="ws-status" data-state="idle">WebSocket: desconectado</span>
+          <span class="status-pill" id="model-status" data-state="unknown">Modelo: sin comprobar</span>
+        </div>
+      </div>
+      <div class="form-grid">
+        <label class="wide">ASR API token
+          <input id="api-token" type="password" autocomplete="off" spellcheck="false" aria-describedby="token-help">
+          <small id="token-help">Sólo memoria de esta página. Se borra del campo al iniciar y de la sesión al terminar.</small>
+        </label>
+        <label class="wide">Texto esperado (opcional, para WER)
+          <textarea id="reference-text" rows="2" placeholder="Escribe aquí el texto que vas a leer"></textarea>
+        </label>
+      </div>
+      <div class="action-row">
+        <button id="start-button" class="primary" type="button">Iniciar grabación</button>
+        <button id="stop-button" class="secondary" type="button" disabled>Detener / Flush</button>
+        <button id="disconnect-button" class="quiet" type="button" disabled>Desconectar</button>
+        <span class="timer" id="timer">00:00</span>
+      </div>
+      <p class="notice" id="notice" role="status">El micrófono requiere permiso y un contexto seguro HTTPS. Se usa el WebSocket ASR existente.</p>
+      <div class="summary-grid" id="summary-grid" aria-live="polite">
+        <div class="metric-card"><span>Segmentos</span><strong id="summary-segments">0</strong></div>
+        <div class="metric-card"><span>Errores</span><strong id="summary-errors">0</strong></div>
+        <div class="metric-card"><span>Audio capturado</span><strong id="summary-audio">0.0 s</strong></div>
+        <div class="metric-card"><span>Inference RTF</span><strong id="summary-rtf">—</strong></div>
+        <div class="metric-card"><span>WER</span><strong id="summary-wer">—</strong></div>
+        <div class="metric-card"><span>Client EOS p50 / p95</span><strong id="summary-client-eos">—</strong></div>
+        <div class="metric-card"><span>Server EOS p50 / p95</span><strong id="summary-server-eos">—</strong></div>
+        <div class="metric-card"><span>Inference p50 / p95</span><strong id="summary-inference">—</strong></div>
+      </div>
+    </section>
+
+    <section class="panel transcript-panel" aria-labelledby="transcript-title">
+      <div class="panel-heading"><div><p class="eyebrow">RESULTADO</p><h2 id="transcript-title">Transcripción final</h2></div><div id="run-meta" class="run-meta">Sin sesión</div></div>
+      <div id="transcript" class="transcript" aria-live="polite">La transcripción aparecerá cuando el servidor cierre un segmento.</div>
+    </section>
+
+    <section class="panel" aria-labelledby="segments-title">
+      <div class="panel-heading"><div><p class="eyebrow">MÉTRICAS REALES</p><h2 id="segments-title">Segmentos</h2></div><div class="export-row"><button id="export-json" class="quiet" type="button" disabled>Exportar JSON</button><button id="export-csv" class="quiet" type="button" disabled>Exportar CSV</button></div></div>
+      <div class="table-wrap"><table><thead><tr>
+        <th># / voz</th><th>Transcripción</th><th>Modelo ms</th><th>Espera segmento ms</th><th>Cola ms</th><th>Servidor EOS ms</th><th>Cliente EOS ms*</th><th>Recepción total ms</th><th>Audio ms</th>
+      </tr></thead><tbody id="segments-body"><tr><td colspan="9" class="empty">Aún no hay segmentos.</td></tr></tbody></table></div>
+      <p class="fine-print">* Medido en el reloj del navegador desde el último bloque de 100 ms sobre RMS 0.015. Resolución aproximada de un bloque y planificación del hilo del navegador; no se resta ningún reloj de servidor.</p>
+    </section>
+
+    <section class="charts-grid" aria-label="Gráficas de benchmark">
+      <article class="panel chart-card"><h3>MODEL_INFERENCE_MS por segmento</h3><canvas id="chart-inference" aria-label="Latencia de inferencia por segmento"></canvas></article>
+      <article class="panel chart-card"><h3>Fin de voz → transcript por segmento</h3><canvas id="chart-eos" aria-label="Latencia fin de voz a transcripción"></canvas></article>
+      <article class="panel chart-card"><h3>GPU utilization % · muestreo 1 Hz</h3><canvas id="chart-gpu" aria-label="Uso de GPU"></canvas></article>
+      <article class="panel chart-card"><h3>VRAM usada / total MiB · 1 Hz</h3><canvas id="chart-vram" aria-label="Memoria de GPU"></canvas></article>
+      <article class="panel chart-card"><h3>Process RSS MiB · 1 Hz</h3><canvas id="chart-ram" aria-label="RAM del proceso"></canvas></article>
+    </section>
+
+    <footer>Las métricas GPU pueden quedar como no disponibles si NVML no existe. No hay partials ni word-level streaming en este endpoint.</footer>
+  </main>
+</body>
+</html>
