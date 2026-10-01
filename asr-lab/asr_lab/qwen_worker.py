@@ -179,14 +179,31 @@ class QwenWorkerEngine:
         state = self.sessions.get(stream_id)
         if state is None:
             raise KeyError("stream_not_found")
+        scheduler_key = payload.get("scheduler_key")
+        if scheduler_key is not None:
+            if (
+                not isinstance(scheduler_key, dict)
+                or set(scheduler_key) != {"connection_id", "stream_id", "scheduler_revision"}
+                or scheduler_key.get("connection_id") != payload.get("connection_id")
+                or scheduler_key.get("stream_id") != stream_id
+                or not isinstance(scheduler_key.get("connection_id"), str)
+                or not 1 <= len(scheduler_key["connection_id"]) <= 128
+                or not isinstance(scheduler_key.get("scheduler_revision"), int)
+                or scheduler_key["scheduler_revision"] < 1
+            ):
+                raise ValueError("invalid_scheduler_key")
         if operation == "push":
-            return self._push(state, payload)
-        if operation == "finish":
-            return self._finish(state)
-        if operation == "close":
+            result = self._push(state, payload)
+        elif operation == "finish":
+            result = self._finish(state)
+        elif operation == "close":
             self.sessions.pop(stream_id, None)
             return {"stream_id": stream_id, "closed": True}
-        raise ValueError("unsupported_operation")
+        else:
+            raise ValueError("unsupported_operation")
+        if scheduler_key is not None:
+            result["scheduler_key"] = dict(scheduler_key)
+        return result
 
     def _push(self, state: Any, payload: dict[str, Any]) -> dict[str, Any]:
         import numpy as np
@@ -202,18 +219,23 @@ class QwenWorkerEngine:
         started = time.perf_counter()
         self.model.streaming_transcribe(audio, state)
         decode_wall_ms = (time.perf_counter() - started) * 1000
+        after_chunk = int(state.chunk_id)
         return {
-            "decoded": int(state.chunk_id) > before_chunk,
+            "decoded": after_chunk > before_chunk,
+            "decode_steps_delta": max(0, after_chunk - before_chunk),
             "decode_wall_ms": round(decode_wall_ms, 3),
             "text": str(state.text or ""),
             "language": str(state.language or "") or None,
         }
 
     def _finish(self, state: Any) -> dict[str, Any]:
+        before_chunk = int(state.chunk_id)
         started = time.perf_counter()
         self.model.finish_streaming_transcribe(state)
         decode_wall_ms = (time.perf_counter() - started) * 1000
+        after_chunk = int(state.chunk_id)
         return {
+            "decode_steps_delta": max(0, after_chunk - before_chunk),
             "decode_wall_ms": round(decode_wall_ms, 3),
             "text": str(state.text or ""),
             "language": str(state.language or "") or None,

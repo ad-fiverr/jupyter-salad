@@ -12,15 +12,19 @@ import {
   ShadowVad,
   StreamingResampler,
   boundedPush,
+  canvasBackingSize,
   csvCell,
   floatToPcm16LE,
   formatMilliseconds,
   gpuStatusLabel,
+  isTerminalQwenError,
   median,
   pcm16RmsNormalized,
   percentile,
   rttPercentiles,
+  qwenDeviceTelemetryLabel,
   wordErrorRate,
+  shouldDrawCanvas,
 } from "../asr_lab/benchmark_web/core.mjs";
 
 const appSource = readFileSync(new URL("../asr_lab/benchmark_web/app.mjs", import.meta.url), "utf8");
@@ -130,6 +134,19 @@ test("compute availability never becomes a false GPU-unavailable label when CUDA
   assert.equal(gpuStatusLabel({}, {}), "GPU de cómputo no confirmada");
 });
 
+test("Qwen dashboard formats flattened device-global GPU and RAM telemetry", () => {
+  const label = qwenDeviceTelemetryLabel({
+    gpu_compute: { available: true, cuda: true, device: "NVIDIA RTX 3090" },
+    gpu_device: "NVIDIA RTX 3090",
+    vram_used_mib: 8192,
+    vram_total_mib: 24576,
+    process_rss_mib: 512,
+  });
+  assert.equal(label, "NVIDIA RTX 3090 · 8192/24576 MiB · 512 MiB RAM");
+  assert.match(appSource, /qwenDeviceTelemetryLabel\(latestTelemetry\)/);
+  assert.doesNotMatch(appSource.slice(appSource.indexOf("function updateQwenSummary"), appSource.indexOf("function renderQwenCharts")), /latestTelemetry\.gpu_telemetry/);
+});
+
 test("browser control RTT samples are bounded and expose separate p50/p95", () => {
   const samples = [{ PROXY_WS_RTT_MS: 20 }, { PROXY_WS_RTT_MS: 31 }, { PROXY_WS_RTT_MS: 44 }, { PROXY_WS_RTT_MS: null }];
   assert.deepEqual(rttPercentiles(samples), { p50: 31, p95: 44 });
@@ -141,6 +158,15 @@ test("latency rendering preserves hundredth-millisecond queue values", () => {
   assert.equal(formatMilliseconds(0.02), "0.02 ms");
   assert.equal(formatMilliseconds(112), "112.00 ms");
   assert.equal(formatMilliseconds(null), "—");
+});
+
+test("mobile canvas backing dimensions cap DPR and skip hidden or zero-size canvases", () => {
+  assert.deepEqual(canvasBackingSize(390, 150, 3), { width: 780, height: 300, dpr: 2 });
+  assert.deepEqual(canvasBackingSize(5000, 3000, 2), { width: 4096, height: 2048, dpr: 2 });
+  assert.equal(canvasBackingSize(0, 150, 2), null);
+  assert.equal(shouldDrawCanvas(true, 390, 150), false);
+  assert.equal(shouldDrawCanvas(false, 0, 150), false);
+  assert.equal(shouldDrawCanvas(false, 390, 150), true);
 });
 
 test("metric definitions distinguish duration, server-only clocks, client path and RTT", () => {
@@ -163,6 +189,12 @@ test("application RTT ping uses the authenticated ASR websocket and performance.
 test("Qwen live UI exposes replaceable partial revisions, chunk experiments and separate final", () => {
   assert.match(htmlSource, /id="transcript-mode"/);
   assert.match(htmlSource, /id="qwen-chunk-size"/);
+  for (const id of ["qwen-active-streams", "qwen-pending-active", "qwen-backlog", "qwen-decode-percentiles", "qwen-wait-percentiles", "qwen-stream-lag", "qwen-overruns"]) {
+    assert.match(htmlSource, new RegExp(`id="${id}"`));
+  }
+  for (const id of ["chart-qwen-wait", "chart-qwen-backlog", "chart-qwen-lag", "chart-qwen-decode"]) {
+    assert.match(htmlSource, new RegExp(`id="${id}"`));
+  }
   assert.match(htmlSource, /Audio hablado · duración, no latencia/);
   assert.match(htmlSource, /Server EOS → transcript/);
   assert.match(htmlSource, /Client EOS → transcript/);
@@ -180,6 +212,9 @@ test("Qwen live UI exposes replaceable partial revisions, chunk experiments and 
   assert.match(appSource, /CLIENT_PARTIAL_UPDATE_INTERVAL_MS/);
   assert.match(appSource, /qwen-proxy-rtt/);
   assert.match(appSource, /qwen-final-wer/);
+  assert.match(appSource, /canvasBackingSize\(rect\.width, rect\.height, window\.devicePixelRatio/);
+  assert.match(appSource, /shouldDrawCanvas\(canvas\.closest\("\[hidden\]"\)/);
+  assert.match(appSource, /document\.querySelectorAll\("\.offline-only"\)/);
   assert.match(appSource, /const wer = state\.backend === "qwen3_asr" \|\| !state\.reference\.trim\(\)\s+\? null : wordErrorRate\(state\.reference, transcriptText\(\)\)/);
   assert.match(appSource, /const productionWer = !isQwen && reference \? wordErrorRate\(reference, candidateText\) : null/);
   assert.match(appSource, /const candidateWer = isQwen && reference \? wordErrorRate\(reference, candidateText\) : null/);
@@ -198,6 +233,11 @@ test("Qwen live UI exposes replaceable partial revisions, chunk experiments and 
   assert.match(appSource, /FINAL_CANDIDATE_WER: row\.FINAL_CANDIDATE_WER/);
   assert.match(appSource, /record_type: partial\.event \?\? "partial_candidate"/);
   assert.match(appSource, /message\.event === "final_candidate"/);
+  assert.equal(isTerminalQwenError("stream_scheduler_overrun"), true);
+  assert.equal(isTerminalQwenError("stream_terminal"), true);
+  assert.equal(isTerminalQwenError("invalid_language"), false);
+  assert.match(appSource, /state\.backend === "qwen3_asr" && isTerminalQwenError\(code\)/);
+  assert.match(appSource, /void cleanup\(false\)/);
   assert.match(appSource, /candidate_only: candidateOnly/);
   assert.match(appSource, /message\.event === "transcript" \|\| message\.type === "transcript"/);
   assert.match(appSource, /candidate_only: true/);
@@ -206,6 +246,16 @@ test("Qwen live UI exposes replaceable partial revisions, chunk experiments and 
   assert.match(appSource, /transcript_mode: state\.backend === "qwen3_asr" \? "STREAMING_PARTIALS" : "FINAL_SEGMENT"/);
   assert.match(appSource, /state\.clientEosAt = performance\.now\(\)/);
   assert.doesNotMatch(appSource, /localStorage|sessionStorage/);
+});
+
+test("benchmark CSS keeps base layout and bounds Qwen/mobile dashboard", () => {
+  const styleSource = readFileSync(new URL("../asr_lab/benchmark_web/style.css", import.meta.url), "utf8");
+  assert.match(styleSource, /--/);
+  assert.match(styleSource, /\.shell/);
+  assert.match(styleSource, /\.panel/);
+  assert.match(styleSource, /\.qwen-scheduler-grid/);
+  assert.match(styleSource, /max-width:560px/);
+  assert.match(styleSource, /\.partial-timeline-wrap\{max-height:360px/);
 });
 
 test("Stop drains the last worklet PCM chunk before freezing capture and marking EOS", () => {

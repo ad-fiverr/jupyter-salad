@@ -45,6 +45,11 @@ class QwenWorkerProcess:
         self._closed = False
         self.model_report: dict[str, Any] = {}
 
+    @property
+    def rpc_pending_requests(self) -> int:
+        """Outstanding JSON-RPC futures; this is transport state, not decode backlog."""
+        return len(self.pending)
+
     async def start(
         self,
         *,

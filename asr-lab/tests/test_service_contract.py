@@ -395,6 +395,194 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("resultado-client-b", json.dumps(socket_a.sent))
         self.assertNotIn("resultado-client-a", json.dumps(socket_b.sent))
 
+    async def test_qwen_websocket_pumps_owned_partial_then_final_before_flush_barrier(self):
+        service = self.setup_service()
+        service.settings = Settings.from_env({
+            "ASR_BACKEND": "parakeet", "ASR_API_TOKEN": TOKEN,
+            "QWEN_STREAMING_ENABLED": "1", "QWEN_STREAMING_RUNTIME_AVAILABLE": "1",
+        })
+
+        class FakeQwenRuntime:
+            ready = True
+
+            async def open_session(self, *, connection_id, source, event_sink, **kwargs):
+                self.connection_id = connection_id
+                self.source = source
+                self.event_sink = event_sink
+                self.stream_id = "owned-stream"
+                return {"event": "stream_started", "stream_id": self.stream_id, "request_id": kwargs.get("request_id")}
+
+            async def push_audio(self, *, connection_id, source, pcm16le):
+                self.assert_owner(connection_id, source, pcm16le)
+                await self.event_sink({
+                    "event": "partial_candidate", "stream_id": self.stream_id,
+                    "text": "provisional", "final": False, "provisional": True,
+                    "replace": True, "truth_status": "candidate_only", "revision": 1,
+                })
+
+            def assert_owner(self, connection_id, source, pcm16le):
+                assert connection_id == self.connection_id and source == self.source and pcm16le
+
+            async def finish(self, *, connection_id, source, request_id, **kwargs):
+                self.assert_owner(connection_id, source, b"pcm")
+                return {
+                    "event": "final_candidate", "stream_id": self.stream_id,
+                    "text": "final candidate", "final": True, "provisional": True,
+                    "candidate_only": True, "truth_status": "candidate_only",
+                    "replace": True, "revision": 2, "request_id": request_id,
+                }
+
+            async def close_connection(self, _connection_id):
+                return None
+
+        service.qwen_runtime = FakeQwenRuntime()
+        start = {"event": "stream_start", "source": "mic", "request_id": "start-1", "language": "auto", "chunk_size_ms": 250}
+        socket = FakeWebSocket([
+            {"type": "websocket.receive", "text": json.dumps(start)},
+            audio_frame(),
+            flush_frame("flush-1"),
+            {"type": "websocket.disconnect"},
+        ])
+        await service.websocket_asr(socket, token=TOKEN)
+        events = [message.get("event") for message in socket.sent]
+        self.assertEqual(events, ["stream_started", "partial_candidate", "final_candidate", "flush_complete"])
+        self.assertEqual(socket.sent[1]["stream_id"], "owned-stream")
+        self.assertEqual(socket.sent[2]["request_id"], "flush-1")
+
+    async def test_six_qwen_websocket_clients_are_isolated_and_overrun_requires_explicit_restart(self):
+        service = self.setup_service(max_connections=8)
+        service.settings = Settings.from_env({
+            "ASR_BACKEND": "parakeet", "ASR_API_TOKEN": TOKEN,
+            "QWEN_STREAMING_ENABLED": "1", "QWEN_STREAMING_RUNTIME_AVAILABLE": "1",
+            "QWEN_MAX_ACTIVE_STREAMS": "6",
+        })
+
+        class FakeQwenRuntime:
+            ready = True
+
+            def __init__(self):
+                self.sessions = {}
+                self.opened = []
+                self.overrun_raised = False
+                self.closed = []
+
+            async def open_session(self, *, connection_id, source, event_sink, context="", request_id=None, **kwargs):
+                session_number = sum(item["connection_id"] == connection_id for item in self.opened) + 1
+                stream_id = f"{connection_id[:8]}-{session_number}"
+                session = {
+                    "connection_id": connection_id, "source": source, "stream_id": stream_id,
+                    "context": context, "event_sink": event_sink,
+                }
+                self.sessions[(connection_id, source)] = session
+                self.opened.append(session)
+                return {"event": "stream_started", "stream_id": stream_id, "request_id": request_id}
+
+            async def push_audio(self, *, connection_id, source, pcm16le):
+                session = self.sessions[(connection_id, source)]
+                assert pcm16le
+                if session["context"] == "cliente-0-original" and not self.overrun_raised:
+                    self.overrun_raised = True
+                    raise service.StreamingError("stream_scheduler_overrun", {
+                        "reason": "per_stream_backlog_limit", "accepted_audio_ms": 250, "rejected_audio_ms": 600,
+                        "terminal_metrics": {
+                            "scheduler_wait_p50_ms": 12.5,
+                            "scheduler_wait_sample_count": 3,
+                            "decode_wall_p95_ms": 95.0,
+                            "pending_jobs": 4,
+                            "backlog_audio_ms": 500.0,
+                            "accepted_audio_total_ms": 750.0,
+                            "dispatched_audio_total_ms": 250.0,
+                            "overrun_reason": "per_stream_backlog_limit",
+                            "overrun_limit_kind": "backlog_ms",
+                            "overrun_limit_value": 1000.0,
+                            "connection_id": "must-not-leak",
+                            "transcript": "must-not-leak",
+                            "secret": "must-not-leak",
+                        },
+                    })
+                await session["event_sink"]({
+                    "event": "partial_candidate", "stream_id": session["stream_id"],
+                    "text": session["context"], "final": False, "provisional": True,
+                    "replace": True, "truth_status": "candidate_only", "revision": 1,
+                })
+
+            async def finish(self, *, connection_id, source, request_id, **kwargs):
+                session = self.sessions[(connection_id, source)]
+                return {
+                    "event": "final_candidate", "stream_id": session["stream_id"],
+                    "text": session["context"] + " final", "final": True,
+                    "provisional": True, "candidate_only": True,
+                    "truth_status": "candidate_only", "replace": True,
+                    "revision": 2, "request_id": request_id,
+                }
+
+            async def close_connection(self, connection_id):
+                self.closed.append(connection_id)
+                for key in [key for key in self.sessions if key[0] == connection_id]:
+                    self.sessions.pop(key, None)
+
+        runtime = FakeQwenRuntime()
+        service.qwen_runtime = runtime
+        sockets = []
+        for index in range(6):
+            first_context = f"cliente-{index}-original"
+            start = {"event": "stream_start", "source": "mic", "request_id": f"start-{index}",
+                     "language": "auto", "context": first_context, "chunk_size_ms": 250}
+            frames = [
+                {"type": "websocket.receive", "text": json.dumps(start)},
+                audio_frame(),
+            ]
+            if index == 0:
+                frames.extend([
+                    audio_frame(),
+                    flush_frame("failed-stream-flush"),
+                    {"type": "websocket.receive", "text": json.dumps({
+                        "event": "stream_start", "source": "mic", "request_id": "restart-0",
+                        "language": "auto", "context": "cliente-0-reinicio", "chunk_size_ms": 250,
+                    })},
+                    audio_frame(),
+                    flush_frame("restart-flush-0"),
+                ])
+            else:
+                frames.append(flush_frame(f"flush-{index}"))
+            frames.append({"type": "websocket.disconnect"})
+            sockets.append(FakeWebSocket(frames))
+
+        await asyncio.gather(*(service.websocket_asr(socket, token=TOKEN) for socket in sockets))
+
+        self.assertEqual(len(runtime.opened), 7)
+        self.assertEqual(len({item["connection_id"] for item in runtime.opened}), 6)
+        self.assertEqual(sum(item["context"] == "cliente-0-original" for item in runtime.opened), 1)
+        self.assertEqual(sum(item["context"] == "cliente-0-reinicio" for item in runtime.opened), 1)
+        for index, socket in enumerate(sockets):
+            candidates = [item for item in socket.sent if item.get("event") in {"partial_candidate", "final_candidate"}]
+            payload = json.dumps(candidates, ensure_ascii=False)
+            for other in range(6):
+                if index != other:
+                    self.assertNotIn(f"cliente-{other}-", payload)
+            if index == 0:
+                self.assertIn("stream_scheduler_overrun", [item.get("code") for item in socket.sent])
+                self.assertIn("stream_terminal", [item.get("code") for item in socket.sent])
+                overrun = next(item for item in socket.sent if item.get("code") == "stream_scheduler_overrun")
+                terminal_metrics = overrun["scheduler"]["terminal_metrics"]
+                self.assertEqual(terminal_metrics["scheduler_wait_sample_count"], 3)
+                self.assertEqual(terminal_metrics["decode_wall_p95_ms"], 95.0)
+                self.assertEqual(terminal_metrics["accepted_audio_total_ms"], 750.0)
+                self.assertFalse({"connection_id", "transcript", "secret"} & terminal_metrics.keys())
+                self.assertEqual([item["text"] for item in candidates], [
+                    "cliente-0-reinicio", "cliente-0-reinicio final",
+                ])
+                self.assertEqual(len([item for item in socket.sent if item.get("event") == "stream_started"]), 2)
+                final_position = next(pos for pos, item in enumerate(socket.sent) if item.get("event") == "final_candidate")
+                barrier_position = max(pos for pos, item in enumerate(socket.sent) if item.get("event") == "flush_complete")
+                self.assertLess(final_position, barrier_position)
+            else:
+                events = [item.get("event") for item in socket.sent]
+                self.assertEqual(events, ["stream_started", "partial_candidate", "final_candidate", "flush_complete"])
+                self.assertEqual(candidates[0]["text"], f"cliente-{index}-original")
+                self.assertEqual(candidates[1]["text"], f"cliente-{index}-original final")
+                self.assertLess(events.index("final_candidate"), events.index("flush_complete"))
+
     async def test_historical_parakeet_blacklist_output_is_not_sent_to_client(self):
         service = self.setup_service()
 

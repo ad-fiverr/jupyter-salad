@@ -6,8 +6,17 @@ import base64
 import re
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Protocol
+from collections import deque
+from dataclasses import dataclass, field as dataclass_field
+from typing import Any, Awaitable, Callable, Protocol
+
+from .qwen_scheduler import (
+    DecodeJob,
+    DispatchResult,
+    QwenDecodeScheduler,
+    RequestKey,
+    SchedulerError,
+)
 
 STREAMING_CLASS = "accumulated-audio-pseudostreaming"
 ALLOWED_CHUNK_MS = (250, 500, 1000, 2000)
@@ -30,9 +39,10 @@ class WorkerRPC(Protocol):
 
 
 class StreamingError(RuntimeError):
-    def __init__(self, code: str):
+    def __init__(self, code: str, details: dict[str, Any] | None = None):
         super().__init__(code)
         self.code = code
+        self.details = details or {}
 
 
 def validate_candidate_event(payload: dict[str, Any], expected_event: str) -> dict[str, Any]:
@@ -63,6 +73,8 @@ class StreamSession:
     started_at: float
     last_activity_at: float
     max_stream_seconds: float
+    event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    event_queue: asyncio.Queue[dict[str, Any]] = dataclass_field(default_factory=lambda: asyncio.Queue(maxsize=32))
     first_audio_at: float | None = None
     audio_samples: int = 0
     revision: int = 0
@@ -72,6 +84,8 @@ class StreamSession:
     first_partial_at: float | None = None
     last_partial_at: float | None = None
     cumulative_decode_wall_ms: float = 0.0
+    scheduler_metrics: deque[dict[str, Any]] = dataclass_field(default_factory=lambda: deque(maxlen=256))
+    latest_scheduler_key: RequestKey | None = None
 
 
 def token_revision_metrics(previous: str, current: str) -> tuple[float | None, float | None]:
@@ -111,6 +125,8 @@ class QwenStreamingRuntime:
         default_language: str,
         unfixed_chunk_num: int,
         unfixed_token_num: int,
+        max_pending_jobs: int = 24,
+        max_backlog_chunks: int = 4,
     ) -> None:
         self.worker = worker
         self.model_id = model_id
@@ -125,10 +141,19 @@ class QwenStreamingRuntime:
         self.unfixed_chunk_num = unfixed_chunk_num
         self.unfixed_token_num = unfixed_token_num
         self.sessions: dict[tuple[str, str], StreamSession] = {}
+        self.sessions_by_stream_id: dict[tuple[str, str], StreamSession] = {}
         self._sessions_lock = asyncio.Lock()
         self._sweeper: asyncio.Task[None] | None = None
         self._closing = False
         self._worker_metrics: list[dict[str, Any]] = []
+        self.scheduler = QwenDecodeScheduler(
+            execute=self._execute_scheduled,
+            on_result=self._scheduled_result,
+            on_fault=self._scheduler_fault,
+            max_pending_jobs=max_pending_jobs,
+            max_backlog_chunks=max_backlog_chunks,
+            max_active_streams=max_active_sessions,
+        )
 
     @property
     def ready(self) -> bool:
@@ -147,7 +172,7 @@ class QwenStreamingRuntime:
 
     @property
     def queued_jobs(self) -> int:
-        return 0
+        return self.scheduler.pending_jobs
 
     @property
     def active_sessions(self) -> int:
@@ -164,6 +189,7 @@ class QwenStreamingRuntime:
             unfixed_token_num=self.unfixed_token_num,
         )
         self._worker_metrics = [report] if report else []
+        await self.scheduler.start()
         self._sweeper = asyncio.create_task(self._expire_loop(), name="qwen-stream-expiry")
 
     async def open_session(
@@ -175,6 +201,7 @@ class QwenStreamingRuntime:
         context: str = "",
         chunk_size_ms: int | None = None,
         request_id: str | None = None,
+        event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         if not self.ready:
             raise StreamingError("backend_not_ready")
@@ -193,15 +220,23 @@ class QwenStreamingRuntime:
                 raise StreamingError("stream_capacity_exceeded")
             stream_id = uuid.uuid4().hex
             now = time.perf_counter()
-            await self.worker.request(
-                "init",
-                stream_id=stream_id,
-                chunk_size_sec=chunk_ms / 1000.0,
-                language=QWEN_LANGUAGE_NAMES.get(language_value),
-                context=context,
-                unfixed_chunk_num=self.unfixed_chunk_num,
-                unfixed_token_num=self.unfixed_token_num,
-            )
+            try:
+                await self.worker.request(
+                    "init",
+                    stream_id=stream_id,
+                    chunk_size_sec=chunk_ms / 1000.0,
+                    language=QWEN_LANGUAGE_NAMES.get(language_value),
+                    context=context,
+                    unfixed_chunk_num=self.unfixed_chunk_num,
+                    unfixed_token_num=self.unfixed_token_num,
+                )
+                await self.scheduler.register(connection_id, stream_id, chunk_ms)
+            except Exception:
+                try:
+                    await self.worker.request("close", stream_id=stream_id)
+                except Exception:
+                    pass
+                raise
             session = StreamSession(
                 owner_connection_id=connection_id,
                 source=source,
@@ -213,8 +248,10 @@ class QwenStreamingRuntime:
                 started_at=now,
                 last_activity_at=now,
                 max_stream_seconds=self.max_stream_seconds,
+                event_sink=event_sink,
             )
             self.sessions[key] = session
+            self.sessions_by_stream_id[(connection_id, stream_id)] = session
         return {
             "event": "stream_started",
             "backend": "qwen3_asr",
@@ -234,37 +271,64 @@ class QwenStreamingRuntime:
         session = self.sessions.get(key)
         if session is None or session.owner_connection_id != connection_id:
             raise StreamingError("stream_not_started")
+        if not pcm16le or len(pcm16le) % 2:
+            raise StreamingError("invalid_audio")
         samples = len(pcm16le) // 2
         if session.audio_samples + samples > session.max_stream_seconds * 16_000:
             await self.close_session(connection_id=connection_id, source=source)
             raise StreamingError("stream_duration_limit")
-        session.audio_samples += samples
-        chunk_started = time.perf_counter()
-        if session.first_audio_at is None:
-            session.first_audio_at = chunk_started
-        session.last_activity_at = chunk_started
-        started = chunk_started
+        received_at = time.perf_counter()
         try:
-            reply = await self.worker.request(
-                "push",
-                stream_id=session.stream_id,
-                pcm16le_base64=base64.b64encode(pcm16le).decode("ascii"),
+            await self.scheduler.append_pcm(
+                connection_id, session.stream_id, pcm16le,
             )
-        except StreamingError as exc:
-            if exc.code in {"stream_worker_unavailable", "stream_worker_timeout"}:
-                await self.close_session(connection_id=connection_id, source=source)
-                raise StreamingError("stream_worker_failed") from exc
-            raise
-        except Exception as exc:
-            raise StreamingError("stream_worker_failed") from exc
+        except SchedulerError as exc:
+            await self.close_session(connection_id=connection_id, source=source)
+            raise StreamingError(exc.code, exc.details) from exc
+        session.audio_samples += samples
+        session.last_activity_at = received_at
+        if session.first_audio_at is None:
+            session.first_audio_at = received_at
+        return None
+
+    async def _execute_scheduled(self, key: RequestKey, job: DecodeJob) -> dict[str, Any]:
+        session = self.sessions_by_stream_id.get((key.connection_id, key.stream_id))
+        if session is None:
+            raise StreamingError("stream_fenced")
+        session.latest_scheduler_key = key
+        scheduler_key = {
+            "connection_id": key.connection_id,
+            "stream_id": key.stream_id,
+            "scheduler_revision": key.scheduler_revision,
+        }
+        payload: dict[str, Any] = {
+            "stream_id": key.stream_id,
+            "connection_id": key.connection_id,
+            "scheduler_revision": key.scheduler_revision,
+            "scheduler_key": scheduler_key,
+        }
+        if job.kind == "push":
+            payload["pcm16le_base64"] = base64.b64encode(job.pcm16le).decode("ascii")
+        reply = await self.worker.request(job.kind, **payload)
+        if reply.get("scheduler_key") != scheduler_key:
+            raise StreamingError("invalid_worker_response")
+        return reply
+
+    async def _scheduled_result(
+        self, key: RequestKey, job: DecodeJob, reply: dict[str, Any], metrics: dict[str, Any],
+    ) -> None:
+        if not self.scheduler.is_current(key):
+            return
+        session = self.sessions_by_stream_id.get((key.connection_id, key.stream_id))
+        if session is None or session.latest_scheduler_key != key:
+            return
         ready = time.perf_counter()
-        if self.sessions.get(key) is not session:
-            # Disconnect/TTL fencing: a reply for a removed owner is discarded.
-            return None
+        stream_metrics = self.scheduler.stream_snapshot(key.connection_id, key.stream_id) or {}
         session.last_activity_at = ready
         decode_wall_ms = max(0.0, float(reply.get("decode_wall_ms", 0.0)))
         if reply.get("decoded") is True:
             session.cumulative_decode_wall_ms += decode_wall_ms
+        session.scheduler_metrics.append(dict(metrics))
         text = reply.get("text")
         if not isinstance(text, str):
             raise StreamingError("invalid_worker_response")
@@ -285,9 +349,9 @@ class QwenStreamingRuntime:
         language = reply.get("language")
         if isinstance(language, str) and language:
             session.current_language = language
-        cursor_ms = session.audio_samples * 1000.0 / 16_000
+        cursor_ms = job.cursor_end_samples * 1000.0 / 16_000
         duration_ms = max(cursor_ms, 1.0)
-        return {
+        event = {
             "event": "partial_candidate",
             "schema_version": 2,
             "backend": "qwen3_asr",
@@ -310,14 +374,28 @@ class QwenStreamingRuntime:
             "PARTIAL_UPDATE_INTERVAL_MS": round(interval_ms, 2) if interval_ms is not None else None,
             "PARTIAL_REVISION_RATE": round(revision_rate, 4) if revision_rate is not None else None,
             "PARTIAL_STABILITY": round(stability, 4) if stability is not None else None,
-            "SERVER_CHUNK_TO_PARTIAL_MS": round((ready - started) * 1000, 2),
+            "SERVER_CHUNK_TO_PARTIAL_MS": round((ready - job.ready_at) * 1000, 2),
             "QWEN_DECODE_CALL_WALL_MS": round(decode_wall_ms, 2) if reply.get("decoded") else None,
             "QWEN_CUMULATIVE_DECODE_WALL_MS": round(session.cumulative_decode_wall_ms, 2),
             "QWEN_STREAM_RTF": round(session.cumulative_decode_wall_ms / duration_ms, 4),
             "AUDIO_DURATION_MS": round(cursor_ms, 2),
             "MODEL_DECODE_CHUNK_MS": session.chunk_size_ms,
             "AUDIO_PUSH_INTERVAL_MS": 100,
+            "QWEN_SCHEDULER_WAIT_MS": metrics.get("qwen_scheduler_wait_ms"),
+            "QWEN_SCHEDULER_REVISION": key.scheduler_revision,
+            "QWEN_DECODE_BACKLOG_MS": metrics.get("qwen_decode_backlog_ms"),
+            "QWEN_DECODE_BACKLOG_MAX_MS": stream_metrics.get("scheduler_max_backlog_audio_ms"),
+            "STREAM_LAG_MS": metrics.get("stream_lag_ms"),
+            "STREAM_LAG_MAX_MS": stream_metrics.get("stream_lag_max_ms"),
+            "QWEN_DECODE_STEPS_DELTA": metrics.get("qwen_decode_steps_delta", 0),
+            "PENDING_DECODE_COUNT": metrics.get("pending_decode_count"),
+            "ACTIVE_STREAM_COUNT": self.scheduler.active_stream_count,
+            "DECODE_OVERRUN": bool(metrics.get("decode_overrun", False)),
         }
+        if session.event_sink is not None:
+            await session.event_sink(event)
+        else:
+            session.event_queue.put_nowait(event)
 
     async def finish(
         self, *, connection_id: str, source: str, server_eos_at: float | None = None,
@@ -329,10 +407,12 @@ class QwenStreamingRuntime:
             raise StreamingError("stream_not_started")
         eos_at = time.perf_counter() if server_eos_at is None else server_eos_at
         try:
-            reply = await self.worker.request("finish", stream_id=session.stream_id)
+            dispatch = await self.scheduler.finish_stream(connection_id, session.stream_id)
+            reply = dispatch.reply
         except Exception as exc:
             await self.close_session(connection_id=connection_id, source=source)
-            raise StreamingError("stream_worker_failed") from exc
+            code = exc.code if isinstance(exc, (StreamingError, SchedulerError)) else "stream_worker_failed"
+            raise StreamingError(code) from exc
         ready = time.perf_counter()
         if self.sessions.get(key) is not session:
             raise StreamingError("stream_not_started")
@@ -350,6 +430,8 @@ class QwenStreamingRuntime:
         finish_decode_ms = max(0.0, float(reply.get("decode_wall_ms", 0.0)))
         session.cumulative_decode_wall_ms += finish_decode_ms
         cursor_ms = session.audio_samples * 1000.0 / 16_000
+        stream_metrics = self.scheduler.stream_snapshot(connection_id, session.stream_id) or {}
+        session.scheduler_metrics.append(dict(dispatch.metrics))
         event = {
             "event": "final_candidate",
             "schema_version": 2,
@@ -384,6 +466,28 @@ class QwenStreamingRuntime:
             "QWEN_STREAM_RTF": round(session.cumulative_decode_wall_ms / max(cursor_ms, 1.0), 4),
             "MODEL_DECODE_CHUNK_MS": session.chunk_size_ms,
             "AUDIO_PUSH_INTERVAL_MS": 100,
+            "QWEN_SCHEDULER_WAIT_MS": dispatch.metrics.get("qwen_scheduler_wait_ms"),
+            "QWEN_SCHEDULER_REVISION": dispatch.key.scheduler_revision,
+            "QWEN_SCHEDULER_WAIT_P50_MS": stream_metrics.get("scheduler_wait_p50_ms"),
+            "QWEN_SCHEDULER_WAIT_P95_MS": stream_metrics.get("scheduler_wait_p95_ms"),
+            "QWEN_SCHEDULER_WAIT_MAX_MS": stream_metrics.get("scheduler_wait_max_ms"),
+            "QWEN_SCHEDULER_WAIT_SAMPLE_COUNT": stream_metrics.get("scheduler_wait_sample_count"),
+            "QWEN_DECODE_WALL_P50_MS": stream_metrics.get("decode_wall_p50_ms"),
+            "QWEN_DECODE_WALL_P95_MS": stream_metrics.get("decode_wall_p95_ms"),
+            "QWEN_DECODE_WALL_MAX_MS": stream_metrics.get("decode_wall_max_ms"),
+            "QWEN_DECODE_WALL_SAMPLE_COUNT": stream_metrics.get("decode_wall_sample_count"),
+            "QWEN_SCHEDULER_METRIC_HISTORY_LIMIT": stream_metrics.get("scheduler_metric_history_limit"),
+            "QWEN_DECODE_STEPS_DELTA": dispatch.metrics.get("qwen_decode_steps_delta", 0),
+            "QWEN_DECODE_STEPS_DELTA_TOTAL": stream_metrics.get("decode_steps_delta_total"),
+            "QWEN_DECODE_BACKLOG_MS": dispatch.metrics.get("qwen_decode_backlog_ms"),
+            "QWEN_DECODE_BACKLOG_MAX_MS": stream_metrics.get("scheduler_max_backlog_audio_ms"),
+            "STREAM_LAG_MS": dispatch.metrics.get("stream_lag_ms"),
+            "STREAM_LAG_MAX_MS": stream_metrics.get("stream_lag_max_ms"),
+            "PENDING_DECODE_COUNT": dispatch.metrics.get("pending_decode_count"),
+            "PENDING_DECODE_COUNT_MAX": stream_metrics.get("scheduler_pending_jobs_max"),
+            "ACTIVE_STREAM_COUNT": self.scheduler.active_stream_count,
+            "ACTIVE_STREAM_COUNT_MAX": stream_metrics.get("active_stream_count_max"),
+            "DECODE_OVERRUN": bool(dispatch.metrics.get("decode_overrun", False)),
         }
         await self.close_session(connection_id=connection_id, source=source)
         return event
@@ -393,10 +497,35 @@ class QwenStreamingRuntime:
         async with self._sessions_lock:
             session = self.sessions.pop(key, None)
             if session is not None:
-                try:
-                    await self.worker.request("close", stream_id=session.stream_id)
-                except Exception:
-                    pass
+                self.sessions_by_stream_id.pop((connection_id, session.stream_id), None)
+        if session is not None:
+            await self.scheduler.fence_stream(connection_id, session.stream_id)
+            try:
+                await self.worker.request("close", stream_id=session.stream_id)
+            except Exception:
+                pass
+
+    async def receive_event(self, *, connection_id: str, source: str) -> dict[str, Any]:
+        session = self.sessions.get((connection_id, source))
+        if session is None:
+            raise StreamingError("stream_not_started")
+        return await session.event_queue.get()
+
+    async def _scheduler_fault(
+        self, connection_id: str, stream_id: str, code: str, details: dict[str, Any],
+    ) -> None:
+        session = self.sessions_by_stream_id.get((connection_id, stream_id))
+        if session is None or code == "stream_scheduler_overrun":
+            return
+        payload = {"event": "error", "code": code, "DECODE_OVERRUN": False}
+        try:
+            if session.event_sink is not None:
+                await session.event_sink(payload)
+            else:
+                session.event_queue.put_nowait(payload)
+        except Exception:
+            pass
+        await self.close_session(connection_id=connection_id, source=session.source)
 
     async def close_connection(self, connection_id: str) -> None:
         keys = [key for key in self.sessions if key[0] == connection_id]
@@ -411,6 +540,8 @@ class QwenStreamingRuntime:
         for connection_id, source in expired:
             session = self.sessions.pop((connection_id, source), None)
             if session is not None:
+                self.sessions_by_stream_id.pop((connection_id, session.stream_id), None)
+                await self.scheduler.fence_stream(connection_id, session.stream_id)
                 try:
                     await self.worker.request("close", stream_id=session.stream_id)
                 except Exception:
@@ -432,6 +563,7 @@ class QwenStreamingRuntime:
             await asyncio.gather(self._sweeper, return_exceptions=True)
         for connection_id, source in list(self.sessions):
             await self.close_session(connection_id=connection_id, source=source)
+        await self.scheduler.close()
         await self.worker.close()
 
 

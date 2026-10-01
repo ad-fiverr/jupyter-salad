@@ -6,6 +6,26 @@ export const MIN_SPEECH_SAMPLES = 8_000;
 export const MAX_BUFFER_SAMPLES = 48_000;
 export const SILENCE_CHUNKS_TO_FLUSH = 4;
 export const RTT_SAMPLE_LIMIT = 720;
+export const MAX_CANVAS_DPR = 2;
+export const MAX_CANVAS_WIDTH = 4096;
+export const MAX_CANVAS_HEIGHT = 2048;
+
+export function canvasBackingSize(cssWidth, cssHeight, devicePixelRatio = 1) {
+  if (![cssWidth, cssHeight, devicePixelRatio].every(Number.isFinite) || cssWidth <= 0 || cssHeight <= 0) {
+    return null;
+  }
+  const dpr = Math.min(MAX_CANVAS_DPR, Math.max(1, devicePixelRatio));
+  return {
+    width: Math.max(1, Math.min(MAX_CANVAS_WIDTH, Math.floor(cssWidth * dpr))),
+    height: Math.max(1, Math.min(MAX_CANVAS_HEIGHT, Math.floor(cssHeight * dpr))),
+    dpr,
+  };
+}
+
+export function shouldDrawCanvas(hidden, cssWidth, cssHeight) {
+  return hidden !== true && Number.isFinite(cssWidth) && Number.isFinite(cssHeight)
+    && cssWidth > 0 && cssHeight > 0;
+}
 
 export const METRIC_DEFINITIONS = Object.freeze({
   AUDIO_DURATION_MS: "Duración del PCM enviado al modelo; no es latencia y puede incluir silencio final.",
@@ -45,6 +65,22 @@ export function gpuStatusLabel(compute, telemetry) {
   }
   if (telemetry?.device) return `${telemetry.device} · cómputo CUDA no confirmado`;
   return "GPU de cómputo no confirmada";
+}
+
+export function qwenDeviceTelemetryLabel(point = {}) {
+  const label = gpuStatusLabel(point.gpu_compute, { device: point.gpu_device });
+  const value = (number) => Number.isFinite(number) ? number : "—";
+  return `${label} · ${value(point.vram_used_mib)}/${value(point.vram_total_mib)} MiB · ${value(point.process_rss_mib)} MiB RAM`;
+}
+
+const TERMINAL_QWEN_ERRORS = new Set([
+  "stream_duration_limit", "stream_not_started", "stream_worker_failed",
+  "stream_worker_timeout", "stream_scheduler_overrun", "stream_result_queue_full",
+  "invalid_worker_response", "stream_fenced", "stream_terminal",
+]);
+
+export function isTerminalQwenError(code) {
+  return TERMINAL_QWEN_ERRORS.has(code);
 }
 
 export function floatToPcm16LE(samples) {

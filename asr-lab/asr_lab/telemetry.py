@@ -150,13 +150,15 @@ def gpu_telemetry(nvml: Any | None = None, *, torch_module: Any | None = None) -
     return _torch_gpu_fallback(torch_module)
 
 
-def collect_telemetry(broker: Any, settings: Any) -> dict[str, Any]:
+def collect_telemetry(
+    broker: Any, settings: Any, qwen_scheduler: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return an allowlisted schema; never include environment or process args."""
     compute = gpu_compute_state(broker, settings)
     gpu = gpu_telemetry()
     if not gpu.get("device") and compute.get("device"):
         gpu["device"] = compute["device"]
-    return {
+    snapshot = {
         "schema_version": 1,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "backend": getattr(settings, "active_backend", settings.backend),
@@ -174,3 +176,18 @@ def collect_telemetry(broker: Any, settings: Any) -> dict[str, Any]:
         # Backwards-compatible telemetry alias; provider/scope identify it.
         "gpu": gpu,
     }
+    if qwen_scheduler is not None:
+        snapshot["qwen_scheduler"] = {
+            key: qwen_scheduler.get(key)
+            for key in (
+                "active_stream_count", "max_active_streams", "pending_decode_count",
+                "active_decode_count", "ready_stream_count", "qwen_scheduler_backlog_ms",
+                "qwen_scheduler_max_stream_backlog_ms", "qwen_scheduler_wait_p50_ms",
+                "qwen_scheduler_stream_lag_ms", "qwen_scheduler_max_stream_lag_ms",
+                "qwen_scheduler_wait_p95_ms", "qwen_scheduler_wait_max_ms",
+                "qwen_decode_wall_p50_ms", "qwen_decode_wall_p95_ms",
+                "qwen_decode_steps_delta_total", "qwen_scheduler_overrun_total",
+                "qwen_decode_budget_overrun_total",
+            )
+        }
+    return snapshot

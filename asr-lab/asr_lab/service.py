@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -30,6 +31,51 @@ qwen_runtime: QwenStreamingRuntime | None = None
 config_valid = settings.error is None
 connection_slots = asyncio.Semaphore(settings.max_connections)
 
+_SAFE_SCHEDULER_REASONS = {
+    "per_stream_backlog_limit",
+    "global_pending_job_limit",
+    "global_pending_job_limit_at_eos",
+}
+_SAFE_SCHEDULER_LIMIT_KINDS = {"backlog_ms", "pending_jobs"}
+_TERMINAL_SCHEDULER_NUMERIC_FIELDS = {
+    "scheduler_wait_p50_ms", "scheduler_wait_p95_ms", "scheduler_wait_max_ms",
+    "scheduler_wait_sample_count", "decode_wall_p50_ms", "decode_wall_p95_ms",
+    "decode_wall_max_ms", "decode_wall_sample_count", "pending_jobs",
+    "stream_pending_jobs", "active_stream_count", "backlog_audio_ms",
+    "stream_lag_ms", "max_backlog_audio_ms", "max_stream_lag_ms",
+    "accepted_audio_total_ms", "dispatched_audio_total_ms", "overrun_limit_value",
+    "scheduler_metric_history_limit",
+}
+
+
+def _safe_scheduler_diagnostics(details: dict[str, Any]) -> dict[str, Any]:
+    """Copy only bounded scheduler numbers and known enum labels to the client."""
+    result: dict[str, Any] = {}
+    for key in ("accepted_audio_ms", "rejected_audio_ms", "backlog_limit_ms", "pending_jobs", "pending_job_limit"):
+        value = details.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+            result[key] = value
+    reason = details.get("reason")
+    if reason in _SAFE_SCHEDULER_REASONS:
+        result["reason"] = reason
+
+    terminal = details.get("terminal_metrics")
+    if isinstance(terminal, dict):
+        safe_terminal: dict[str, Any] = {}
+        for key in _TERMINAL_SCHEDULER_NUMERIC_FIELDS:
+            value = terminal.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+                safe_terminal[key] = value
+        terminal_reason = terminal.get("overrun_reason")
+        if terminal_reason in _SAFE_SCHEDULER_REASONS:
+            safe_terminal["overrun_reason"] = terminal_reason
+        limit_kind = terminal.get("overrun_limit_kind")
+        if limit_kind in _SAFE_SCHEDULER_LIMIT_KINDS:
+            safe_terminal["overrun_limit_kind"] = limit_kind
+        if safe_terminal:
+            result["terminal_metrics"] = safe_terminal
+    return result
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -54,6 +100,8 @@ async def lifespan(app: FastAPI):
                 default_language=settings.qwen_language,
                 unfixed_chunk_num=settings.qwen_unfixed_chunk_num,
                 unfixed_token_num=settings.qwen_unfixed_token_num,
+                max_pending_jobs=settings.qwen_max_pending_jobs,
+                max_backlog_chunks=settings.qwen_max_backlog_chunks,
             )
             loader = asyncio.create_task(_load_qwen(qwen_runtime), name="qwen-model-loader")
         else:
@@ -132,13 +180,20 @@ async def telemetry(authorization: str | None = Header(default=None)) -> JSONRes
     if scheme.casefold() != "bearer" or not settings.api_token or not token_matches(bearer, settings.api_token):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
     active_runtime = qwen_runtime if settings.qwen_streaming_enabled else broker
-    snapshot = await asyncio.to_thread(collect_telemetry, active_runtime, settings)
+    qwen_scheduler = qwen_runtime.scheduler.snapshot() if qwen_runtime is not None and settings.qwen_streaming_enabled else None
+    snapshot = await asyncio.to_thread(collect_telemetry, active_runtime, settings, qwen_scheduler)
     snapshot["transcript_mode"] = settings.transcript_mode
     snapshot["active_streams"] = qwen_runtime.active_sessions if qwen_runtime is not None else None
     snapshot["max_active_streams"] = settings.qwen_max_active_sessions if settings.qwen_streaming_enabled else None
     if settings.qwen_streaming_enabled:
         snapshot["workers"] = 1
         snapshot["runtime_provenance"] = qwen_runtime.runtime_provenance if qwen_runtime is not None else None
+        snapshot["qwen_scheduler"] = qwen_scheduler
+        snapshot["active_streams"] = qwen_scheduler["active_stream_count"] if qwen_scheduler else 0
+        snapshot["pending_decode_count"] = qwen_scheduler["pending_decode_count"] if qwen_scheduler else 0
+        snapshot["active_decode_count"] = qwen_scheduler["active_decode_count"] if qwen_scheduler else 0
+        snapshot["qwen_max_pending_jobs"] = settings.qwen_max_pending_jobs
+        snapshot["qwen_max_backlog_chunks"] = settings.qwen_max_backlog_chunks
     return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
 
 
@@ -347,13 +402,55 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
         return
     send_lock = asyncio.Lock()
     opened_sources: set[str] = set()
+    terminal_sources: set[str] = set()
+    terminal_error_codes = {
+        "stream_duration_limit", "stream_not_started", "stream_worker_failed",
+        "stream_worker_timeout", "stream_scheduler_overrun", "stream_result_queue_full",
+        "invalid_worker_response", "stream_fenced",
+    }
+    outbound: asyncio.Queue[tuple[dict[str, Any], asyncio.Future[None] | None] | None] = asyncio.Queue(maxsize=128)
 
     async def send_json(payload: dict[str, Any]) -> None:
         async with send_lock:
             await websocket.send_json(payload)
 
+    async def enqueue_result(payload: dict[str, Any]) -> None:
+        try:
+            outbound.put_nowait((payload, None))
+        except asyncio.QueueFull as exc:
+            raise StreamingError("stream_result_queue_full") from exc
+
+    async def enqueue_final(payload: dict[str, Any]) -> None:
+        delivered = asyncio.get_running_loop().create_future()
+        await outbound.put((payload, delivered))
+        await delivered
+
+    async def result_pump() -> None:
+        while True:
+            item = await outbound.get()
+            if item is None:
+                return
+            payload, delivered = item
+            try:
+                event = payload.get("event")
+                if event in {"partial_candidate", "final_candidate"}:
+                    expected = "final_candidate" if event == "final_candidate" else "partial_candidate"
+                    payload = validate_candidate_event(payload, expected)
+                await send_json(payload)
+                if delivered is not None and not delivered.done():
+                    delivered.set_result(None)
+            except Exception as exc:
+                if delivered is not None and not delivered.done():
+                    delivered.set_exception(exc)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+
+    pump_task = asyncio.create_task(result_pump(), name=f"qwen-result-pump-{connection_id}")
+
     async def open_default_session(source: str) -> None:
-        payload = await runtime.open_session(connection_id=connection_id, source=source)
+        payload = await runtime.open_session(
+            connection_id=connection_id, source=source, event_sink=enqueue_result,
+        )
         opened_sources.add(source)
         await send_json(payload)
 
@@ -398,6 +495,7 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                         context=message.context,
                         chunk_size_ms=message.chunk_size_ms,
                         request_id=message.request_id,
+                        event_sink=enqueue_result,
                     )
                 except StreamingError as exc:
                     await send_json({
@@ -407,6 +505,7 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                         "message": "Streaming session could not be started.",
                     })
                     continue
+                terminal_sources.discard(message.source)
                 opened_sources.add(message.source)
                 await send_json(result)
                 continue
@@ -425,10 +524,22 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                         server_eos_at=time.perf_counter(),
                         request_id=message.request_id,
                     )
-                    await send_json(validate_candidate_event(result, "final_candidate"))
+                    await enqueue_final(validate_candidate_event(result, "final_candidate"))
                     opened_sources.discard(message.source)
                 except StreamingError as exc:
-                    await send_json({"event": "error", "code": exc.code, "message": "Streaming finalization failed."})
+                    opened_sources.discard(message.source)
+                    if exc.code in terminal_error_codes:
+                        terminal_sources.add(message.source)
+                    error_payload: dict[str, Any] = {
+                        "event": "error", "code": exc.code,
+                        "message": "Streaming finalization failed.",
+                    }
+                    if exc.code == "stream_scheduler_overrun":
+                        error_payload["DECODE_OVERRUN"] = True
+                        scheduler_diagnostics = _safe_scheduler_diagnostics(exc.details)
+                        if scheduler_diagnostics:
+                            error_payload["scheduler"] = scheduler_diagnostics
+                    await send_json(error_payload)
                 if message.request_id is not None:
                     await send_json({
                         "event": "flush_complete",
@@ -437,6 +548,13 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                 continue
 
             assert isinstance(message, AudioChunk)
+            if message.source in terminal_sources:
+                await send_json({
+                    "event": "error",
+                    "code": "stream_terminal",
+                    "message": "This stream ended; send an explicit stream_start before sending more audio.",
+                })
+                continue
             if message.source not in opened_sources:
                 try:
                     await open_default_session(message.source)
@@ -449,14 +567,24 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                     source=message.source,
                     pcm16le=message.pcm16le,
                 )
-                if result is not None:
-                    await send_json(validate_candidate_event(result, "partial_candidate"))
             except StreamingError as exc:
-                if exc.code in {"stream_duration_limit", "stream_not_started", "stream_worker_failed"}:
+                if exc.code in terminal_error_codes:
                     opened_sources.discard(message.source)
-                await send_json({"event": "error", "code": exc.code, "message": "Streaming audio could not be processed."})
+                    terminal_sources.add(message.source)
+                error_payload = {
+                    "event": "error", "code": exc.code,
+                    "DECODE_OVERRUN": exc.code == "stream_scheduler_overrun",
+                    "message": "Streaming audio could not be processed.",
+                }
+                if exc.code == "stream_scheduler_overrun":
+                    scheduler_diagnostics = _safe_scheduler_diagnostics(exc.details)
+                    if scheduler_diagnostics:
+                        error_payload["scheduler"] = scheduler_diagnostics
+                await send_json(error_payload)
     finally:
         await runtime.close_connection(connection_id)
+        pump_task.cancel()
+        await asyncio.gather(pump_task, return_exceptions=True)
 
 
 async def _flush(

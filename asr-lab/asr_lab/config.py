@@ -42,7 +42,9 @@ class Settings:
     qwen_unfixed_token_num: int = 5
     qwen_language: str = "auto"
     qwen_gpu_memory_utilization: float = 0.65
-    qwen_max_active_sessions: int = 2
+    qwen_max_active_sessions: int = 6
+    qwen_max_pending_jobs: int = 24
+    qwen_max_backlog_chunks: int = 4
     qwen_max_stream_seconds: float = 60.0
     qwen_session_idle_ttl_seconds: float = 120.0
     qwen_max_context_chars: int = 512
@@ -136,7 +138,9 @@ class Settings:
         qwen_unfixed_chunk_num = 2
         qwen_unfixed_token_num = 5
         qwen_gpu_memory_utilization = 0.65
-        qwen_max_active_sessions = 2
+        qwen_max_active_sessions = 6
+        qwen_max_pending_jobs = 24
+        qwen_max_backlog_chunks = 4
         qwen_max_stream_seconds = 60.0
         qwen_session_idle_ttl_seconds = 120.0
         qwen_max_context_chars = 512
@@ -161,7 +165,9 @@ class Settings:
             qwen_unfixed_chunk_num = integer("QWEN_UNFIXED_CHUNK_NUM", 2, 0, 64)
             qwen_unfixed_token_num = integer("QWEN_UNFIXED_TOKEN_NUM", 5, 0, 128)
             qwen_gpu_memory_utilization = number("QWEN_GPU_MEMORY_UTILIZATION", 0.65, 0.1, 0.89)
-            qwen_max_active_sessions = integer("QWEN_MAX_ACTIVE_STREAMS", 2, 1, 128)
+            qwen_max_active_sessions = integer("QWEN_MAX_ACTIVE_STREAMS", 6, 1, 6)
+            qwen_max_pending_jobs = integer("QWEN_MAX_PENDING_JOBS", 24, 6, 192)
+            qwen_max_backlog_chunks = integer("QWEN_MAX_BACKLOG_CHUNKS", 4, 1, 32)
             qwen_max_stream_seconds = number("QWEN_MAX_STREAM_SECONDS", 60.0, 5.0, 300.0)
             qwen_session_idle_ttl_seconds = number("QWEN_SESSION_IDLE_TTL_SECONDS", 120.0, 15.0, 3600.0)
             qwen_max_context_chars = integer("QWEN_MAX_CONTEXT_CHARS", 512, 0, 2048)
@@ -191,6 +197,8 @@ class Settings:
             qwen_language=qwen_language,
             qwen_gpu_memory_utilization=qwen_gpu_memory_utilization,
             qwen_max_active_sessions=qwen_max_active_sessions,
+            qwen_max_pending_jobs=qwen_max_pending_jobs,
+            qwen_max_backlog_chunks=qwen_max_backlog_chunks,
             qwen_max_stream_seconds=qwen_max_stream_seconds,
             qwen_session_idle_ttl_seconds=qwen_session_idle_ttl_seconds,
             qwen_max_context_chars=qwen_max_context_chars,

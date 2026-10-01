@@ -68,8 +68,8 @@
         <div class="metric-card"><span>Segmentos</span><strong id="summary-segments">0</strong></div>
         <div class="metric-card"><span>Errores</span><strong id="summary-errors">0</strong></div>
         <div class="metric-card"><span>Audio capturado · no es latencia</span><strong id="summary-audio">0.0 s</strong></div>
-        <div class="metric-card"><span>Inference RTF</span><strong id="summary-rtf">—</strong></div>
-        <div class="metric-card"><span>WER</span><strong id="summary-wer">—</strong></div>
+        <div class="metric-card offline-only" hidden><span>Inference RTF</span><strong id="summary-rtf">—</strong></div>
+        <div class="metric-card offline-only" hidden><span>WER</span><strong id="summary-wer">—</strong></div>
       </div>
     </section>
 
@@ -111,8 +111,24 @@
         <div class="metric-card"><span>Qwen decode RTF · wall/audio</span><strong id="qwen-stream-rtf">—</strong></div>
         <div class="metric-card"><span>Partial count</span><strong id="qwen-partial-count">0</strong></div>
       </div>
+      <div class="summary-grid qwen-scheduler-grid" aria-live="polite" aria-label="Capacidad del scheduler Qwen">
+        <div class="metric-card"><span>Streams activos / máximo lógico</span><strong id="qwen-active-streams">—</strong></div>
+        <div class="metric-card"><span>Decodes pending / active</span><strong id="qwen-pending-active">—</strong></div>
+        <div class="metric-card"><span>Audio en backlog · agregado / máximo stream</span><strong id="qwen-backlog">—</strong></div>
+        <div class="metric-card"><span>Decode wall p50 / p95</span><strong id="qwen-decode-percentiles">—</strong></div>
+        <div class="metric-card"><span>Scheduler wait p50 / p95</span><strong id="qwen-wait-percentiles">—</strong></div>
+        <div class="metric-card"><span>Lag del último partial / máximo activo</span><strong id="qwen-stream-lag">—</strong></div>
+        <div class="metric-card"><span>Decodes sobre presupuesto / fences</span><strong id="qwen-overruns">—</strong></div>
+        <div class="metric-card"><span>GPU / VRAM / RAM · global</span><strong id="qwen-device-telemetry">—</strong></div>
+      </div>
       <div class="table-wrap partial-timeline-wrap"><table><thead><tr><th>Audio cursor</th><th>Client elapsed</th><th>Revision</th><th>Partial completo (reemplaza el anterior)</th><th>Server chunk → partial</th><th>Revisión</th><th>Decode wall</th></tr></thead><tbody id="qwen-partials-body"><tr><td colspan="7" class="empty">Aún no hay parciales.</td></tr></tbody></table></div>
-      <p class="fine-print">La estabilidad compara el prefijo de tokens anterior con el nuevo texto completo: tokens anteriores idénticos al inicio ÷ tokens anteriores. PARTIAL_REVISION_RATE = 1 − estabilidad; tokens añadidos no cuentan como revisiones. Qwen vuelve a alimentar el audio acumulado: decode wall es tiempo de llamada, no tiempo de kernel ni uso GPU atribuido.</p>
+      <div class="charts-grid qwen-charts" aria-label="Métricas del scheduler Qwen">
+        <article class="panel chart-card qwen-chart-card"><h3>Scheduler wait p95 · agregado móvil 1 Hz</h3><canvas id="chart-qwen-wait" aria-label="Percentil 95 del scheduler wait Qwen por sondeo"></canvas></article>
+        <article class="panel chart-card qwen-chart-card"><h3>Backlog de audio / decodes pending · 1 Hz</h3><canvas id="chart-qwen-backlog" aria-label="Backlog agregado y cantidad de decodes pendientes"></canvas></article>
+        <article class="panel chart-card qwen-chart-card"><h3>Máximo stream lag activo · 1 Hz</h3><canvas id="chart-qwen-lag" aria-label="Máximo de audio aceptado menos decodificado entre streams activos"></canvas></article>
+        <article class="panel chart-card qwen-chart-card"><h3>Decode wall p95 vs ventana de audio · 1 Hz</h3><canvas id="chart-qwen-decode" aria-label="Percentil 95 del decode wall comparado con el chunk de audio"></canvas></article>
+      </div>
+      <p class="fine-print">La estabilidad compara el prefijo de tokens anterior con el nuevo texto completo: tokens anteriores idénticos al inicio ÷ prefijo previo. PARTIAL_REVISION_RATE = 1 − estabilidad; tokens añadidos no cuentan como revisiones. Qwen vuelve a alimentar el audio acumulado: decode wall es tiempo de llamada del wrapper, no tiempo de kernel ni uso GPU atribuido. El scheduler usa un engine y una RPC decode activa; superar decode wall al chunk señala presión de capacidad, no una garantía de que GPU soporte seis streams a esa cadencia.</p>
       <p class="fine-print">SEMANTIC_LEAD_TIME_MS requiere correlación real con JEV: primera hipótesis útil pre-EOS comparada con EOS. Este laboratorio ASR no calcula esa métrica por sí solo. PARTIAL ≠ TRUTH.</p>
     </section>
 
@@ -124,17 +140,17 @@
     <section class="panel" aria-labelledby="segments-title">
       <div class="panel-heading"><div><p class="eyebrow">MÉTRICAS REALES</p><h2 id="segments-title">Segmentos</h2></div><div class="export-row"><button id="export-json" class="quiet" type="button" disabled>Exportar JSON</button><button id="export-csv" class="quiet" type="button" disabled>Exportar CSV</button></div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th># / voz</th><th>Transcripción</th><th>Audio PCM ms · no latencia</th><th>Endpointing server ms</th><th>Queue ms</th><th>Model adapter ms</th><th>Postprocess ms</th><th>Server EOS → transcript ms</th><th>Client EOS → transcript ms*</th>
+        <th># / voz</th><th>Transcripción</th><th>Audio PCM ms · no latencia</th><th class="offline-only" hidden>Endpointing server ms</th><th class="offline-only" hidden>Queue ms</th><th class="offline-only" hidden>Model adapter ms</th><th class="offline-only" hidden>Postprocess ms</th><th>Server EOS → transcript ms</th><th>Client EOS → transcript ms*</th>
       </tr></thead><tbody id="segments-body"><tr><td colspan="9" class="empty">Aún no hay segmentos.</td></tr></tbody></table></div>
       <p class="fine-print">* performance.now() desde el último bloque de 100 ms sobre RMS 0.015 hasta recibir el transcript. La resolución depende del chunking y del scheduling del navegador; no se resta ningún reloj de servidor. La duración PCM es el audio entregado al modelo y puede contener silencio final.</p>
       <details class="fine-print"><summary>Diagnóstico heredado, fuera de los KPI de latencia</summary><p>SERVER_RECEIVE_TO_TRANSCRIPT_MS mide desde el inicio del buffer hasta el transcript listo. Puede incluir silencio inicial y el tiempo durante el que se habló; se conserva en las exportaciones para diagnóstico.</p></details>
     </section>
 
     <section class="charts-grid" aria-label="Gráficas de benchmark">
-      <article class="panel chart-card"><h3>SERVER_MODEL_INFERENCE_MS · adapter wall time</h3><canvas id="chart-inference" aria-label="Tiempo del adaptador de inferencia por segmento"></canvas></article>
-      <article class="panel chart-card"><h3>SERVER_ENDPOINTING_MS por segmento</h3><canvas id="chart-endpoint" aria-label="Endpointing servidor por segmento"></canvas></article>
-      <article class="panel chart-card"><h3>SERVER_EOS_TO_TRANSCRIPT_MS por segmento</h3><canvas id="chart-server-eos" aria-label="Server EOS a transcript por segmento"></canvas></article>
-      <article class="panel chart-card"><h3>CLIENT_EOS_TO_TRANSCRIPT_MS por segmento</h3><canvas id="chart-client-eos" aria-label="Client EOS a transcript por segmento"></canvas></article>
+      <article class="panel chart-card offline-only" hidden><h3>SERVER_MODEL_INFERENCE_MS · adapter wall time</h3><canvas id="chart-inference" aria-label="Tiempo del adaptador de inferencia por segmento"></canvas></article>
+      <article class="panel chart-card offline-only" hidden><h3>SERVER_ENDPOINTING_MS por segmento</h3><canvas id="chart-endpoint" aria-label="Endpointing servidor por segmento"></canvas></article>
+      <article class="panel chart-card offline-only" hidden><h3>SERVER_EOS_TO_TRANSCRIPT_MS por segmento</h3><canvas id="chart-server-eos" aria-label="Server EOS a transcript por segmento"></canvas></article>
+      <article class="panel chart-card offline-only" hidden><h3>CLIENT_EOS_TO_TRANSCRIPT_MS por segmento</h3><canvas id="chart-client-eos" aria-label="Client EOS a transcript por segmento"></canvas></article>
       <article class="panel chart-card"><h3>PROXY_WS_RTT_MS · control ping/pong, 5 s</h3><canvas id="chart-rtt" aria-label="RTT de control del WebSocket a lo largo del tiempo"></canvas></article>
       <article class="panel chart-card"><h3>GPU0 utilization % · NVML global, 1 Hz</h3><canvas id="chart-gpu" aria-label="Uso global de GPU reportado por NVML"></canvas></article>
       <article class="panel chart-card"><h3>GPU0 VRAM used / total MiB · NVML/Torch global, 1 Hz</h3><canvas id="chart-vram" aria-label="VRAM global"></canvas></article>

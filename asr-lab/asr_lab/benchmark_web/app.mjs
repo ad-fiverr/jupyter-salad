@@ -1,6 +1,7 @@
 import {
-  METRIC_DEFINITIONS, ShadowVad, boundedPush, csvCell, formatMilliseconds, gpuStatusLabel,
-  median, percentile, rttPercentiles, wordErrorRate,
+  METRIC_DEFINITIONS, ShadowVad, boundedPush, canvasBackingSize, csvCell, formatMilliseconds, gpuStatusLabel,
+  isTerminalQwenError, median, percentile, qwenDeviceTelemetryLabel, rttPercentiles, wordErrorRate,
+  shouldDrawCanvas,
 } from "/asr/benchmark/core.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -61,6 +62,8 @@ const charts = {
   inference: $("chart-inference"), endpoint: $("chart-endpoint"), serverEos: $("chart-server-eos"),
   clientEos: $("chart-client-eos"), rtt: $("chart-rtt"), gpu: $("chart-gpu"),
   vram: $("chart-vram"), ram: $("chart-ram"),
+  qwenWait: $("chart-qwen-wait"), qwenBacklog: $("chart-qwen-backlog"),
+  qwenLag: $("chart-qwen-lag"), qwenDecode: $("chart-qwen-decode"),
 };
 
 function showNotice(message, level = "info") {
@@ -118,6 +121,7 @@ function updateTranscript() {
     headers[7].textContent = qwen ? "Server EOS → candidato final ms" : "Server EOS → transcript ms";
     headers[8].textContent = qwen ? "Client EOS → candidato final ms*" : "Client EOS → transcript ms*";
   }
+  document.querySelectorAll(".segment-offline-column").forEach((node) => { node.hidden = qwen; });
 }
 
 function updateSummary() {
@@ -182,6 +186,20 @@ function updateQwenSummary() {
     ? finalRow.QWEN_STREAM_RTF.toFixed(3) : Number.isFinite(latest?.QWEN_STREAM_RTF)
       ? latest.QWEN_STREAM_RTF.toFixed(3) : "—";
   $("qwen-partial-count").textContent = String(finalRow?.PARTIAL_COUNT ?? partials.length);
+  const scheduler = state.health?.qwen_scheduler ?? {};
+  const latestEvent = finalRow ?? partials.at(-1) ?? {};
+  const latestTelemetry = state.telemetry.at(-1) ?? {};
+  $("qwen-active-streams").textContent = `${scheduler.active_stream_count ?? "—"} / ${scheduler.max_active_streams ?? "—"}`;
+  $("qwen-pending-active").textContent = `${scheduler.pending_decode_count ?? latestEvent.PENDING_DECODE_COUNT ?? "—"} / ${scheduler.active_decode_count ?? "—"}`;
+  $("qwen-backlog").textContent = `${fmtMs(scheduler.qwen_scheduler_backlog_ms)} / ${fmtMs(scheduler.qwen_scheduler_max_stream_backlog_ms)}`;
+  $("qwen-decode-percentiles").textContent = `${fmtMs(scheduler.qwen_decode_wall_p50_ms)} / ${fmtMs(scheduler.qwen_decode_wall_p95_ms)}`;
+  $("qwen-wait-percentiles").textContent = `${fmtMs(scheduler.qwen_scheduler_wait_p50_ms)} / ${fmtMs(scheduler.qwen_scheduler_wait_p95_ms)}`;
+  $("qwen-stream-lag").textContent = `${fmtMs(latestEvent.STREAM_LAG_MS)} / ${fmtMs(latestEvent.STREAM_LAG_MAX_MS ?? scheduler.qwen_scheduler_max_stream_lag_ms)}`;
+  $("qwen-overruns").textContent = `${scheduler.qwen_decode_budget_overrun_total ?? "—"} / ${scheduler.qwen_scheduler_overrun_total ?? "—"}`;
+  // collectTelemetry flattens GPU fields onto each point; keep the device
+  // attribution explicitly global instead of expecting a nested snapshot.
+  $("qwen-device-telemetry").textContent = qwenDeviceTelemetryLabel(latestTelemetry);
+  renderQwenCharts();
 }
 
 function renderQwenPartials() {
@@ -258,8 +276,12 @@ function renderSegments() {
         ? item.CLIENT_EOS_TO_FINAL_CANDIDATE_MS
         : Number.isFinite(item.CLIENT_EOS_TO_TRANSCRIPT_MS) ? item.CLIENT_EOS_TO_TRANSCRIPT_MS : item.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS),
     ];
-    values.forEach((value) => {
+    values.forEach((value, index) => {
       const td = document.createElement("td");
+      if (index >= 3 && index <= 6) {
+        td.className = "segment-offline-column";
+        td.hidden = state.backend === "qwen3_asr";
+      }
       td.textContent = value == null ? "" : String(value);
       tr.append(td);
     });
@@ -269,8 +291,10 @@ function renderSegments() {
 
 function drawChart(canvas, points, key, color = "#80e0b2", secondKey = null) {
   const rect = canvas.getBoundingClientRect();
-  const width = Math.max(260, Math.floor(rect.width * devicePixelRatio));
-  const height = Math.max(125, Math.floor(rect.height * devicePixelRatio));
+  if (!shouldDrawCanvas(canvas.closest("[hidden]") !== null, rect.width, rect.height)) return;
+  const dimensions = canvasBackingSize(rect.width, rect.height, window.devicePixelRatio || 1);
+  if (!dimensions) return;
+  const { width, height, dpr } = dimensions;
   if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, width, height);
@@ -281,13 +305,13 @@ function drawChart(canvas, points, key, color = "#80e0b2", secondKey = null) {
   const values = series.flat();
   ctx.strokeStyle = "#273845";
   ctx.fillStyle = "#9aabba";
-  ctx.font = `${11 * devicePixelRatio}px system-ui`;
-  ctx.lineWidth = devicePixelRatio;
+  ctx.font = `${11 * dpr}px system-ui`;
+  ctx.lineWidth = dpr;
   for (let i = 0; i <= 4; i += 1) {
     const y = margin.top + plotH * i / 4;
     ctx.beginPath(); ctx.moveTo(margin.left, y); ctx.lineTo(width - margin.right, y); ctx.stroke();
     const max = values.reduce((largest, value) => Math.max(largest, value), 1);
-    ctx.fillText((max * (1 - i / 4)).toFixed(0), 3, y + 4 * devicePixelRatio);
+    ctx.fillText((max * (1 - i / 4)).toFixed(0), 3, y + 4 * dpr);
   }
   const maxValue = values.reduce((largest, value) => Math.max(largest, value), 1);
   const lineColors = [color, "#f0c878"];
@@ -295,7 +319,7 @@ function drawChart(canvas, points, key, color = "#80e0b2", secondKey = null) {
     const actualPoints = points.map((point, index) => ({ x: index, y: point[seriesIndex === 0 ? key : secondKey] })).filter((point) => Number.isFinite(point.y));
     if (!actualPoints.length) return;
     ctx.strokeStyle = lineColors[seriesIndex];
-    ctx.lineWidth = 2 * devicePixelRatio;
+    ctx.lineWidth = 2 * dpr;
     ctx.beginPath();
     actualPoints.forEach((point, index) => {
       const x = margin.left + (points.length <= 1 ? 0 : point.x / (points.length - 1)) * plotW;
@@ -304,6 +328,27 @@ function drawChart(canvas, points, key, color = "#80e0b2", secondKey = null) {
     });
     ctx.stroke();
   });
+}
+
+function renderQwenCharts() {
+  if (!charts.qwenWait || $("qwen-stream-panel").hidden) return;
+  const qwenTelemetry = state.telemetry
+    .filter((point) => point.qwen_scheduler && typeof point.qwen_scheduler === "object")
+    .map((point) => point.qwen_scheduler);
+  drawChart(charts.qwenWait, qwenTelemetry.map((item) => ({
+    QWEN_SCHEDULER_WAIT_P95_MS: item.qwen_scheduler_wait_p95_ms,
+  })), "QWEN_SCHEDULER_WAIT_P95_MS", "#80e0b2");
+  drawChart(charts.qwenBacklog, qwenTelemetry.map((item) => ({
+    QWEN_DECODE_BACKLOG_MS: item.qwen_scheduler_backlog_ms,
+    PENDING_DECODE_COUNT: item.pending_decode_count,
+  })), "QWEN_DECODE_BACKLOG_MS", "#7dc4ff", "PENDING_DECODE_COUNT");
+  drawChart(charts.qwenLag, qwenTelemetry.map((item) => ({
+    STREAM_LAG_MS: item.qwen_scheduler_max_stream_lag_ms,
+  })), "STREAM_LAG_MS", "#f0c878");
+  drawChart(charts.qwenDecode, qwenTelemetry.map((item) => ({
+    QWEN_DECODE_WALL_P95_MS: item.qwen_decode_wall_p95_ms,
+    MODEL_DECODE_CHUNK_MS: state.qwenChunkMs,
+  })), "QWEN_DECODE_WALL_P95_MS", "#f08080", "MODEL_DECODE_CHUNK_MS");
 }
 
 function renderCharts() {
@@ -315,6 +360,7 @@ function renderCharts() {
   drawChart(charts.gpu, state.telemetry, "gpu_utilization_pct", "#80e0b2");
   drawChart(charts.vram, state.telemetry, "vram_used_mib", "#7dc4ff", "vram_total_mib");
   drawChart(charts.ram, state.telemetry, "process_rss_mib", "#f0c878");
+  renderQwenCharts();
 }
 
 function updateTimer() {
@@ -355,6 +401,7 @@ function recordTelemetry(snapshot) {
     queue_depth: snapshot.queue_depth,
     model_loaded: snapshot.model_loaded,
     workers: snapshot.workers,
+    qwen_scheduler: snapshot.qwen_scheduler ?? null,
   };
   state.telemetry.push(point);
   if (state.telemetry.length > 3600) state.telemetry.shift();
@@ -367,6 +414,8 @@ function recordTelemetry(snapshot) {
   $("qwen-stream-controls").hidden = !qwen;
   $("qwen-stream-panel").hidden = !qwen;
   $("offline-latency-groups").hidden = qwen;
+  document.querySelectorAll(".offline-only").forEach((node) => { node.hidden = qwen; });
+  updateQwenSummary();
   updateTranscript();
 }
 
@@ -417,6 +466,14 @@ function onPartialTranscript(message) {
     QWEN_DECODE_CALL_WALL_MS: message.QWEN_DECODE_CALL_WALL_MS,
     QWEN_CUMULATIVE_DECODE_WALL_MS: message.QWEN_CUMULATIVE_DECODE_WALL_MS,
     QWEN_STREAM_RTF: message.QWEN_STREAM_RTF,
+    QWEN_SCHEDULER_WAIT_MS: message.QWEN_SCHEDULER_WAIT_MS,
+    QWEN_DECODE_BACKLOG_MS: message.QWEN_DECODE_BACKLOG_MS,
+    QWEN_DECODE_BACKLOG_MAX_MS: message.QWEN_DECODE_BACKLOG_MAX_MS,
+    STREAM_LAG_MS: message.STREAM_LAG_MS,
+    STREAM_LAG_MAX_MS: message.STREAM_LAG_MAX_MS,
+    PENDING_DECODE_COUNT: message.PENDING_DECODE_COUNT,
+    ACTIVE_STREAM_COUNT: message.ACTIVE_STREAM_COUNT,
+    DECODE_OVERRUN: message.DECODE_OVERRUN === true,
     MODEL_DECODE_CHUNK_MS: message.MODEL_DECODE_CHUNK_MS,
     AUDIO_PUSH_INTERVAL_MS: message.AUDIO_PUSH_INTERVAL_MS,
     client_received_at: receivedAt,
@@ -481,6 +538,21 @@ function onTranscript(message, candidateOnly = false) {
     QWEN_CUMULATIVE_DECODE_WALL_MS: Number.isFinite(message.QWEN_CUMULATIVE_DECODE_WALL_MS)
       ? message.QWEN_CUMULATIVE_DECODE_WALL_MS : null,
     QWEN_STREAM_RTF: Number.isFinite(message.QWEN_STREAM_RTF) ? message.QWEN_STREAM_RTF : null,
+    QWEN_SCHEDULER_WAIT_MS: Number.isFinite(message.QWEN_SCHEDULER_WAIT_MS) ? message.QWEN_SCHEDULER_WAIT_MS : null,
+    QWEN_SCHEDULER_WAIT_P50_MS: Number.isFinite(message.QWEN_SCHEDULER_WAIT_P50_MS) ? message.QWEN_SCHEDULER_WAIT_P50_MS : null,
+    QWEN_SCHEDULER_WAIT_P95_MS: Number.isFinite(message.QWEN_SCHEDULER_WAIT_P95_MS) ? message.QWEN_SCHEDULER_WAIT_P95_MS : null,
+    QWEN_DECODE_WALL_P50_MS: Number.isFinite(message.QWEN_DECODE_WALL_P50_MS) ? message.QWEN_DECODE_WALL_P50_MS : null,
+    QWEN_DECODE_WALL_P95_MS: Number.isFinite(message.QWEN_DECODE_WALL_P95_MS) ? message.QWEN_DECODE_WALL_P95_MS : null,
+    QWEN_DECODE_BACKLOG_MS: Number.isFinite(message.QWEN_DECODE_BACKLOG_MS) ? message.QWEN_DECODE_BACKLOG_MS : null,
+    QWEN_DECODE_BACKLOG_MAX_MS: Number.isFinite(message.QWEN_DECODE_BACKLOG_MAX_MS) ? message.QWEN_DECODE_BACKLOG_MAX_MS : null,
+    STREAM_LAG_MS: Number.isFinite(message.STREAM_LAG_MS) ? message.STREAM_LAG_MS : null,
+    STREAM_LAG_MAX_MS: Number.isFinite(message.STREAM_LAG_MAX_MS) ? message.STREAM_LAG_MAX_MS : null,
+    PENDING_DECODE_COUNT: Number.isInteger(message.PENDING_DECODE_COUNT) ? message.PENDING_DECODE_COUNT : null,
+    ACTIVE_STREAM_COUNT: Number.isInteger(message.ACTIVE_STREAM_COUNT) ? message.ACTIVE_STREAM_COUNT : null,
+    DECODE_OVERRUN: message.DECODE_OVERRUN === true,
+    QWEN_DECODE_STEPS_DELTA: Number.isInteger(message.QWEN_DECODE_STEPS_DELTA) ? message.QWEN_DECODE_STEPS_DELTA : null,
+    QWEN_DECODE_STEPS_DELTA_TOTAL: Number.isInteger(message.QWEN_DECODE_STEPS_DELTA_TOTAL) ? message.QWEN_DECODE_STEPS_DELTA_TOTAL : null,
+    QWEN_FINISH_DECODE_WALL_MS: Number.isFinite(message.QWEN_FINISH_DECODE_WALL_MS) ? message.QWEN_FINISH_DECODE_WALL_MS : null,
     PARTIAL_COUNT: Number.isFinite(message.PARTIAL_COUNT) ? message.PARTIAL_COUNT : null,
     FIRST_PARTIAL_MS: Number.isFinite(message.FIRST_PARTIAL_MS) ? message.FIRST_PARTIAL_MS : null,
     PARTIAL_REVISION_RATE: Number.isFinite(message.PARTIAL_REVISION_RATE) ? message.PARTIAL_REVISION_RATE : null,
@@ -566,6 +638,12 @@ function onSocketMessage(raw) {
     }
     showNotice(`Error ASR: ${code}`, "error");
     updateSummary();
+    if (state.backend === "qwen3_asr" && isTerminalQwenError(code)) {
+      state.isRecording = false;
+      state.isStopping = false;
+      showNotice(`El stream Qwen terminó (${code}); inicia una sesión explícita para volver a enviar audio.`, "error");
+      void cleanup(false);
+    }
     return;
   }
   if (message.event === "flush_complete" && message.request_id === state.flushId) {
@@ -1004,6 +1082,21 @@ function safeResult() {
     FINALIZATION_AFTER_SERVER_EOS_MS: row.FINALIZATION_AFTER_SERVER_EOS_MS,
     QWEN_CUMULATIVE_DECODE_WALL_MS: row.QWEN_CUMULATIVE_DECODE_WALL_MS,
     QWEN_STREAM_RTF: row.QWEN_STREAM_RTF,
+    QWEN_SCHEDULER_WAIT_MS: row.QWEN_SCHEDULER_WAIT_MS,
+    QWEN_SCHEDULER_WAIT_P50_MS: row.QWEN_SCHEDULER_WAIT_P50_MS,
+    QWEN_SCHEDULER_WAIT_P95_MS: row.QWEN_SCHEDULER_WAIT_P95_MS,
+    QWEN_DECODE_WALL_P50_MS: row.QWEN_DECODE_WALL_P50_MS,
+    QWEN_DECODE_WALL_P95_MS: row.QWEN_DECODE_WALL_P95_MS,
+    QWEN_DECODE_BACKLOG_MS: row.QWEN_DECODE_BACKLOG_MS,
+    QWEN_DECODE_BACKLOG_MAX_MS: row.QWEN_DECODE_BACKLOG_MAX_MS,
+    STREAM_LAG_MS: row.STREAM_LAG_MS,
+    STREAM_LAG_MAX_MS: row.STREAM_LAG_MAX_MS,
+    PENDING_DECODE_COUNT: row.PENDING_DECODE_COUNT,
+    ACTIVE_STREAM_COUNT: row.ACTIVE_STREAM_COUNT,
+    DECODE_OVERRUN: row.DECODE_OVERRUN,
+    QWEN_DECODE_STEPS_DELTA: row.QWEN_DECODE_STEPS_DELTA,
+    QWEN_DECODE_STEPS_DELTA_TOTAL: row.QWEN_DECODE_STEPS_DELTA_TOTAL,
+    QWEN_FINISH_DECODE_WALL_MS: row.QWEN_FINISH_DECODE_WALL_MS,
     PARTIAL_COUNT: row.PARTIAL_COUNT,
     FIRST_PARTIAL_MS: row.FIRST_PARTIAL_MS,
     PARTIAL_REVISION_RATE: row.PARTIAL_REVISION_RATE,
@@ -1077,12 +1170,27 @@ function safeResult() {
           ?? segments.at(-1)?.CLIENT_EOS_TO_TRANSCRIPT_MS ?? null,
         cumulative_decode_call_wall_ms: segments.at(-1)?.QWEN_CUMULATIVE_DECODE_WALL_MS ?? null,
         decode_wall_rtf: segments.at(-1)?.QWEN_STREAM_RTF ?? null,
+        scheduler_wait_ms_p50: state.health?.qwen_scheduler?.qwen_scheduler_wait_p50_ms ?? null,
+        scheduler_wait_ms_p95: state.health?.qwen_scheduler?.qwen_scheduler_wait_p95_ms ?? null,
+        decode_wall_ms_p50: state.health?.qwen_scheduler?.qwen_decode_wall_p50_ms ?? null,
+        decode_wall_ms_p95: state.health?.qwen_scheduler?.qwen_decode_wall_p95_ms ?? null,
+        scheduler_backlog_audio_ms: state.health?.qwen_scheduler?.qwen_scheduler_backlog_ms ?? null,
+        scheduler_max_stream_backlog_audio_ms: state.health?.qwen_scheduler?.qwen_scheduler_max_stream_backlog_ms ?? null,
+        pending_decode_count: state.health?.qwen_scheduler?.pending_decode_count ?? null,
+        active_decode_count: state.health?.qwen_scheduler?.active_decode_count ?? null,
+        active_stream_count: state.health?.qwen_scheduler?.active_stream_count ?? null,
+        decode_budget_overrun_count: state.health?.qwen_scheduler?.qwen_decode_budget_overrun_total ?? null,
+        scheduler_fence_overrun_count: state.health?.qwen_scheduler?.qwen_scheduler_overrun_total ?? null,
       },
       definitions: {
         PARTIAL_STABILITY: "Identical exact-prefix tokens in prior full text / prior token count; appended suffix tokens do not change this ratio.",
         PARTIAL_REVISION_RATE: "1 - PARTIAL_STABILITY; measures changed or removed prior tokens, excluding appended tokens.",
         QWEN_CUMULATIVE_DECODE_WALL_MS: "Sum of Qwen wrapper decode-call wall durations; not GPU kernel time.",
-        QWEN_STREAM_RTF: "Cumulative decode-call wall duration / audio duration; not GPU utilization or end-to-end RTF.",
+      QWEN_STREAM_RTF: "Cumulative decode-call wall duration / audio duration; not GPU utilization or end-to-end RTF.",
+      QWEN_SCHEDULER_WAIT_MS: "Time from a decode job becoming ready until the single worker RPC starts.",
+      QWEN_DECODE_BACKLOG_MS: "Accepted audio not yet handed to the worker, including queued windows and residual tail.",
+      STREAM_LAG_MS: "Accepted audio cursor minus last successfully dispatched audio cursor; includes active and pending work.",
+      DECODE_OVERRUN: "Decode-call wall exceeded the configured audio chunk interval; PCM is retained until bounded backpressure fences this stream.",
       },
     } : null,
     reference_text: state.reference || null,
@@ -1131,6 +1239,17 @@ function safeResult() {
         ?? segments.at(-1)?.CLIENT_EOS_TO_TRANSCRIPT_MS ?? null,
       QWEN_CUMULATIVE_DECODE_WALL_MS: segments.at(-1)?.QWEN_CUMULATIVE_DECODE_WALL_MS ?? null,
       QWEN_STREAM_RTF: segments.at(-1)?.QWEN_STREAM_RTF ?? null,
+      QWEN_SCHEDULER_WAIT_MS_P50: state.health?.qwen_scheduler?.qwen_scheduler_wait_p50_ms ?? null,
+      QWEN_SCHEDULER_WAIT_MS_P95: state.health?.qwen_scheduler?.qwen_scheduler_wait_p95_ms ?? null,
+      QWEN_DECODE_WALL_P50_MS: state.health?.qwen_scheduler?.qwen_decode_wall_p50_ms ?? null,
+      QWEN_DECODE_WALL_P95_MS: state.health?.qwen_scheduler?.qwen_decode_wall_p95_ms ?? null,
+      QWEN_DECODE_BACKLOG_MS: state.health?.qwen_scheduler?.qwen_scheduler_backlog_ms ?? null,
+      QWEN_MAX_STREAM_BACKLOG_MS: state.health?.qwen_scheduler?.qwen_scheduler_max_stream_backlog_ms ?? null,
+      PENDING_DECODE_COUNT: state.health?.qwen_scheduler?.pending_decode_count ?? null,
+      ACTIVE_DECODE_COUNT: state.health?.qwen_scheduler?.active_decode_count ?? null,
+      ACTIVE_STREAM_COUNT: state.health?.qwen_scheduler?.active_stream_count ?? null,
+      DECODE_BUDGET_OVERRUN_COUNT: state.health?.qwen_scheduler?.qwen_decode_budget_overrun_total ?? null,
+      SCHEDULER_FENCE_OVERRUN_COUNT: state.health?.qwen_scheduler?.qwen_scheduler_overrun_total ?? null,
     },
     telemetry: [...state.telemetry],
     proxy_ws_rtt_samples: state.rttSamples.map((sample) => ({
@@ -1187,6 +1306,18 @@ function exportCsv() {
     "SERVER_CHUNK_TO_PARTIAL_MS", "PARTIAL_COUNT", "PARTIAL_REVISION_RATE", "PARTIAL_STABILITY",
     "FINALIZATION_AFTER_SERVER_EOS_MS", "QWEN_DECODE_CALL_WALL_MS",
     "QWEN_CUMULATIVE_DECODE_WALL_MS", "QWEN_STREAM_RTF",
+    "QWEN_SCHEDULER_WAIT_MS", "QWEN_SCHEDULER_WAIT_P50_MS", "QWEN_SCHEDULER_WAIT_P95_MS",
+    "QWEN_DECODE_WALL_P50_MS", "QWEN_DECODE_WALL_P95_MS", "QWEN_DECODE_BACKLOG_MS",
+    "QWEN_DECODE_BACKLOG_MAX_MS", "STREAM_LAG_MAX_MS",
+    "STREAM_LAG_MS", "PENDING_DECODE_COUNT", "ACTIVE_DECODE_COUNT", "ACTIVE_STREAM_COUNT",
+    "DECODE_OVERRUN", "DECODE_BUDGET_OVERRUN_COUNT", "SCHEDULER_FENCE_OVERRUN_COUNT",
+    "QWEN_DECODE_STEPS_DELTA", "QWEN_DECODE_STEPS_DELTA_TOTAL", "QWEN_FINISH_DECODE_WALL_MS",
+    "QWEN_ACTIVE_STREAM_COUNT", "QWEN_MAX_ACTIVE_STREAMS", "QWEN_ACTIVE_DECODE_COUNT",
+    "QWEN_PENDING_DECODE_COUNT", "QWEN_SCHEDULER_BACKLOG_MS", "QWEN_MAX_STREAM_BACKLOG_MS",
+    "QWEN_STREAM_LAG_SUM_MS", "QWEN_MAX_STREAM_LAG_MS", "QWEN_DECODE_BUDGET_OVERRUN_TOTAL",
+    "QWEN_SCHEDULER_FENCE_OVERRUN_TOTAL", "QWEN_SCHEDULER_WAIT_ROLLING_P95_MS",
+    "QWEN_DECODE_WALL_ROLLING_P95_MS", "gpu_utilization_pct", "vram_used_mib",
+    "vram_total_mib", "process_rss_mib",
     "MODEL_DECODE_CHUNK_MS", "AUDIO_PUSH_INTERVAL_MS",
     "qwen_asr_version", "vllm_version", "transformers_version", "torch_version", "torch_cuda_version"];
   const toCsvRow = (row) => columns.map((column) => csvCell(row[column] ?? "")).join(",");
@@ -1220,6 +1351,21 @@ function exportCsv() {
       FINALIZATION_AFTER_SERVER_EOS_MS: row.FINALIZATION_AFTER_SERVER_EOS_MS,
       QWEN_CUMULATIVE_DECODE_WALL_MS: row.QWEN_CUMULATIVE_DECODE_WALL_MS,
       QWEN_STREAM_RTF: row.QWEN_STREAM_RTF, PARTIAL_COUNT: row.PARTIAL_COUNT,
+      QWEN_SCHEDULER_WAIT_MS: row.QWEN_SCHEDULER_WAIT_MS,
+      QWEN_SCHEDULER_WAIT_P50_MS: row.QWEN_SCHEDULER_WAIT_P50_MS,
+      QWEN_SCHEDULER_WAIT_P95_MS: row.QWEN_SCHEDULER_WAIT_P95_MS,
+      QWEN_DECODE_WALL_P50_MS: row.QWEN_DECODE_WALL_P50_MS,
+      QWEN_DECODE_WALL_P95_MS: row.QWEN_DECODE_WALL_P95_MS,
+      QWEN_DECODE_BACKLOG_MS: row.QWEN_DECODE_BACKLOG_MS,
+      QWEN_DECODE_BACKLOG_MAX_MS: row.QWEN_DECODE_BACKLOG_MAX_MS,
+      STREAM_LAG_MS: row.STREAM_LAG_MS,
+      STREAM_LAG_MAX_MS: row.STREAM_LAG_MAX_MS,
+      PENDING_DECODE_COUNT: row.PENDING_DECODE_COUNT,
+      ACTIVE_STREAM_COUNT: row.ACTIVE_STREAM_COUNT,
+      DECODE_OVERRUN: row.DECODE_OVERRUN,
+      QWEN_DECODE_STEPS_DELTA: row.QWEN_DECODE_STEPS_DELTA,
+      QWEN_DECODE_STEPS_DELTA_TOTAL: row.QWEN_DECODE_STEPS_DELTA_TOTAL,
+      QWEN_FINISH_DECODE_WALL_MS: row.QWEN_FINISH_DECODE_WALL_MS,
       FIRST_PARTIAL_MS: row.FIRST_PARTIAL_MS, PARTIAL_STABILITY: row.PARTIAL_STABILITY,
       PARTIAL_REVISION_RATE: row.PARTIAL_REVISION_RATE,
       MODEL_DECODE_CHUNK_MS: row.MODEL_DECODE_CHUNK_MS,
@@ -1248,6 +1394,14 @@ function exportCsv() {
       QWEN_DECODE_CALL_WALL_MS: partial.QWEN_DECODE_CALL_WALL_MS,
       QWEN_CUMULATIVE_DECODE_WALL_MS: partial.QWEN_CUMULATIVE_DECODE_WALL_MS,
       QWEN_STREAM_RTF: partial.QWEN_STREAM_RTF,
+      QWEN_SCHEDULER_WAIT_MS: partial.QWEN_SCHEDULER_WAIT_MS,
+      QWEN_DECODE_BACKLOG_MS: partial.QWEN_DECODE_BACKLOG_MS,
+      QWEN_DECODE_BACKLOG_MAX_MS: partial.QWEN_DECODE_BACKLOG_MAX_MS,
+      STREAM_LAG_MS: partial.STREAM_LAG_MS,
+      STREAM_LAG_MAX_MS: partial.STREAM_LAG_MAX_MS,
+      PENDING_DECODE_COUNT: partial.PENDING_DECODE_COUNT,
+      ACTIVE_STREAM_COUNT: partial.ACTIVE_STREAM_COUNT,
+      DECODE_OVERRUN: partial.DECODE_OVERRUN,
       MODEL_DECODE_CHUNK_MS: partial.MODEL_DECODE_CHUNK_MS,
       AUDIO_PUSH_INTERVAL_MS: partial.AUDIO_PUSH_INTERVAL_MS,
       qwen_asr_version: result.runtime_provenance?.qwen_asr_version,
@@ -1255,6 +1409,29 @@ function exportCsv() {
       transformers_version: result.runtime_provenance?.transformers_version,
       torch_version: result.runtime_provenance?.torch_version,
       torch_cuda_version: result.runtime_provenance?.torch_cuda_version,
+    }));
+  }
+  for (const point of result.telemetry ?? []) {
+    const scheduler = point.qwen_scheduler ?? {};
+    lines.push(toCsvRow({
+      record_type: "telemetry", timestamp: point.timestamp, backend: result.backend,
+      model_id: result.model_id, gpu: point.gpu_device, workers: point.workers,
+      QWEN_ACTIVE_STREAM_COUNT: scheduler.active_stream_count,
+      QWEN_MAX_ACTIVE_STREAMS: scheduler.max_active_streams,
+      QWEN_ACTIVE_DECODE_COUNT: scheduler.active_decode_count,
+      QWEN_PENDING_DECODE_COUNT: scheduler.pending_decode_count,
+      QWEN_SCHEDULER_BACKLOG_MS: scheduler.qwen_scheduler_backlog_ms,
+      QWEN_MAX_STREAM_BACKLOG_MS: scheduler.qwen_scheduler_max_stream_backlog_ms,
+      QWEN_STREAM_LAG_SUM_MS: scheduler.qwen_scheduler_stream_lag_ms,
+      QWEN_MAX_STREAM_LAG_MS: scheduler.qwen_scheduler_max_stream_lag_ms,
+      QWEN_SCHEDULER_WAIT_ROLLING_P95_MS: scheduler.qwen_scheduler_wait_p95_ms,
+      QWEN_DECODE_WALL_ROLLING_P95_MS: scheduler.qwen_decode_wall_p95_ms,
+      QWEN_DECODE_BUDGET_OVERRUN_TOTAL: scheduler.qwen_decode_budget_overrun_total,
+      QWEN_SCHEDULER_FENCE_OVERRUN_TOTAL: scheduler.qwen_scheduler_overrun_total,
+      gpu_utilization_pct: point.gpu_utilization_pct,
+      vram_used_mib: point.vram_used_mib,
+      vram_total_mib: point.vram_total_mib,
+      process_rss_mib: point.process_rss_mib,
     }));
   }
   for (const sample of result.proxy_ws_rtt_samples) {

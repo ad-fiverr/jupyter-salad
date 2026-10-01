@@ -178,6 +178,33 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(snapshot["queue_depth"], 2)
         self.assertNotIn(SECRET, json.dumps(snapshot))
 
+    def test_qwen_scheduler_telemetry_contains_aggregates_without_stream_identity(self):
+        broker = types.SimpleNamespace(ready=True, queued_jobs=3)
+        settings = types.SimpleNamespace(
+            backend="faster_whisper", model_id="model", model_revision=None,
+            workers=1, api_token=SECRET,
+        )
+        scheduler = {
+            "active_stream_count": 6, "max_active_streams": 6,
+            "pending_decode_count": 4, "active_decode_count": 1,
+            "qwen_scheduler_backlog_ms": 825.0,
+            "qwen_scheduler_wait_p95_ms": 137.5,
+            "qwen_decode_budget_overrun_total": 3,
+            "connection_id": "must-not-leak", "stream_id": "must-not-leak-either",
+        }
+        with patch("asr_lab.telemetry.process_rss_mib", return_value=100.0), \
+             patch("asr_lab.telemetry.system_memory_mib", return_value={"total_mib": 1000.0, "used_mib": 500.0}), \
+             patch("asr_lab.telemetry.gpu_compute_state", return_value={"available": False, "cuda": False, "device": None}), \
+             patch("asr_lab.telemetry.gpu_telemetry", return_value={"available": False, "device": None}):
+            snapshot = collect_telemetry(broker, settings, scheduler)
+        self.assertEqual(snapshot["qwen_scheduler"]["active_stream_count"], 6)
+        self.assertEqual(snapshot["qwen_scheduler"]["pending_decode_count"], 4)
+        self.assertEqual(snapshot["qwen_scheduler"]["qwen_decode_budget_overrun_total"], 3)
+        encoded = json.dumps(snapshot)
+        self.assertNotIn("connection_id", encoded)
+        self.assertNotIn("stream_id", encoded)
+        self.assertNotIn(SECRET, encoded)
+
 
 if __name__ == "__main__":
     unittest.main()
