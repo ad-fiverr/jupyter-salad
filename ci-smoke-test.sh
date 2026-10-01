@@ -209,6 +209,21 @@ if ((probe_failures != 0)); then
   exit 1
 fi
 
+set_phase qwen_build_runtime_test
+timeout 15s docker exec --interactive "$container_name" \
+  /opt/qwen-asr-venv/bin/python - <<'PY'
+import importlib.metadata
+import os
+from pathlib import Path
+
+python_path = Path("/opt/qwen-asr-venv/bin/python")
+assert python_path.is_file() and os.access(python_path, os.X_OK), "Qwen venv Python is missing"
+assert os.environ.get("QWEN_STREAMING_RUNTIME_AVAILABLE") == "1", "Qwen runtime flag is not enabled in the image"
+assert importlib.metadata.version("qwen-asr") == "0.0.6", "Unexpected qwen-asr package version"
+assert importlib.metadata.version("vllm") == "0.14.0", "Unexpected vLLM package version"
+print("QWEN_BUILD_RUNTIME_PRESENT=PASS qwen_asr=0.0.6 vllm=0.14.0 weights=NOT_LOADED")
+PY
+
 set_phase jupyter_login_test
 timeout 5s docker exec "$container_name" sh -c 'touch /workspace/ci-smoke-root-marker.txt'
 

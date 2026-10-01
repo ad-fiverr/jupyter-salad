@@ -69,6 +69,24 @@ case "$1" in
       "$(cat "$SMOKE_FAKE_DIR/asr-secret")"
     ;;
   exec)
+    if [[ " $* " == *" /opt/qwen-asr-venv/bin/python - "* ]]; then
+      if [[ " $* " != *" --interactive "* ]]; then
+        printf '%s\n' 'Qwen image probe did not keep STDIN open with --interactive.' >&2
+        exit 96
+      fi
+      qwen_script="$(cat)"
+      for required in \
+        'QWEN_STREAMING_RUNTIME_AVAILABLE' \
+        'version("qwen-asr") == "0.0.6"' \
+        'version("vllm") == "0.14.0"'; do
+        if ! grep -Fq -- "$required" <<<"$qwen_script"; then
+          printf 'Qwen image probe stdin is missing check: %s\n' "$required" >&2
+          exit 97
+        fi
+      done
+      printf '%s\n' 'QWEN_BUILD_RUNTIME_PRESENT=PASS qwen_asr=0.0.6 vllm=0.14.0 weights=NOT_LOADED'
+      exit 0
+    fi
     if [[ " $* " == *" /usr/local/bin/salad-nginx-diagnostics.py "* ]]; then
       for argument in "$@"; do
         case "$argument" in
@@ -288,7 +306,7 @@ if [[ "$(grep -Fc -- '--- Container diagnostics' "$start_failure_output")" != '1
 fi
 
 healthy_output="$(run_smoke normal healthy 0)"
-for phase in container_start health_wait health_probe jupyter_login_test asr_health_test websocket_test secret_log_check complete; do
+for phase in container_start health_wait health_probe qwen_build_runtime_test jupyter_login_test asr_health_test websocket_test secret_log_check complete; do
   if ! grep -Fq "SMOKE_PHASE=$phase" "$healthy_output"; then
     printf 'Missing successful smoke phase: %s\n' "$phase" >&2
     cat "$healthy_output" >&2
@@ -303,4 +321,10 @@ for probe in nginx_direct jupyter_direct asr_direct; do
   fi
 done
 
-printf '%s\n' 'CI smoke phases, failure diagnostics, bounded Docker calls, loopback probes, and redaction: PASS'
+if ! grep -Fq 'QWEN_BUILD_RUNTIME_PRESENT=PASS qwen_asr=0.0.6 vllm=0.14.0 weights=NOT_LOADED' "$healthy_output"; then
+  printf '%s\n' 'Qwen image contract check did not run successfully.' >&2
+  cat "$healthy_output" >&2
+  exit 1
+fi
+
+printf '%s\n' 'CI smoke phases, failure diagnostics, bounded Docker calls, loopback probes, Qwen image contract, and redaction: PASS'

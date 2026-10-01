@@ -80,5 +80,71 @@ class AsrBenchmarkImageContractTests(unittest.TestCase):
         self.assertIn("-s /opt/asr-lab/tests -v", dockerfile)
 
 
+class QwenBuildArtifactContractTests(unittest.TestCase):
+    def test_ci_build_enables_qwen_and_is_the_image_smoked_then_published(self):
+        workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
+        build_steps = re.findall(
+            r"(?ms)^      - name: Build linux/amd64 image for runner smoke tests\n"
+            r"(?P<body>.*?)(?=^      - name: |\Z)",
+            workflow,
+        )
+        self.assertEqual(len(build_steps), 1)
+        build_step = build_steps[0]
+        self.assertIn("uses: docker/build-push-action@", build_step)
+        self.assertIn("tags: myblockchaincompany/jupyter-salad:ci", build_step)
+        self.assertIn("build-args: |\n            INSTALL_QWEN_RUNTIME=1", build_step)
+        self.assertIn("bash ci-smoke-test.sh myblockchaincompany/jupyter-salad:ci", workflow)
+        self.assertEqual(workflow.count('docker tag "${image}:ci"'), 3)
+        for published_tag in (
+            "2.4.1-py3.11-cuda12.4.1", "latest", "sha-${SHORT_SHA}"
+        ):
+            self.assertIn(f'docker tag "${{image}}:ci" "${{image}}:{published_tag}"', workflow)
+        self.assertLess(
+            workflow.index("Test built image before publication"),
+            workflow.index("Log in to Docker Hub after validation"),
+        )
+        self.assertLess(
+            workflow.index("Log in to Docker Hub after validation"),
+            workflow.index("Tag and publish the tested image"),
+        )
+
+    def test_dockerfile_and_smoke_verify_the_isolated_qwen_image_contract_without_weights(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        requirements = (ROOT / "asr-lab/requirements-qwen.txt").read_text(encoding="utf-8")
+        verifier = (ROOT / "asr-lab/asr_lab/verify_qwen_runtime.py").read_text(encoding="utf-8")
+        smoke = (ROOT / "ci-smoke-test.sh").read_text(encoding="utf-8")
+
+        self.assertIn("ARG INSTALL_QWEN_RUNTIME=0", dockerfile)
+        self.assertIn("QWEN_STREAMING_RUNTIME_AVAILABLE=${INSTALL_QWEN_RUNTIME}", dockerfile)
+        self.assertIn('if [ "$INSTALL_QWEN_RUNTIME" = "1" ]', dockerfile)
+        self.assertIn("python -m venv /opt/qwen-asr-venv", dockerfile)
+        self.assertIn("--requirement /tmp/qwen-requirements.txt", dockerfile)
+        self.assertIn("/opt/qwen-asr-venv/bin/python -m asr_lab.verify_qwen_runtime", dockerfile)
+        self.assertIn("qwen-asr[vllm]==0.0.6", requirements)
+        self.assertIn("vllm==0.14.0", requirements)
+        self.assertIn('"qwen-asr": "0.0.6"', verifier)
+        self.assertIn('"vllm": "0.14.0"', verifier)
+        self.assertIn("from qwen_asr import Qwen3ASRModel", verifier)
+        self.assertIn("import vllm", verifier)
+        self.assertIn("weights=NOT_LOADED", verifier)
+
+        self.assertIn("set_phase qwen_build_runtime_test", smoke)
+        self.assertRegex(
+            smoke,
+            r"timeout 15s docker exec --interactive \"\$container_name\" \\\
+\s*/opt/qwen-asr-venv/bin/python - <<'PY'",
+        )
+        self.assertIn('os.environ.get("QWEN_STREAMING_RUNTIME_AVAILABLE") == "1"', smoke)
+        fake_smoke_test = (ROOT / "tests/test-ci-smoke-diagnostics.sh").read_text(encoding="utf-8")
+        self.assertIn('qwen_script="$(cat)"', fake_smoke_test)
+        self.assertIn('!= *" --interactive "*', fake_smoke_test)
+        self.assertIn('version("qwen-asr") == "0.0.6"', fake_smoke_test)
+        self.assertIn('version("vllm") == "0.14.0"', fake_smoke_test)
+        self.assertIn('version("qwen-asr") == "0.0.6"', smoke)
+        self.assertIn('version("vllm") == "0.14.0"', smoke)
+        self.assertIn("QWEN_BUILD_RUNTIME_PRESENT=PASS", smoke)
+        self.assertIn("weights=NOT_LOADED", smoke)
+
+
 if __name__ == "__main__":
     unittest.main()

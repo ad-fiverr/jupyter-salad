@@ -86,6 +86,8 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           tags: myblockchaincompany/jupyter-salad:ci
+          build-args: |
+            INSTALL_QWEN_RUNTIME=1
           load: true
           push: false
           cache-from: type=gha
