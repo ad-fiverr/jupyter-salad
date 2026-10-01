@@ -69,7 +69,7 @@ def gpu_compute_state(broker: Any, settings: Any) -> dict[str, Any]:
         "available": available,
         "cuda": available,
         "device": detected.get("device") if detected else None,
-        "backend": getattr(settings, "backend", None),
+        "backend": getattr(settings, "active_backend", getattr(settings, "backend", None)),
         "model_loaded": bool(broker and getattr(broker, "ready", False)),
     }
 
@@ -159,9 +159,10 @@ def collect_telemetry(broker: Any, settings: Any) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "backend": settings.backend,
-        "model_id": settings.model_id,
-        "model_revision": settings.model_revision,
+        "backend": getattr(settings, "active_backend", settings.backend),
+        "production_backend": settings.backend,
+        "model_id": getattr(settings, "active_model_id", settings.model_id),
+        "model_revision": getattr(settings, "active_model_revision", settings.model_revision),
         "model_loaded": bool(broker and broker.ready),
         "ready": bool(broker and broker.ready),
         "workers": settings.workers,

@@ -14,9 +14,9 @@
       <div>
         <p class="eyebrow">SALAD · GPU LAB</p>
         <h1>Live ASR Benchmark</h1>
-        <p class="subhead">Habla y mide la transcripción final por segmento. El audio se transmite en vivo y no se guarda.</p>
+        <p class="subhead">Compara transcripción final por segmento y parciales de Qwen. El audio se transmite en vivo y no se guarda.</p>
       </div>
-      <div class="mode-badge"><span>TRANSCRIPT_MODE</span><strong>FINAL_SEGMENT</strong></div>
+      <div class="mode-badge"><span>TRANSCRIPT_MODE</span><strong id="transcript-mode">FINAL_SEGMENT</strong></div>
     </header>
 
     <section class="panel controls" aria-labelledby="controls-title">
@@ -30,8 +30,29 @@
       <div class="form-grid">
         <label class="wide">ASR API token
           <input id="api-token" type="password" autocomplete="off" spellcheck="false" aria-describedby="token-help">
-          <small id="token-help">Sólo memoria de esta página. Se borra del campo al iniciar y de la sesión al terminar.</small>
+          <small id="token-help">Sólo memoria de esta página; puedes reutilizarlo entre grabaciones mientras la página siga abierta.</small>
         </label>
+        <div id="qwen-stream-controls" class="wide stream-controls" hidden>
+          <label>Idioma Qwen
+            <select id="qwen-language">
+              <option value="auto">auto</option><option value="es">español</option><option value="en">inglés</option>
+              <option value="zh">chino</option><option value="yue">cantonés</option><option value="ja">japonés</option>
+              <option value="ko">coreano</option><option value="pt">portugués</option><option value="fr">francés</option>
+              <option value="de">alemán</option><option value="it">italiano</option><option value="ru">ruso</option>
+            </select>
+          </label>
+          <label>QWEN_STREAM_CHUNK_MS
+            <select id="qwen-chunk-size">
+              <option value="250">250 ms</option><option value="500">500 ms</option>
+              <option value="1000" selected>1000 ms</option><option value="2000">2000 ms</option>
+            </select>
+          </label>
+          <label class="wide">Contexto / vocabulario opcional
+            <input id="qwen-context" type="text" maxlength="512" autocomplete="off" spellcheck="false">
+            <small>Hasta 512 caracteres. Se usa sólo durante esta sesión y no se guarda.</small>
+          </label>
+          <p class="fine-print wide">El navegador envía audio cada 100 ms; QWEN_STREAM_CHUNK_MS controla el umbral de decode, que puede ser mayor. Los parciales son hipótesis reemplazables, nunca confirmación de negocio.</p>
+        </div>
         <label class="wide">Texto esperado (opcional, para WER)
           <textarea id="reference-text" rows="2" placeholder="Escribe aquí el texto que vas a leer"></textarea>
         </label>
@@ -52,7 +73,7 @@
       </div>
     </section>
 
-    <div class="latency-groups">
+    <div class="latency-groups" id="offline-latency-groups">
       <section class="panel" aria-labelledby="server-latency-title">
         <div class="panel-heading"><div><p class="eyebrow">PANEL A</p><h2 id="server-latency-title">Latencia del servidor / modelo</h2></div></div>
         <div class="summary-grid" aria-live="polite">
@@ -73,6 +94,27 @@
         <p class="fine-print">Client EOS incluye navegador, transporte, proxy, servidor y regreso del transcript. El RTT es ida y vuelta por el WebSocket autenticado; incluye scheduling y no es latencia unidireccional.</p>
       </section>
     </div>
+
+    <section class="panel qwen-stream-panel" id="qwen-stream-panel" hidden aria-labelledby="qwen-stream-title">
+      <div class="panel-heading"><div><p class="eyebrow">QWEN3-ASR · vLLM</p><h2 id="qwen-stream-title">Parciales provisionales</h2></div><div id="qwen-stream-meta" class="run-meta">Sin stream</div></div>
+      <div class="candidate-transcript"><span>Candidato actual · no es verdad confirmada</span><strong id="qwen-current-partial">Esperando el primer partial…</strong></div>
+      <div class="summary-grid streaming-metrics" aria-live="polite">
+        <div class="metric-card"><span>Audio hablado · duración, no latencia</span><strong id="qwen-audio-duration">—</strong></div>
+        <div class="metric-card"><span>Client first partial</span><strong id="qwen-first-partial">—</strong></div>
+        <div class="metric-card"><span>Intervalo entre parciales</span><strong id="qwen-partial-interval">—</strong></div>
+        <div class="metric-card"><span>Estabilidad del prefijo anterior</span><strong id="qwen-partial-stability">—</strong></div>
+        <div class="metric-card"><span>Final candidate WER</span><strong id="qwen-final-wer">—</strong></div>
+        <div class="metric-card"><span>Server EOS → final candidate</span><strong id="qwen-server-finalization">—</strong></div>
+        <div class="metric-card"><span>Client EOS → final candidate</span><strong id="qwen-client-finalization">—</strong></div>
+        <div class="metric-card"><span>WebSocket proxy RTT p50 / p95</span><strong id="qwen-proxy-rtt">—</strong></div>
+        <div class="metric-card"><span>Decode wall acumulado · no GPU kernel</span><strong id="qwen-decode-wall">—</strong></div>
+        <div class="metric-card"><span>Qwen decode RTF · wall/audio</span><strong id="qwen-stream-rtf">—</strong></div>
+        <div class="metric-card"><span>Partial count</span><strong id="qwen-partial-count">0</strong></div>
+      </div>
+      <div class="table-wrap partial-timeline-wrap"><table><thead><tr><th>Audio cursor</th><th>Client elapsed</th><th>Revision</th><th>Partial completo (reemplaza el anterior)</th><th>Server chunk → partial</th><th>Revisión</th><th>Decode wall</th></tr></thead><tbody id="qwen-partials-body"><tr><td colspan="7" class="empty">Aún no hay parciales.</td></tr></tbody></table></div>
+      <p class="fine-print">La estabilidad compara el prefijo de tokens anterior con el nuevo texto completo: tokens anteriores idénticos al inicio ÷ tokens anteriores. PARTIAL_REVISION_RATE = 1 − estabilidad; tokens añadidos no cuentan como revisiones. Qwen vuelve a alimentar el audio acumulado: decode wall es tiempo de llamada, no tiempo de kernel ni uso GPU atribuido.</p>
+      <p class="fine-print">SEMANTIC_LEAD_TIME_MS requiere correlación real con JEV: primera hipótesis útil pre-EOS comparada con EOS. Este laboratorio ASR no calcula esa métrica por sí solo. PARTIAL ≠ TRUTH.</p>
+    </section>
 
     <section class="panel transcript-panel" aria-labelledby="transcript-title">
       <div class="panel-heading"><div><p class="eyebrow">RESULTADO</p><h2 id="transcript-title">Transcripción final</h2></div><div id="run-meta" class="run-meta">Sin sesión</div></div>
@@ -99,7 +141,7 @@
       <article class="panel chart-card"><h3>Process RSS MiB · 1 Hz</h3><canvas id="chart-ram" aria-label="RAM del proceso"></canvas></article>
     </section>
 
-    <footer>La disponibilidad de cómputo CUDA se informa separada de la telemetría. NVML/Torch reportan métricas globales del dispositivo, no del modelo; el allocator de PyTorch no mide VRAM de CTranslate2. No se mide tiempo de kernel GPU. No hay partials ni word-level streaming en este endpoint.</footer>
+    <footer>La disponibilidad de cómputo CUDA se informa separada de la telemetría. NVML/Torch reportan métricas globales del dispositivo, no del modelo; el allocator de PyTorch no mide VRAM de CTranslate2. No se mide tiempo de kernel GPU. Parakeet/Faster-Whisper siguen en FINAL_SEGMENT; Qwen muestra parciales provisionales con revisiones.</footer>
   </main>
 </body>
 </html>

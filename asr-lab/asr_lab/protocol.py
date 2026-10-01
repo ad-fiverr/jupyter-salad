@@ -44,6 +44,15 @@ class FlushRequest:
 
 
 @dataclass(frozen=True)
+class StreamStart:
+    source: str
+    language: str
+    context: str
+    chunk_size_ms: int | None = None
+    request_id: str | None = None
+
+
+@dataclass(frozen=True)
 class BenchmarkPing:
     request_id: str
 
@@ -74,7 +83,8 @@ def parse_message(
     *,
     max_message_bytes: int,
     max_chunk_seconds: float,
-) -> AudioChunk | FlushRequest | BenchmarkPing:
+    max_context_chars: int = 512,
+) -> AudioChunk | FlushRequest | BenchmarkPing | StreamStart:
     value = _safe_json(raw, max_message_bytes)
     event = value.get("event")
 
@@ -96,6 +106,43 @@ def parse_message(
         if request_id is not None and (not isinstance(request_id, str) or len(request_id) > 128):
             raise ProtocolError("invalid_request_id", "request_id must be a short string.")
         return FlushRequest(source=source, request_id=request_id)
+
+    if event == "stream_start":
+        if set(value) - {"event", "source", "language", "context", "chunk_size_ms", "request_id"}:
+            raise ProtocolError("invalid_stream_start", "Stream start contains unsupported fields.")
+        source = value.get("source")
+        if source not in ("mic", "system"):
+            raise ProtocolError("invalid_source", "source must be mic or system.")
+        language = value.get("language", "auto")
+        if not isinstance(language, str) or not language or len(language) > 16:
+            raise ProtocolError("invalid_language", "language must be a supported short code or auto.")
+        language = language.strip().lower()
+        if language != "auto" and not language.isalpha():
+            raise ProtocolError("invalid_language", "language must be a supported short code or auto.")
+        context = value.get("context", "")
+        if not isinstance(context, str) or len(context) > max_context_chars:
+            raise ProtocolError("invalid_context", "context exceeds the configured character limit.")
+        if any(ord(char) < 32 or ord(char) == 127 for char in context):
+            raise ProtocolError("invalid_context", "context must not contain control characters.")
+        chunk_size_ms = value.get("chunk_size_ms")
+        if chunk_size_ms is not None and (
+            not isinstance(chunk_size_ms, int)
+            or isinstance(chunk_size_ms, bool)
+            or chunk_size_ms not in (250, 500, 1000, 2000)
+        ):
+            raise ProtocolError("invalid_stream_chunk", "chunk_size_ms must be one of 250, 500, 1000, or 2000.")
+        request_id = value.get("request_id")
+        if request_id is not None and (
+            not isinstance(request_id, str) or not request_id or len(request_id) > 128
+        ):
+            raise ProtocolError("invalid_request_id", "request_id must be a non-empty string up to 128 characters.")
+        return StreamStart(
+            source=source,
+            language=language,
+            context=" ".join(context.split()),
+            chunk_size_ms=chunk_size_ms,
+            request_id=request_id,
+        )
 
     allowed = {"source", "speaker", "encoding", "sample_rate", "audio", "request_id", "type"}
     if set(value) - allowed:

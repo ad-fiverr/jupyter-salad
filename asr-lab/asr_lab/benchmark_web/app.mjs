@@ -20,6 +20,7 @@ const state = {
   backend: null,
   modelId: null,
   modelRevision: null,
+  runtimeProvenance: null,
   workers: null,
   segments: [],
   errors: [],
@@ -43,6 +44,17 @@ const state = {
   micSettings: null,
   activeSegmentRequestId: null,
   finalised: false,
+  streamId: null,
+  streamStartRequestId: null,
+  streamStartResolver: null,
+  streamEvents: [],
+  lastPartialRevision: 0,
+  lastPartialAt: null,
+  clientEosAt: null,
+  clientFinalizationMs: null,
+  qwenChunkMs: null,
+  qwenLanguage: "auto",
+  qwenContext: "",
 };
 
 const charts = {
@@ -87,13 +99,25 @@ function transcriptText() {
 
 function updateTranscript() {
   const text = transcriptText();
-  $("transcript").textContent = text || "La transcripción aparecerá cuando el servidor cierre un segmento.";
+  const qwen = state.backend === "qwen3_asr";
+  $("transcript-title").textContent = qwen ? "Candidato final · no confirmado" : "Transcripción final";
+  $("transcript").textContent = text || (
+    state.backend === "qwen3_asr"
+      ? "El candidato final aparecerá al cerrar el stream; requiere reconciliación aguas abajo."
+      : "La transcripción aparecerá cuando el servidor cierre un segmento."
+  );
   const latest = state.telemetry.at(-1);
   const gpu = gpuStatusLabel(
     latest?.gpu_compute,
     { device: latest?.gpu_device, provider: latest?.gpu_telemetry_provider },
   );
   $("run-meta").textContent = [state.backend, state.modelId, `workers=${state.workers ?? "?"}`, gpu].filter(Boolean).join(" · ");
+  const headers = $("segments-body")?.parentElement?.querySelectorAll("thead th");
+  if (headers?.length >= 9) {
+    headers[1].textContent = qwen ? "Candidato final · no confirmado" : "Transcripción";
+    headers[7].textContent = qwen ? "Server EOS → candidato final ms" : "Server EOS → transcript ms";
+    headers[8].textContent = qwen ? "Client EOS → candidato final ms*" : "Client EOS → transcript ms*";
+  }
 }
 
 function updateSummary() {
@@ -108,11 +132,13 @@ function updateSummary() {
   const rtt = rttPercentiles(state.rttSamples);
   const audioMs = rows.map((row) => row.audio_duration_ms).filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
   const inferenceMs = inference.reduce((sum, value) => sum + value, 0);
-  const wer = state.reference.trim() ? wordErrorRate(state.reference, transcriptText()) : null;
+  const wer = state.backend === "qwen3_asr" || !state.reference.trim()
+    ? null : wordErrorRate(state.reference, transcriptText());
   $("summary-segments").textContent = String(rows.length);
   $("summary-errors").textContent = String(state.errors.length);
   $("summary-audio").textContent = `${(state.capturedSamples / 16_000).toFixed(1)} s`;
-  $("summary-rtf").textContent = audioMs > 0 ? (inferenceMs / audioMs).toFixed(3) : "—";
+  $("summary-rtf").textContent = state.backend === "qwen3_asr" ? "—"
+    : audioMs > 0 ? (inferenceMs / audioMs).toFixed(3) : "—";
   $("summary-wer").textContent = wer == null ? "—" : `${(wer * 100).toFixed(1)}%`;
   const displayPair = (values) => values.length
     ? `${formatMilliseconds(median(values))} / ${formatMilliseconds(percentile(values, 0.95))}`
@@ -125,6 +151,80 @@ function updateSummary() {
   $("summary-postprocess").textContent = displayPair(postprocess);
   $("summary-proxy-rtt").textContent = rtt.p50 == null ? "—"
     : `${formatMilliseconds(rtt.p50)} / ${formatMilliseconds(rtt.p95)}`;
+}
+
+function updateQwenSummary() {
+  if (!$("qwen-first-partial")) return;
+  const partials = state.streamEvents;
+  const first = partials.find((item) => Number.isFinite(item.CLIENT_FIRST_PARTIAL_MS));
+  const intervals = partials.map((item) => item.CLIENT_PARTIAL_UPDATE_INTERVAL_MS).filter(Number.isFinite);
+  const latest = partials.at(-1);
+  const finalRow = state.segments.at(-1);
+  $("qwen-audio-duration").textContent = Number.isFinite(finalRow?.AUDIO_DURATION_MS)
+    ? fmtMs(finalRow.AUDIO_DURATION_MS) : "—";
+  $("qwen-first-partial").textContent = first ? fmtMs(first.CLIENT_FIRST_PARTIAL_MS) : "—";
+  $("qwen-partial-interval").textContent = intervals.length ? fmtMs(median(intervals)) : "—";
+  $("qwen-partial-stability").textContent = Number.isFinite(latest?.PARTIAL_STABILITY)
+    ? (latest.PARTIAL_STABILITY * 100).toFixed(1) + "%" : "—";
+  const serverEos = Number.isFinite(finalRow?.SERVER_EOS_TO_FINAL_CANDIDATE_MS)
+    ? finalRow.SERVER_EOS_TO_FINAL_CANDIDATE_MS : finalRow?.FINALIZATION_AFTER_SERVER_EOS_MS;
+  $("qwen-server-finalization").textContent = Number.isFinite(serverEos) ? fmtMs(serverEos) : "—";
+  $("qwen-client-finalization").textContent = Number.isFinite(finalRow?.CLIENT_EOS_TO_FINAL_CANDIDATE_MS)
+    ? fmtMs(finalRow.CLIENT_EOS_TO_FINAL_CANDIDATE_MS) : "—";
+  const rtt = rttPercentiles(state.rttSamples);
+  $("qwen-proxy-rtt").textContent = rtt.p50 == null
+    ? "—" : fmtMs(rtt.p50) + " / " + fmtMs(rtt.p95);
+  $("qwen-final-wer").textContent = state.reference.trim() && finalRow
+    ? (wordErrorRate(state.reference, finalRow.text) * 100).toFixed(2) + "%" : "—";
+  $("qwen-decode-wall").textContent = Number.isFinite(finalRow?.QWEN_CUMULATIVE_DECODE_WALL_MS)
+    ? fmtMs(finalRow.QWEN_CUMULATIVE_DECODE_WALL_MS) : "—";
+  $("qwen-stream-rtf").textContent = Number.isFinite(finalRow?.QWEN_STREAM_RTF)
+    ? finalRow.QWEN_STREAM_RTF.toFixed(3) : Number.isFinite(latest?.QWEN_STREAM_RTF)
+      ? latest.QWEN_STREAM_RTF.toFixed(3) : "—";
+  $("qwen-partial-count").textContent = String(finalRow?.PARTIAL_COUNT ?? partials.length);
+}
+
+function renderQwenPartials() {
+  const body = $("qwen-partials-body");
+  body.replaceChildren();
+  if (!state.streamEvents.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 7;
+    cell.className = "empty";
+    cell.textContent = "Aún no hay parciales.";
+    row.append(cell);
+    body.append(row);
+    $("qwen-current-partial").textContent = "Esperando el primer partial…";
+    return;
+  }
+  for (const item of state.streamEvents) {
+    const row = document.createElement("tr");
+    const values = [
+      fmtMs(item.audio_cursor_ms),
+      fmtMs(item.CLIENT_ELAPSED_MS),
+      item.revision,
+      item.text,
+      fmtMs(item.SERVER_CHUNK_TO_PARTIAL_MS),
+      Number.isFinite(item.PARTIAL_REVISION_RATE) ? (item.PARTIAL_REVISION_RATE * 100).toFixed(1) + "%" : "—",
+      fmtMs(item.QWEN_DECODE_CALL_WALL_MS),
+    ];
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = value == null ? "" : String(value);
+      row.append(cell);
+    }
+    body.append(row);
+  }
+  const current = state.streamEvents.at(-1);
+  $("qwen-current-partial").textContent = current.text;
+  $("qwen-stream-meta").textContent = [
+    "stream=" + String(state.streamId ?? "").slice(0, 8),
+    "language=" + state.qwenLanguage,
+    "push=100 ms",
+    "decode=" + (state.qwenChunkMs ?? "?") + " ms",
+  ].join(" · ");
+  updateQwenSummary();
 }
 
 function renderSegments() {
@@ -151,8 +251,12 @@ function renderSegments() {
       fmtMs(Number.isFinite(item.SERVER_QUEUE_WAIT_MS) ? item.SERVER_QUEUE_WAIT_MS : item.queue_wait_ms),
       fmtMs(Number.isFinite(item.SERVER_MODEL_INFERENCE_MS) ? item.SERVER_MODEL_INFERENCE_MS : item.MODEL_INFERENCE_MS),
       fmtMs(item.SERVER_POSTPROCESS_MS),
-      fmtMs(Number.isFinite(item.SERVER_EOS_TO_TRANSCRIPT_MS) ? item.SERVER_EOS_TO_TRANSCRIPT_MS : item.SERVER_AUDIO_END_TO_TRANSCRIPT_MS),
-      fmtMs(Number.isFinite(item.CLIENT_EOS_TO_TRANSCRIPT_MS) ? item.CLIENT_EOS_TO_TRANSCRIPT_MS : item.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS),
+      fmtMs(item.candidate_only
+        ? item.SERVER_EOS_TO_FINAL_CANDIDATE_MS
+        : Number.isFinite(item.SERVER_EOS_TO_TRANSCRIPT_MS) ? item.SERVER_EOS_TO_TRANSCRIPT_MS : item.SERVER_AUDIO_END_TO_TRANSCRIPT_MS),
+      fmtMs(item.candidate_only
+        ? item.CLIENT_EOS_TO_FINAL_CANDIDATE_MS
+        : Number.isFinite(item.CLIENT_EOS_TO_TRANSCRIPT_MS) ? item.CLIENT_EOS_TO_TRANSCRIPT_MS : item.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS),
     ];
     values.forEach((value) => {
       const td = document.createElement("td");
@@ -255,6 +359,14 @@ function recordTelemetry(snapshot) {
   state.telemetry.push(point);
   if (state.telemetry.length > 3600) state.telemetry.shift();
   status($("model-status"), "Modelo", snapshot.ready ? "listo" : "cargando / no listo", snapshot.ready ? "ready" : "unknown");
+  const qwen = snapshot.backend === "qwen3_asr";
+  if (snapshot.runtime_provenance && typeof snapshot.runtime_provenance === "object") {
+    state.runtimeProvenance = snapshot.runtime_provenance;
+  }
+  $("transcript-mode").textContent = snapshot.transcript_mode ?? (qwen ? "STREAMING_PARTIALS" : "FINAL_SEGMENT");
+  $("qwen-stream-controls").hidden = !qwen;
+  $("qwen-stream-panel").hidden = !qwen;
+  $("offline-latency-groups").hidden = qwen;
   updateTranscript();
 }
 
@@ -263,10 +375,14 @@ async function pollTelemetry() {
   try {
     const snapshot = await getTelemetry();
     if (!state.token || state.finalised) return;
+    state.health = snapshot;
     recordTelemetry(snapshot);
     if (snapshot.backend) state.backend = snapshot.backend;
     if (snapshot.model_id) state.modelId = snapshot.model_id;
     if (snapshot.model_revision) state.modelRevision = snapshot.model_revision;
+    if (snapshot.runtime_provenance && typeof snapshot.runtime_provenance === "object") {
+      state.runtimeProvenance = snapshot.runtime_provenance;
+    }
     if (Number.isInteger(snapshot.workers)) state.workers = snapshot.workers;
     updateTranscript();
     renderCharts();
@@ -276,23 +392,70 @@ async function pollTelemetry() {
   }
 }
 
-function onTranscript(message) {
+function onPartialTranscript(message) {
+  if (message.stream_id !== state.streamId || message.final !== false || message.replace !== true) return;
+  if (!Number.isInteger(message.revision) || message.revision <= state.lastPartialRevision) return;
+  const receivedAt = performance.now();
+  const previousAt = state.lastPartialAt;
+  const clientElapsedMs = state.startedAt == null ? null : Math.max(0, receivedAt - state.startedAt);
+  const item = {
+    event: "partial_candidate",
+    stream_id: message.stream_id,
+    revision: message.revision,
+    text: String(message.text ?? ""),
+    language: typeof message.language === "string" ? message.language : null,
+    audio_cursor_ms: Number.isFinite(message.audio_cursor_ms) ? message.audio_cursor_ms : null,
+    CLIENT_ELAPSED_MS: clientElapsedMs,
+    CLIENT_FIRST_PARTIAL_MS: state.streamEvents.length === 0 ? clientElapsedMs : null,
+    CLIENT_PARTIAL_UPDATE_INTERVAL_MS: previousAt == null ? null : Math.max(0, receivedAt - previousAt),
+    FIRST_PARTIAL_MS: message.FIRST_PARTIAL_MS,
+    PARTIAL_UPDATE_INTERVAL_MS: message.PARTIAL_UPDATE_INTERVAL_MS,
+    PARTIAL_COUNT: message.PARTIAL_COUNT,
+    PARTIAL_REVISION_RATE: message.PARTIAL_REVISION_RATE,
+    PARTIAL_STABILITY: message.PARTIAL_STABILITY,
+    SERVER_CHUNK_TO_PARTIAL_MS: message.SERVER_CHUNK_TO_PARTIAL_MS,
+    QWEN_DECODE_CALL_WALL_MS: message.QWEN_DECODE_CALL_WALL_MS,
+    QWEN_CUMULATIVE_DECODE_WALL_MS: message.QWEN_CUMULATIVE_DECODE_WALL_MS,
+    QWEN_STREAM_RTF: message.QWEN_STREAM_RTF,
+    MODEL_DECODE_CHUNK_MS: message.MODEL_DECODE_CHUNK_MS,
+    AUDIO_PUSH_INTERVAL_MS: message.AUDIO_PUSH_INTERVAL_MS,
+    client_received_at: receivedAt,
+    candidate_only: true,
+    provisional: true,
+    final: false,
+    truth_status: message.truth_status ?? "candidate_only",
+  };
+  state.streamEvents.push(item);
+  if (state.streamEvents.length > 1000) state.streamEvents.shift();
+  state.lastPartialRevision = message.revision;
+  state.lastPartialAt = receivedAt;
+  renderQwenPartials();
+}
+
+function onTranscript(message, candidateOnly = false) {
   const receivedAt = performance.now();
   const clientStart = typeof message.client_request_id === "string"
     ? state.requestTimes.get(message.client_request_id)
     : null;
   if (typeof message.client_request_id === "string") state.requestTimes.delete(message.client_request_id);
-  const clientEosMs = Number.isFinite(clientStart) ? Math.max(0, receivedAt - clientStart) : null;
+  const clientEosMs = state.backend === "qwen3_asr" && Number.isFinite(state.clientEosAt)
+    ? Math.max(0, receivedAt - state.clientEosAt)
+    : Number.isFinite(clientStart) ? Math.max(0, receivedAt - clientStart) : null;
   const modelMs = Number.isFinite(message.SERVER_MODEL_INFERENCE_MS)
     ? message.SERVER_MODEL_INFERENCE_MS
     : Number.isFinite(message.MODEL_INFERENCE_MS) ? message.MODEL_INFERENCE_MS : null;
   const queueMs = Number.isFinite(message.SERVER_QUEUE_WAIT_MS)
     ? message.SERVER_QUEUE_WAIT_MS
     : Number.isFinite(message.queue_wait_ms) ? message.queue_wait_ms : null;
-  const serverEosMs = Number.isFinite(message.SERVER_EOS_TO_TRANSCRIPT_MS)
+  const serverEosMs = !candidateOnly && Number.isFinite(message.SERVER_EOS_TO_TRANSCRIPT_MS)
     ? message.SERVER_EOS_TO_TRANSCRIPT_MS
-    : Number.isFinite(message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS) ? message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS : null;
+    : !candidateOnly && Number.isFinite(message.FINALIZATION_AFTER_SERVER_EOS_MS)
+      ? message.FINALIZATION_AFTER_SERVER_EOS_MS
+      : !candidateOnly && Number.isFinite(message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS)
+        ? message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS : null;
   state.segments.push({
+    event: candidateOnly ? "final_candidate" : "transcript",
+    candidate_only: candidateOnly,
     text: String(message.text ?? ""),
     start: Number.isFinite(message.start) ? message.start : null,
     end: Number.isFinite(message.end) ? message.end : null,
@@ -304,28 +467,51 @@ function onTranscript(message) {
     SERVER_QUEUE_WAIT_MS: queueMs,
     SERVER_POSTPROCESS_MS: Number.isFinite(message.SERVER_POSTPROCESS_MS) ? message.SERVER_POSTPROCESS_MS : null,
     SERVER_EOS_TO_TRANSCRIPT_MS: serverEosMs,
-    CLIENT_EOS_TO_TRANSCRIPT_MS: clientEosMs,
+    SERVER_EOS_TO_FINAL_CANDIDATE_MS: candidateOnly && Number.isFinite(message.SERVER_EOS_TO_FINAL_CANDIDATE_MS)
+      ? message.SERVER_EOS_TO_FINAL_CANDIDATE_MS : null,
+    CLIENT_EOS_TO_TRANSCRIPT_MS: candidateOnly ? null : clientEosMs,
+    CLIENT_EOS_TO_FINAL_CANDIDATE_MS: candidateOnly ? clientEosMs : null,
     SEGMENT_WAIT_MS: Number.isFinite(message.SEGMENT_WAIT_MS) ? message.SEGMENT_WAIT_MS : null,
     SERVER_TO_TRANSCRIPT_MS: Number.isFinite(message.SERVER_TO_TRANSCRIPT_MS) ? message.SERVER_TO_TRANSCRIPT_MS : null,
     SERVER_RECEIVE_TO_TRANSCRIPT_MS: Number.isFinite(message.SERVER_RECEIVE_TO_TRANSCRIPT_MS) ? message.SERVER_RECEIVE_TO_TRANSCRIPT_MS : null,
     SERVER_AUDIO_END_TO_TRANSCRIPT_MS: serverEosMs,
-    CLIENT_AUDIO_END_TO_TRANSCRIPT_MS: clientEosMs,
+    CLIENT_AUDIO_END_TO_TRANSCRIPT_MS: candidateOnly ? null : clientEosMs,
+    FINALIZATION_AFTER_SERVER_EOS_MS: Number.isFinite(message.FINALIZATION_AFTER_SERVER_EOS_MS)
+      ? message.FINALIZATION_AFTER_SERVER_EOS_MS : null,
+    QWEN_CUMULATIVE_DECODE_WALL_MS: Number.isFinite(message.QWEN_CUMULATIVE_DECODE_WALL_MS)
+      ? message.QWEN_CUMULATIVE_DECODE_WALL_MS : null,
+    QWEN_STREAM_RTF: Number.isFinite(message.QWEN_STREAM_RTF) ? message.QWEN_STREAM_RTF : null,
+    PARTIAL_COUNT: Number.isFinite(message.PARTIAL_COUNT) ? message.PARTIAL_COUNT : null,
+    FIRST_PARTIAL_MS: Number.isFinite(message.FIRST_PARTIAL_MS) ? message.FIRST_PARTIAL_MS : null,
+    PARTIAL_REVISION_RATE: Number.isFinite(message.PARTIAL_REVISION_RATE) ? message.PARTIAL_REVISION_RATE : null,
+    PARTIAL_STABILITY: Number.isFinite(message.PARTIAL_STABILITY) ? message.PARTIAL_STABILITY : null,
+    MODEL_DECODE_CHUNK_MS: Number.isFinite(message.MODEL_DECODE_CHUNK_MS) ? message.MODEL_DECODE_CHUNK_MS : null,
+    AUDIO_PUSH_INTERVAL_MS: Number.isFinite(message.AUDIO_PUSH_INTERVAL_MS) ? message.AUDIO_PUSH_INTERVAL_MS : null,
     queue_wait_ms: queueMs,
     audio_duration_ms: Number.isFinite(message.AUDIO_DURATION_MS)
       ? message.AUDIO_DURATION_MS
       : Number.isFinite(message.audio_duration_ms) ? message.audio_duration_ms : null,
     request_id: typeof message.request_id === "string" ? message.request_id : null,
     client_request_id: typeof message.client_request_id === "string" ? message.client_request_id : null,
+    stream_id: typeof message.stream_id === "string" ? message.stream_id : null,
+    revision: Number.isInteger(message.revision) ? message.revision : null,
+    audio_cursor_ms: Number.isFinite(message.audio_cursor_ms) ? message.audio_cursor_ms : null,
     receivedAt,
+    truth_status: candidateOnly ? "candidate_only" : message.truth_status ?? null,
+    provisional: candidateOnly,
   });
   renderSegments();
   updateTranscript();
   updateSummary();
+  updateQwenSummary();
 }
 
 function onSocketMessage(raw) {
   let message;
   try { message = JSON.parse(raw); } catch { state.errors.push("invalid_server_message"); updateSummary(); return; }
+  if (state.backend === "qwen3_asr" && (
+    message.event === "partial_transcript" || message.event === "transcript" || message.type === "transcript"
+  )) return;
   if (message.event === "benchmark_pong") {
     const pending = state.rttPending;
     if (pending && message.request_id === pending.request_id) {
@@ -342,6 +528,31 @@ function onSocketMessage(raw) {
     }
     return;
   }
+  if (message.event === "stream_started") {
+    if (message.request_id && message.request_id !== state.streamStartRequestId) return;
+    state.streamId = message.stream_id ?? null;
+    state.qwenChunkMs = Number.isFinite(message.model_decode_chunk_ms) ? message.model_decode_chunk_ms : state.qwenChunkMs;
+    state.qwenLanguage = message.language ?? state.qwenLanguage;
+    state.streamStartResolver?.resolve(message);
+    state.streamStartResolver = null;
+    $("qwen-stream-meta").textContent = "stream=" + String(state.streamId ?? "").slice(0, 8)
+      + " · language=" + state.qwenLanguage + " · push=100 ms · decode=" + state.qwenChunkMs + " ms";
+    return;
+  }
+  if (message.event === "partial_transcript") {
+    onPartialTranscript(message);
+    return;
+  }
+  if (message.event === "partial_candidate") {
+    if (message.truth_status !== "candidate_only" || message.final !== false) return;
+    onPartialTranscript(message);
+    return;
+  }
+  if (message.event === "final_candidate") {
+    if (message.truth_status !== "candidate_only" || message.candidate_only !== true || message.final !== true) return;
+    onTranscript(message, true);
+    return;
+  }
   if (message.event === "transcript" || message.type === "transcript") {
     onTranscript(message);
     return;
@@ -349,6 +560,10 @@ function onSocketMessage(raw) {
   if (message.event === "error") {
     const code = /^[a-z0-9_]{1,64}$/i.test(message.code ?? "") ? message.code : "asr_error";
     state.errors.push(code);
+    if (state.streamStartResolver) {
+      state.streamStartResolver.reject(new Error(code));
+      state.streamStartResolver = null;
+    }
     showNotice(`Error ASR: ${code}`, "error");
     updateSummary();
     return;
@@ -437,9 +652,59 @@ function openSocket(token) {
   });
 }
 
+function waitForQwenStreamStart(requestId) {
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      if (state.streamStartResolver?.requestId !== requestId) return;
+      state.streamStartResolver = null;
+      reject(new Error("stream_start_timeout"));
+    }, 15_000);
+    state.streamStartResolver = {
+      requestId,
+      resolve: (message) => { clearTimeout(timeoutId); resolve(message); },
+      reject: (error) => { clearTimeout(timeoutId); reject(error); },
+    };
+  });
+}
+
+async function startQwenStream() {
+  state.qwenChunkMs = Number($("qwen-chunk-size").value);
+  state.qwenLanguage = $("qwen-language").value;
+  state.qwenContext = $("qwen-context").value.trim();
+  const requestId = crypto.randomUUID();
+  state.streamStartRequestId = requestId;
+  const started = waitForQwenStreamStart(requestId);
+  state.ws.send(JSON.stringify({
+    event: "stream_start",
+    source: "mic",
+    request_id: requestId,
+    language: state.qwenLanguage,
+    context: state.qwenContext,
+    chunk_size_ms: state.qwenChunkMs,
+  }));
+  await started;
+}
+
 function receivePcmChunk(buffer, sampleCount) {
   if ((!state.isRecording && !state.isStopping) || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
   state.capturedSamples += sampleCount;
+  if (state.backend === "qwen3_asr") {
+    state.chunkSequence += 1;
+    if (state.ws.bufferedAmount > 512_000) {
+      state.errors.push("websocket_backpressure");
+      updateSummary();
+      showNotice("La red no alcanza la cadencia de captura; deteniendo para no descartar audio silenciosamente.", "error");
+      void stopRun();
+      return;
+    }
+    const bytes = new Uint8Array(buffer);
+    state.sentBytes += bytes.byteLength;
+    state.ws.send(JSON.stringify({
+      type: "audio", source: "mic", speaker: "you", encoding: "pcm_int16",
+      sample_rate: 16_000, audio: bytesToBase64(buffer),
+    }));
+    return;
+  }
   const now = performance.now();
   const shadow = state.vad.push(buffer, now);
   let requestId = null;
@@ -514,20 +779,22 @@ async function setupMicrophone() {
   state.sourceNode.connect(state.workletNode);
   state.workletNode.connect(state.zeroGain);
   state.zeroGain.connect(state.context.destination);
+  await state.context.resume();
+}
+
+function activateCapture() {
   state.startedAt = performance.now();
   state.isRecording = true;
-  await state.context.resume();
 }
 
 async function startRun() {
   const input = $("api-token");
-  const token = input.value;
+  const token = input.value || state.token;
   if (!token) { showNotice("Escribe el ASR API token para iniciar.", "error"); input.focus(); return; }
   if (!window.isSecureContext) { showNotice("El micrófono requiere HTTPS (o localhost).", "error"); return; }
   resetRun();
   state.token = token;
   state.reference = $("reference-text").value;
-  input.value = "";
   state.runTimestamp = new Date().toISOString();
   state.runPrefix = crypto.randomUUID().replaceAll("-", "");
   state.isStopping = false;
@@ -546,12 +813,19 @@ async function startRun() {
     state.token = token;
     await setupMicrophone();
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) throw new Error("websocket_closed");
+    if (state.backend === "qwen3_asr") await startQwenStream();
+    activateCapture();
     $("stop-button").disabled = false;
     $("disconnect-button").disabled = false;
     startRttSampler();
     state.timer = setInterval(() => { updateTimer(); void pollTelemetry(); }, 1000);
     document.addEventListener("visibilitychange", onVisibilityChange);
-    showNotice("Grabando. Habla con naturalidad; se mostrarán segmentos finales.", "ok");
+    showNotice(
+      state.backend === "qwen3_asr"
+        ? "Grabando. Los parciales son candidatos reemplazables; el transcript final llega al detener."
+        : "Grabando. Habla con naturalidad; se mostrarán segmentos finales.",
+      "ok",
+    );
     status($("model-status"), "Modelo", first.ready ? "listo" : "no listo", first.ready ? "ready" : "unknown");
   } catch (error) {
     const reason = error?.message === "model_not_ready" ? "El modelo todavía no está listo." :
@@ -601,18 +875,20 @@ async function stopRun() {
   if (!state.ws || state.isStopping || state.finalised) return;
   state.isStopping = true;
   stopRttSampler();
-  state.isRecording = false;
   $("stop-button").disabled = true;
   showNotice("Cerrando el último bloque y esperando flush_complete…");
   try {
     await waitForWorkletFlush();
+    state.isRecording = false;
     const barrier = waitForFlushBarrier();
     const requestId = crypto.randomUUID();
     state.flushId = requestId;
+    if (state.backend === "qwen3_asr") state.clientEosAt = performance.now();
     state.ws.send(JSON.stringify({ event: "flush", source: "mic", request_id: requestId }));
     await barrier;
     showNotice("Sesión terminada. El audio no se conserva.", "ok");
   } catch {
+    state.isRecording = false;
     state.errors.push("flush_or_connection_error");
     showNotice("No se confirmó el flush del servidor; se libera el micrófono y los resultados quedan parciales.", "error");
   }
@@ -637,10 +913,12 @@ async function cleanup(complete) {
   state.context = null;
   if (state.ws && state.ws.readyState < WebSocket.CLOSING) state.ws.close(1000);
   state.ws = null;
-  state.token = null;
   state.requestTimes.clear();
   state.activeSegmentRequestId = null;
-  $("api-token").value = "";
+  if (state.streamStartResolver) {
+    state.streamStartResolver.reject(new Error("stream_closed"));
+    state.streamStartResolver = null;
+  }
   $("stop-button").disabled = true;
   $("disconnect-button").disabled = true;
   $("start-button").disabled = false;
@@ -675,8 +953,19 @@ function resetRun() {
   state.modelId = null;
   state.modelRevision = null;
   state.workers = null;
+  state.streamId = null;
+  state.streamStartRequestId = null;
+  state.streamEvents = [];
+  state.lastPartialRevision = 0;
+  state.lastPartialAt = null;
+  state.clientEosAt = null;
+  state.clientFinalizationMs = null;
+  state.qwenChunkMs = null;
+  state.qwenLanguage = $("qwen-language").value;
+  state.qwenContext = "";
   state.finalised = false;
   $("transcript").textContent = "La transcripción aparecerá cuando el servidor cierre un segmento.";
+  renderQwenPartials();
   $("export-json").disabled = true;
   $("export-csv").disabled = true;
   renderSegments();
@@ -685,21 +974,42 @@ function resetRun() {
 }
 
 function safeResult() {
-  const segments = sortedSegments().map((row) => ({
+  const orderedRows = sortedSegments();
+  const isQwen = state.backend === "qwen3_asr";
+  const reference = state.reference.trim();
+  const candidateText = transcriptText();
+  const candidateWer = isQwen && reference ? wordErrorRate(reference, candidateText) : null;
+  const productionWer = !isQwen && reference ? wordErrorRate(reference, candidateText) : null;
+  const finalCandidateSource = [...orderedRows].reverse().find((row) => row.candidate_only) ?? null;
+  const segments = orderedRows.map((row) => ({
+    event: row.event, candidate_only: row.candidate_only, truth_status: row.truth_status, provisional: row.provisional,
     text: row.text, start: row.start, end: row.end, speaker: row.speaker, backend: row.backend,
+    stream_id: row.stream_id, revision: row.revision, audio_cursor_ms: row.audio_cursor_ms,
+    FINAL_CANDIDATE_WER: row === finalCandidateSource ? candidateWer : null,
     AUDIO_DURATION_MS: row.audio_duration_ms,
     SERVER_ENDPOINTING_MS: row.SERVER_ENDPOINTING_MS,
     SERVER_QUEUE_WAIT_MS: row.SERVER_QUEUE_WAIT_MS,
     SERVER_MODEL_INFERENCE_MS: row.SERVER_MODEL_INFERENCE_MS,
     SERVER_POSTPROCESS_MS: row.SERVER_POSTPROCESS_MS,
     SERVER_EOS_TO_TRANSCRIPT_MS: row.SERVER_EOS_TO_TRANSCRIPT_MS,
+    SERVER_EOS_TO_FINAL_CANDIDATE_MS: row.SERVER_EOS_TO_FINAL_CANDIDATE_MS,
     CLIENT_EOS_TO_TRANSCRIPT_MS: row.CLIENT_EOS_TO_TRANSCRIPT_MS,
+    CLIENT_EOS_TO_FINAL_CANDIDATE_MS: row.CLIENT_EOS_TO_FINAL_CANDIDATE_MS,
     MODEL_INFERENCE_MS: row.MODEL_INFERENCE_MS,
     SEGMENT_WAIT_MS: row.SEGMENT_WAIT_MS,
     SERVER_TO_TRANSCRIPT_MS: row.SERVER_TO_TRANSCRIPT_MS,
     SERVER_RECEIVE_TO_TRANSCRIPT_MS: row.SERVER_RECEIVE_TO_TRANSCRIPT_MS,
     SERVER_AUDIO_END_TO_TRANSCRIPT_MS: row.SERVER_AUDIO_END_TO_TRANSCRIPT_MS,
     CLIENT_AUDIO_END_TO_TRANSCRIPT_MS: row.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS,
+    FINALIZATION_AFTER_SERVER_EOS_MS: row.FINALIZATION_AFTER_SERVER_EOS_MS,
+    QWEN_CUMULATIVE_DECODE_WALL_MS: row.QWEN_CUMULATIVE_DECODE_WALL_MS,
+    QWEN_STREAM_RTF: row.QWEN_STREAM_RTF,
+    PARTIAL_COUNT: row.PARTIAL_COUNT,
+    FIRST_PARTIAL_MS: row.FIRST_PARTIAL_MS,
+    PARTIAL_REVISION_RATE: row.PARTIAL_REVISION_RATE,
+    PARTIAL_STABILITY: row.PARTIAL_STABILITY,
+    MODEL_DECODE_CHUNK_MS: row.MODEL_DECODE_CHUNK_MS,
+    AUDIO_PUSH_INTERVAL_MS: row.AUDIO_PUSH_INTERVAL_MS,
     queue_wait_ms: row.queue_wait_ms, audio_duration_ms: row.audio_duration_ms,
   }));
   const inference = segments.map((row) => row.MODEL_INFERENCE_MS).filter(Number.isFinite);
@@ -708,6 +1018,7 @@ function safeResult() {
   const postprocess = segments.map((row) => row.SERVER_POSTPROCESS_MS).filter(Number.isFinite);
   const serverEos = segments.map((row) => row.SERVER_AUDIO_END_TO_TRANSCRIPT_MS).filter(Number.isFinite);
   const clientEos = segments.map((row) => row.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS).filter(Number.isFinite);
+  const finalCandidate = [...segments].reverse().find((row) => row.candidate_only) ?? null;
   const rtt = rttPercentiles(state.rttSamples);
   const audioMs = segments.map((row) => row.audio_duration_ms).filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
   const inferenceMs = inference.reduce((sum, value) => sum + value, 0);
@@ -716,8 +1027,10 @@ function safeResult() {
     timestamp: state.runTimestamp,
     finished_at: new Date().toISOString(),
     backend: state.backend,
+    production_backend: state.health?.production_backend ?? null,
     model_id: state.modelId,
     model_revision: state.modelRevision,
+    runtime_provenance: state.runtimeProvenance,
     gpu: lastTelemetry?.gpu_device ?? null,
     GPU_COMPUTE_AVAILABLE: lastTelemetry?.gpu_compute_available === true,
     GPU_TELEMETRY_AVAILABLE: lastTelemetry?.gpu_telemetry_available === true,
@@ -744,16 +1057,44 @@ function safeResult() {
       sent_audio_bytes: state.sentBytes,
       microphone_track_settings: state.micSettings,
     },
-    transcript_mode: "FINAL_SEGMENT",
+    transcript_mode: state.backend === "qwen3_asr" ? "STREAMING_PARTIALS" : "FINAL_SEGMENT",
+    streaming: state.backend === "qwen3_asr" ? {
+      streaming_class: "accumulated-audio-pseudostreaming",
+      audio_push_interval_ms: 100,
+      model_decode_chunk_ms: state.qwenChunkMs,
+      language: state.qwenLanguage,
+      context_supplied: Boolean(state.qwenContext),
+      partials: [...state.streamEvents],
+      metrics: {
+        partial_count: state.streamEvents.length,
+        client_first_partial_ms: state.streamEvents[0]?.CLIENT_FIRST_PARTIAL_MS ?? null,
+        server_first_partial_ms: state.streamEvents[0]?.FIRST_PARTIAL_MS ?? null,
+        client_partial_interval_ms_median: median(state.streamEvents.map((item) => item.CLIENT_PARTIAL_UPDATE_INTERVAL_MS)),
+        latest_partial_stability: state.streamEvents.at(-1)?.PARTIAL_STABILITY ?? null,
+        latest_partial_revision_rate: state.streamEvents.at(-1)?.PARTIAL_REVISION_RATE ?? null,
+        finalization_after_server_eos_ms: segments.at(-1)?.FINALIZATION_AFTER_SERVER_EOS_MS ?? null,
+        finalization_after_client_eos_ms: segments.at(-1)?.CLIENT_EOS_TO_FINAL_CANDIDATE_MS
+          ?? segments.at(-1)?.CLIENT_EOS_TO_TRANSCRIPT_MS ?? null,
+        cumulative_decode_call_wall_ms: segments.at(-1)?.QWEN_CUMULATIVE_DECODE_WALL_MS ?? null,
+        decode_wall_rtf: segments.at(-1)?.QWEN_STREAM_RTF ?? null,
+      },
+      definitions: {
+        PARTIAL_STABILITY: "Identical exact-prefix tokens in prior full text / prior token count; appended suffix tokens do not change this ratio.",
+        PARTIAL_REVISION_RATE: "1 - PARTIAL_STABILITY; measures changed or removed prior tokens, excluding appended tokens.",
+        QWEN_CUMULATIVE_DECODE_WALL_MS: "Sum of Qwen wrapper decode-call wall durations; not GPU kernel time.",
+        QWEN_STREAM_RTF: "Cumulative decode-call wall duration / audio duration; not GPU utilization or end-to-end RTF.",
+      },
+    } : null,
     reference_text: state.reference || null,
-    transcript: transcriptText(),
+    transcript: isQwen ? null : transcriptText(),
+    final_candidate: isQwen ? transcriptText() : null,
     segments,
     summary: {
       segment_count: segments.length,
       error_count: state.errors.length,
       errors: [...state.errors],
       transcribed_audio_ms: audioMs,
-      MODEL_INFERENCE_RTF: audioMs > 0 ? inferenceMs / audioMs : null,
+      MODEL_INFERENCE_RTF: state.backend === "qwen3_asr" || audioMs <= 0 ? null : inferenceMs / audioMs,
       SERVER_MODEL_INFERENCE_MS_P50: median(inference),
       SERVER_MODEL_INFERENCE_MS_P95: percentile(inference, 0.95),
       SERVER_ENDPOINTING_MS_P50: median(endpoint),
@@ -774,7 +1115,22 @@ function safeResult() {
       SERVER_AUDIO_END_TO_TRANSCRIPT_MS_P95: percentile(serverEos, 0.95),
       CLIENT_AUDIO_END_TO_TRANSCRIPT_MS_P50: median(clientEos),
       CLIENT_AUDIO_END_TO_TRANSCRIPT_MS_P95: percentile(clientEos, 0.95),
-      WER: state.reference.trim() ? wordErrorRate(state.reference, transcriptText()) : null,
+      WER: productionWer,
+      FINAL_WER: productionWer,
+      FINAL_CANDIDATE_WER: candidateWer,
+      SERVER_EOS_TO_FINAL_CANDIDATE_MS: isQwen ? finalCandidate?.SERVER_EOS_TO_FINAL_CANDIDATE_MS ?? null : null,
+      CLIENT_EOS_TO_FINAL_CANDIDATE_MS: isQwen ? finalCandidate?.CLIENT_EOS_TO_FINAL_CANDIDATE_MS ?? null : null,
+      FIRST_PARTIAL_MS: state.streamEvents[0]?.FIRST_PARTIAL_MS ?? null,
+      CLIENT_FIRST_PARTIAL_MS: state.streamEvents[0]?.CLIENT_FIRST_PARTIAL_MS ?? null,
+      PARTIAL_COUNT: state.streamEvents.length,
+      PARTIAL_UPDATE_INTERVAL_MS_P50: median(state.streamEvents.map((item) => item.CLIENT_PARTIAL_UPDATE_INTERVAL_MS)),
+      PARTIAL_STABILITY: state.streamEvents.at(-1)?.PARTIAL_STABILITY ?? null,
+      PARTIAL_REVISION_RATE: state.streamEvents.at(-1)?.PARTIAL_REVISION_RATE ?? null,
+      FINALIZATION_AFTER_SERVER_EOS_MS: segments.at(-1)?.FINALIZATION_AFTER_SERVER_EOS_MS ?? null,
+      FINALIZATION_AFTER_CLIENT_EOS_MS: segments.at(-1)?.CLIENT_EOS_TO_FINAL_CANDIDATE_MS
+        ?? segments.at(-1)?.CLIENT_EOS_TO_TRANSCRIPT_MS ?? null,
+      QWEN_CUMULATIVE_DECODE_WALL_MS: segments.at(-1)?.QWEN_CUMULATIVE_DECODE_WALL_MS ?? null,
+      QWEN_STREAM_RTF: segments.at(-1)?.QWEN_STREAM_RTF ?? null,
     },
     telemetry: [...state.telemetry],
     proxy_ws_rtt_samples: state.rttSamples.map((sample) => ({
@@ -782,9 +1138,16 @@ function safeResult() {
       PROXY_WS_RTT_MS: sample.PROXY_WS_RTT_MS,
       status: sample.status,
     })),
-    metric_definitions: METRIC_DEFINITIONS,
+    metric_definitions: {
+      ...METRIC_DEFINITIONS,
+      SERVER_EOS_TO_FINAL_CANDIDATE_MS: "Qwen server perf_counter from receipt of client EOS to final candidate ready; experimental and not a confirmed transcript.",
+      CLIENT_EOS_TO_FINAL_CANDIDATE_MS: "Browser performance.now from shadow-VAD/client EOS to final candidate WebSocket receipt; candidate-only and includes proxy/network/browser scheduling.",
+    },
     measurement_provenance: {
       MODEL_INFERENCE_SCOPE: "adapter_wall_clock_not_gpu_kernel_time",
+      QWEN_DECODE_WALL_SCOPE: "Qwen wrapper decode-call wall time; serialized server processing, not GPU kernel time.",
+      QWEN_SERVER_CHUNK_TO_PARTIAL_SCOPE: "ASR process perf_counter from RPC push dispatch through full replacement partial availability.",
+      SEMANTIC_LEAD_TIME_MS: "Not computed here; requires correlating a useful JEV hypothesis with client/server EOS.",
       GPU_TELEMETRY_SCOPE: "optional_nvml_or_torch_device_global_not_backend_attributed",
       SERVER_CLOCK: "time.perf_counter within ASR server process",
       CLIENT_CLOCK: "performance.now within browser only",
@@ -811,18 +1174,28 @@ function exportJson() {
 
 function exportCsv() {
   const result = safeResult();
-  const columns = ["record_type", "timestamp", "backend", "model_id", "gpu", "workers",
+  const columns = ["record_type", "event", "candidate_only", "provisional", "truth_status", "timestamp", "backend", "model_id", "gpu", "workers",
     "PROXY_WS_RTT_MS_P50", "PROXY_WS_RTT_MS_P95", "elapsed_ms", "start", "end", "text",
     "AUDIO_DURATION_MS", "SERVER_ENDPOINTING_MS", "SERVER_QUEUE_WAIT_MS", "SERVER_MODEL_INFERENCE_MS",
     "SERVER_POSTPROCESS_MS", "SERVER_EOS_TO_TRANSCRIPT_MS", "CLIENT_EOS_TO_TRANSCRIPT_MS",
+    "SERVER_EOS_TO_FINAL_CANDIDATE_MS", "CLIENT_EOS_TO_FINAL_CANDIDATE_MS", "FINAL_CANDIDATE_WER",
     "PROXY_WS_RTT_MS", "MODEL_INFERENCE_MS", "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS",
     "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS",
-    "CLIENT_AUDIO_END_TO_TRANSCRIPT_MS", "queue_wait_ms", "audio_duration_ms"];
+    "CLIENT_AUDIO_END_TO_TRANSCRIPT_MS", "queue_wait_ms", "audio_duration_ms",
+    "stream_id", "revision", "audio_cursor_ms", "CLIENT_ELAPSED_MS",
+    "CLIENT_FIRST_PARTIAL_MS", "CLIENT_PARTIAL_UPDATE_INTERVAL_MS", "FIRST_PARTIAL_MS",
+    "SERVER_CHUNK_TO_PARTIAL_MS", "PARTIAL_COUNT", "PARTIAL_REVISION_RATE", "PARTIAL_STABILITY",
+    "FINALIZATION_AFTER_SERVER_EOS_MS", "QWEN_DECODE_CALL_WALL_MS",
+    "QWEN_CUMULATIVE_DECODE_WALL_MS", "QWEN_STREAM_RTF",
+    "MODEL_DECODE_CHUNK_MS", "AUDIO_PUSH_INTERVAL_MS",
+    "qwen_asr_version", "vllm_version", "transformers_version", "torch_version", "torch_cuda_version"];
   const toCsvRow = (row) => columns.map((column) => csvCell(row[column] ?? "")).join(",");
   const lines = [toCsvRow(Object.fromEntries(columns.map((column) => [column, column])))];
   for (const row of result.segments) {
     lines.push(toCsvRow({
-      record_type: "segment", timestamp: result.timestamp, backend: result.backend,
+      record_type: row.candidate_only ? "final_candidate" : "segment",
+      event: row.event, candidate_only: row.candidate_only, provisional: row.provisional,
+      truth_status: row.truth_status, timestamp: result.timestamp, backend: result.backend,
       model_id: result.model_id, gpu: result.gpu, workers: result.workers,
       PROXY_WS_RTT_MS_P50: result.summary.PROXY_WS_RTT_MS_P50,
       PROXY_WS_RTT_MS_P95: result.summary.PROXY_WS_RTT_MS_P95,
@@ -834,13 +1207,54 @@ function exportCsv() {
       SERVER_POSTPROCESS_MS: row.SERVER_POSTPROCESS_MS,
       SERVER_EOS_TO_TRANSCRIPT_MS: row.SERVER_EOS_TO_TRANSCRIPT_MS,
       CLIENT_EOS_TO_TRANSCRIPT_MS: row.CLIENT_EOS_TO_TRANSCRIPT_MS,
+      SERVER_EOS_TO_FINAL_CANDIDATE_MS: row.SERVER_EOS_TO_FINAL_CANDIDATE_MS,
+      CLIENT_EOS_TO_FINAL_CANDIDATE_MS: row.CLIENT_EOS_TO_FINAL_CANDIDATE_MS,
+      FINAL_CANDIDATE_WER: row.FINAL_CANDIDATE_WER,
       MODEL_INFERENCE_MS: row.MODEL_INFERENCE_MS,
       SEGMENT_WAIT_MS: row.SEGMENT_WAIT_MS,
       SERVER_TO_TRANSCRIPT_MS: row.SERVER_TO_TRANSCRIPT_MS,
       SERVER_RECEIVE_TO_TRANSCRIPT_MS: row.SERVER_RECEIVE_TO_TRANSCRIPT_MS,
       SERVER_AUDIO_END_TO_TRANSCRIPT_MS: row.SERVER_AUDIO_END_TO_TRANSCRIPT_MS,
       CLIENT_AUDIO_END_TO_TRANSCRIPT_MS: row.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS,
+      stream_id: row.stream_id, revision: row.revision,
+      FINALIZATION_AFTER_SERVER_EOS_MS: row.FINALIZATION_AFTER_SERVER_EOS_MS,
+      QWEN_CUMULATIVE_DECODE_WALL_MS: row.QWEN_CUMULATIVE_DECODE_WALL_MS,
+      QWEN_STREAM_RTF: row.QWEN_STREAM_RTF, PARTIAL_COUNT: row.PARTIAL_COUNT,
+      FIRST_PARTIAL_MS: row.FIRST_PARTIAL_MS, PARTIAL_STABILITY: row.PARTIAL_STABILITY,
+      PARTIAL_REVISION_RATE: row.PARTIAL_REVISION_RATE,
+      MODEL_DECODE_CHUNK_MS: row.MODEL_DECODE_CHUNK_MS,
+      AUDIO_PUSH_INTERVAL_MS: row.AUDIO_PUSH_INTERVAL_MS,
+      qwen_asr_version: result.runtime_provenance?.qwen_asr_version,
+      vllm_version: result.runtime_provenance?.vllm_version,
+      transformers_version: result.runtime_provenance?.transformers_version,
+      torch_version: result.runtime_provenance?.torch_version,
+      torch_cuda_version: result.runtime_provenance?.torch_cuda_version,
       queue_wait_ms: row.queue_wait_ms, audio_duration_ms: row.audio_duration_ms,
+    }));
+  }
+  for (const partial of result.streaming?.partials ?? []) {
+    lines.push(toCsvRow({
+      record_type: partial.event ?? "partial_candidate", timestamp: result.timestamp, backend: result.backend,
+      model_id: result.model_id, gpu: result.gpu, workers: result.workers,
+      stream_id: partial.stream_id, revision: partial.revision, text: partial.text,
+      audio_cursor_ms: partial.audio_cursor_ms, CLIENT_ELAPSED_MS: partial.CLIENT_ELAPSED_MS,
+      CLIENT_FIRST_PARTIAL_MS: partial.CLIENT_FIRST_PARTIAL_MS,
+      CLIENT_PARTIAL_UPDATE_INTERVAL_MS: partial.CLIENT_PARTIAL_UPDATE_INTERVAL_MS,
+      FIRST_PARTIAL_MS: partial.FIRST_PARTIAL_MS,
+      SERVER_CHUNK_TO_PARTIAL_MS: partial.SERVER_CHUNK_TO_PARTIAL_MS,
+      PARTIAL_COUNT: partial.PARTIAL_COUNT,
+      PARTIAL_REVISION_RATE: partial.PARTIAL_REVISION_RATE,
+      PARTIAL_STABILITY: partial.PARTIAL_STABILITY,
+      QWEN_DECODE_CALL_WALL_MS: partial.QWEN_DECODE_CALL_WALL_MS,
+      QWEN_CUMULATIVE_DECODE_WALL_MS: partial.QWEN_CUMULATIVE_DECODE_WALL_MS,
+      QWEN_STREAM_RTF: partial.QWEN_STREAM_RTF,
+      MODEL_DECODE_CHUNK_MS: partial.MODEL_DECODE_CHUNK_MS,
+      AUDIO_PUSH_INTERVAL_MS: partial.AUDIO_PUSH_INTERVAL_MS,
+      qwen_asr_version: result.runtime_provenance?.qwen_asr_version,
+      vllm_version: result.runtime_provenance?.vllm_version,
+      transformers_version: result.runtime_provenance?.transformers_version,
+      torch_version: result.runtime_provenance?.torch_version,
+      torch_cuda_version: result.runtime_provenance?.torch_cuda_version,
     }));
   }
   for (const sample of result.proxy_ws_rtt_samples) {

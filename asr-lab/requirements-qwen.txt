@@ -1,0 +1,5 @@
+# Isolated from /opt/asr-venv: vLLM 0.14.0 pins a different Torch/CUDA stack.
+# vLLM publishes its current prebuilt NVIDIA wheels for CUDA 12.9.
+qwen-asr[vllm]==0.0.6
+vllm==0.14.0
+torch==2.9.1

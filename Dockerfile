@@ -4,13 +4,18 @@
 # GitHub Actions selects linux/amd64 through Buildx; keep FROM platform selection implicit.
 FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04@sha256:61a4aafb0094cd773f11eefa378929d5a687bd775febeb78eac62fc824141fb5
 
+# Qwen/vLLM remains opt-in so the established Parakeet/Faster-Whisper image
+# neither installs nor verifies the experimental CUDA 12.9 stack by default.
+ARG INSTALL_QWEN_RUNTIME=0
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     JUPYTER_CONFIG_DIR=/tmp/jupyter-config \
     JUPYTER_RUNTIME_DIR=/tmp/jupyter-runtime \
     PYTHONPATH=/opt/asr-lab \
-    HF_HOME=/workspace/.cache/huggingface
+    HF_HOME=/workspace/.cache/huggingface \
+    QWEN_STREAMING_RUNTIME_AVAILABLE=${INSTALL_QWEN_RUNTIME}
 
 WORKDIR /workspace
 
@@ -29,6 +34,18 @@ RUN python -m venv --system-site-packages /opt/asr-venv \
       --constraint /tmp/asr-constraints.txt \
       --requirement /tmp/asr-requirements.txt
 
+# Optional Qwen experiment. Its isolated interpreter avoids replacing the
+# NeMo/Faster-Whisper Torch 2.4 runtime; default Salad image builds skip it.
+COPY asr-lab/requirements-qwen.txt /tmp/qwen-requirements.txt
+RUN if [ "$INSTALL_QWEN_RUNTIME" = "1" ]; then \
+      python -m venv /opt/qwen-asr-venv \
+      && /opt/qwen-asr-venv/bin/python -m pip install --no-cache-dir --disable-pip-version-check \
+        --extra-index-url https://download.pytorch.org/whl/cu129 \
+        --requirement /tmp/qwen-requirements.txt; \
+    elif [ "$INSTALL_QWEN_RUNTIME" != "0" ]; then \
+      echo "INSTALL_QWEN_RUNTIME must be 0 or 1" >&2; exit 1; \
+    fi
+
 COPY asr-lab /opt/asr-lab
 COPY nginx-main.conf /etc/nginx/nginx.conf
 COPY nginx-salad.conf /etc/nginx/conf.d/default.conf
@@ -45,6 +62,12 @@ RUN chmod 0755 \
     && python /usr/local/bin/salad-nginx-diagnostics.py contract \
     && /usr/local/bin/salad-jupyter-verify-runtime \
     && nvcc --version | grep -Eq 'release 12\.4([,.]|$)'
+
+# Qwen's stronger package/model-factory verifier is only part of an explicitly
+# requested experimental image build; the default runtime contract is unchanged.
+RUN if [ "$INSTALL_QWEN_RUNTIME" = "1" ]; then \
+      PYTHONPATH=/opt/asr-lab /opt/qwen-asr-venv/bin/python -m asr_lab.verify_qwen_runtime; \
+    fi
 
 # Fail the image build if the benchmark UI/worklet/tests are omitted from the
 # image. Unit tests use the CI-safe fakes and never download or load model weights.

@@ -24,6 +24,7 @@ import {
 } from "../asr_lab/benchmark_web/core.mjs";
 
 const appSource = readFileSync(new URL("../asr_lab/benchmark_web/app.mjs", import.meta.url), "utf8");
+const htmlSource = readFileSync(new URL("../asr_lab/benchmark_web/index.html", import.meta.url), "utf8");
 
 function sine(rate, frequency, sampleCount, start = 0) {
   return Float32Array.from(
@@ -157,4 +158,61 @@ test("application RTT ping uses the authenticated ASR websocket and performance.
   assert.match(appSource, /const receivedAt = performance\.now\(\)/);
   assert.match(appSource, /setInterval\(sendRttPing, 5000\)/);
   assert.doesNotMatch(appSource, /localStorage|sessionStorage|document\.cookie/);
+});
+
+test("Qwen live UI exposes replaceable partial revisions, chunk experiments and separate final", () => {
+  assert.match(htmlSource, /id="transcript-mode"/);
+  assert.match(htmlSource, /id="qwen-chunk-size"/);
+  assert.match(htmlSource, /Audio hablado · duración, no latencia/);
+  assert.match(htmlSource, /Server EOS → transcript/);
+  assert.match(htmlSource, /Client EOS → transcript/);
+  assert.match(htmlSource, /Server EOS → final candidate/);
+  assert.match(htmlSource, /Client EOS → final candidate/);
+  assert.match(htmlSource, /WebSocket proxy RTT p50 \/ p95/);
+  assert.match(htmlSource, /Final candidate WER/);
+  for (const chunk of ["250", "500", "1000", "2000"]) assert.match(htmlSource, new RegExp(chunk + " ms"));
+  assert.match(htmlSource, /PARTIAL ≠ TRUTH/);
+  assert.match(appSource, /event: "stream_start"/);
+  assert.match(appSource, /message\.event === "partial_candidate"/);
+  assert.match(appSource, /message\.replace !== true/);
+  assert.match(appSource, /message\.revision <= state\.lastPartialRevision/);
+  assert.match(appSource, /CLIENT_FIRST_PARTIAL_MS/);
+  assert.match(appSource, /CLIENT_PARTIAL_UPDATE_INTERVAL_MS/);
+  assert.match(appSource, /qwen-proxy-rtt/);
+  assert.match(appSource, /qwen-final-wer/);
+  assert.match(appSource, /const wer = state\.backend === "qwen3_asr" \|\| !state\.reference\.trim\(\)\s+\? null : wordErrorRate\(state\.reference, transcriptText\(\)\)/);
+  assert.match(appSource, /const productionWer = !isQwen && reference \? wordErrorRate\(reference, candidateText\) : null/);
+  assert.match(appSource, /const candidateWer = isQwen && reference \? wordErrorRate\(reference, candidateText\) : null/);
+  assert.match(appSource, /WER: productionWer/);
+  assert.match(appSource, /FINAL_WER: productionWer/);
+  assert.match(appSource, /FINAL_CANDIDATE_WER: candidateWer/);
+  assert.match(appSource, /FINAL_CANDIDATE_WER: row === finalCandidateSource \? candidateWer : null/);
+  assert.match(appSource, /const finalCandidateSource = \[\.\.\.orderedRows\]\.reverse\(\)\.find\(\(row\) => row\.candidate_only\) \?\? null/);
+  assert.match(appSource, /const serverEosMs = !candidateOnly/);
+  assert.match(appSource, /CLIENT_EOS_TO_TRANSCRIPT_MS: candidateOnly \? null : clientEosMs/);
+  assert.match(appSource, /SERVER_EOS_TO_FINAL_CANDIDATE_MS: candidateOnly && Number\.isFinite/);
+  assert.match(appSource, /CLIENT_EOS_TO_FINAL_CANDIDATE_MS: candidateOnly \? clientEosMs : null/);
+  assert.match(appSource, /"SERVER_EOS_TO_FINAL_CANDIDATE_MS", "CLIENT_EOS_TO_FINAL_CANDIDATE_MS", "FINAL_CANDIDATE_WER"/);
+  assert.match(appSource, /SERVER_EOS_TO_FINAL_CANDIDATE_MS: row\.SERVER_EOS_TO_FINAL_CANDIDATE_MS/);
+  assert.match(appSource, /CLIENT_EOS_TO_FINAL_CANDIDATE_MS: row\.CLIENT_EOS_TO_FINAL_CANDIDATE_MS/);
+  assert.match(appSource, /FINAL_CANDIDATE_WER: row\.FINAL_CANDIDATE_WER/);
+  assert.match(appSource, /record_type: partial\.event \?\? "partial_candidate"/);
+  assert.match(appSource, /message\.event === "final_candidate"/);
+  assert.match(appSource, /candidate_only: candidateOnly/);
+  assert.match(appSource, /message\.event === "transcript" \|\| message\.type === "transcript"/);
+  assert.match(appSource, /candidate_only: true/);
+  assert.match(appSource, /transcript: isQwen \? null : transcriptText\(\)/);
+  assert.match(appSource, /final_candidate: isQwen \? transcriptText\(\) : null/);
+  assert.match(appSource, /transcript_mode: state\.backend === "qwen3_asr" \? "STREAMING_PARTIALS" : "FINAL_SEGMENT"/);
+  assert.match(appSource, /state\.clientEosAt = performance\.now\(\)/);
+  assert.doesNotMatch(appSource, /localStorage|sessionStorage/);
+});
+
+test("Stop drains the last worklet PCM chunk before freezing capture and marking EOS", () => {
+  const stopSource = appSource.slice(
+    appSource.indexOf("async function stopRun()"),
+    appSource.indexOf("async function cleanup(complete)"),
+  );
+  assert.ok(stopSource.indexOf("await waitForWorkletFlush()") < stopSource.indexOf("state.isRecording = false"));
+  assert.ok(stopSource.indexOf("state.isRecording = false") < stopSource.indexOf("state.clientEosAt = performance.now()"));
 });

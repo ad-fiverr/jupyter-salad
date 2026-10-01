@@ -168,7 +168,7 @@ class TelemetryTests(unittest.TestCase):
             snapshot = collect_telemetry(broker, settings)
 
         self.assertEqual(set(snapshot), {
-            "schema_version", "timestamp", "backend", "model_id", "model_revision",
+            "schema_version", "timestamp", "backend", "production_backend", "model_id", "model_revision",
             "model_loaded", "ready", "workers", "queue_depth", "process_rss_mib",
             "system_ram", "gpu_compute", "gpu_telemetry", "gpu",
         })

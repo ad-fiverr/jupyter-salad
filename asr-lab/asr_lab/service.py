@@ -16,31 +16,55 @@ from starlette.responses import Response
 
 from .broker import InferenceBroker
 from .buffering import AudioBuffer, INACTIVITY_FLUSH_SECONDS
-from .config import Settings
-from .protocol import AudioChunk, BenchmarkPing, FlushRequest, ProtocolError, parse_message
+from .config import QWEN_LANGUAGE_CODES, Settings
+from .protocol import AudioChunk, BenchmarkPing, FlushRequest, ProtocolError, StreamStart, parse_message
+from .qwen_process import QwenWorkerProcess
+from .qwen_streaming import QwenStreamingRuntime, StreamingError, validate_candidate_event
 from .security import token_matches
 from .telemetry import collect_telemetry, gpu_compute_state
 
 settings = Settings.from_env()
 logger = logging.getLogger("asr_lab.service")
 broker: InferenceBroker | None = None
+qwen_runtime: QwenStreamingRuntime | None = None
 config_valid = settings.error is None
 connection_slots = asyncio.Semaphore(settings.max_connections)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global broker
+    global broker, qwen_runtime
     loader: asyncio.Task[None] | None = None
     if config_valid and not settings.test_no_model and settings.backend and settings.model_id:
-        broker = InferenceBroker(
-            backend_name=settings.backend,
-            model_id=settings.model_id,
-            model_revision=settings.model_revision,
-            workers=settings.workers,
-            queue_size=settings.max_queue_size,
-        )
-        loader = asyncio.create_task(_load_backend(broker), name="asr-model-loader")
+        if settings.qwen_streaming_enabled:
+            worker = QwenWorkerProcess(
+                python=settings.qwen_worker_python,
+                script=Path(__file__).with_name("qwen_worker.py"),
+            )
+            qwen_runtime = QwenStreamingRuntime(
+                worker=worker,
+                model_id=settings.active_model_id or "",
+                model_revision=settings.active_model_revision or "",
+                gpu_memory_utilization=settings.qwen_gpu_memory_utilization,
+                max_active_sessions=settings.qwen_max_active_sessions,
+                max_stream_seconds=settings.qwen_max_stream_seconds,
+                session_idle_ttl_seconds=settings.qwen_session_idle_ttl_seconds,
+                max_context_chars=settings.qwen_max_context_chars,
+                default_chunk_ms=settings.qwen_stream_chunk_ms,
+                default_language=settings.qwen_language,
+                unfixed_chunk_num=settings.qwen_unfixed_chunk_num,
+                unfixed_token_num=settings.qwen_unfixed_token_num,
+            )
+            loader = asyncio.create_task(_load_qwen(qwen_runtime), name="qwen-model-loader")
+        else:
+            broker = InferenceBroker(
+                backend_name=settings.backend,
+                model_id=settings.model_id,
+                model_revision=settings.model_revision,
+                workers=settings.workers,
+                queue_size=settings.max_queue_size,
+            )
+            loader = asyncio.create_task(_load_backend(broker), name="asr-model-loader")
     try:
         yield
     finally:
@@ -50,6 +74,9 @@ async def lifespan(app: FastAPI):
         if broker is not None:
             await broker.close()
             broker = None
+        if qwen_runtime is not None:
+            await qwen_runtime.close()
+            qwen_runtime = None
 
 
 async def _load_backend(target: InferenceBroker) -> None:
@@ -59,6 +86,15 @@ async def _load_backend(target: InferenceBroker) -> None:
         raise
     except Exception as exc:
         logger.error("ASR startup failed exception_type=%s", type(exc).__name__)
+
+
+async def _load_qwen(target: QwenStreamingRuntime) -> None:
+    try:
+        await target.start()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("Qwen streaming startup failed exception_type=%s", type(exc).__name__)
 
 
 app = FastAPI(title="Salad ASR Lab", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -95,7 +131,14 @@ async def telemetry(authorization: str | None = Header(default=None)) -> JSONRes
     scheme, _, bearer = (authorization or "").partition(" ")
     if scheme.casefold() != "bearer" or not settings.api_token or not token_matches(bearer, settings.api_token):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
-    snapshot = await asyncio.to_thread(collect_telemetry, broker, settings)
+    active_runtime = qwen_runtime if settings.qwen_streaming_enabled else broker
+    snapshot = await asyncio.to_thread(collect_telemetry, active_runtime, settings)
+    snapshot["transcript_mode"] = settings.transcript_mode
+    snapshot["active_streams"] = qwen_runtime.active_sessions if qwen_runtime is not None else None
+    snapshot["max_active_streams"] = settings.qwen_max_active_sessions if settings.qwen_streaming_enabled else None
+    if settings.qwen_streaming_enabled:
+        snapshot["workers"] = 1
+        snapshot["runtime_provenance"] = qwen_runtime.runtime_provenance if qwen_runtime is not None else None
     return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
 
 
@@ -105,25 +148,34 @@ def _worker_metrics() -> list[dict[str, Any]]:
 
 @app.get("/asr/health")
 async def health() -> dict[str, Any]:
-    compute = gpu_compute_state(broker, settings)
+    active_runtime = qwen_runtime if settings.qwen_streaming_enabled else broker
+    compute = gpu_compute_state(active_runtime, settings)
+    model_loaded = bool(active_runtime and active_runtime.ready)
     return {
         "status": "ok",
-        "backend": settings.backend,
-        "model_id": settings.model_id,
-        "model_revision": settings.model_revision,
-        "model_loaded": bool(broker and broker.ready),
+        "backend": settings.active_backend,
+        "production_backend": settings.backend,
+        "model_id": settings.active_model_id,
+        "model_revision": settings.active_model_revision,
+        "model_loaded": model_loaded,
+        "transcript_mode": settings.transcript_mode,
+        "streaming_class": "accumulated-audio-pseudostreaming" if settings.qwen_streaming_enabled else None,
         "cuda": compute["cuda"],
         "gpu_compute": compute,
-        "workers": settings.workers,
-        "worker_metrics": _worker_metrics(),
+        "workers": 1 if settings.qwen_streaming_enabled else settings.workers,
+        "worker_metrics": active_runtime.worker_metrics if active_runtime is not None else _worker_metrics(),
+        "active_streams": qwen_runtime.active_sessions if qwen_runtime is not None else None,
+        "max_active_streams": settings.qwen_max_active_sessions if settings.qwen_streaming_enabled else None,
+        "runtime_provenance": qwen_runtime.runtime_provenance if settings.qwen_streaming_enabled and qwen_runtime is not None else None,
     }
 
 
 @app.get("/asr/readiness")
 async def readiness() -> JSONResponse:
-    ready = config_valid and not settings.test_no_model and broker is not None and broker.ready
+    active_runtime = qwen_runtime if settings.qwen_streaming_enabled else broker
+    ready = config_valid and not settings.test_no_model and active_runtime is not None and active_runtime.ready
     return JSONResponse(
-        {"ready": bool(ready), "backend": settings.backend, "model_loaded": bool(broker and broker.ready)},
+        {"ready": bool(ready), "backend": settings.active_backend, "production_backend": settings.backend, "model_loaded": bool(active_runtime and active_runtime.ready)},
         status_code=200 if ready else 503,
     )
 
@@ -136,7 +188,8 @@ async def websocket_asr(websocket: WebSocket, token: str | None = Query(default=
     if not config_valid:
         await websocket.close(code=1013, reason="service_not_configured")
         return
-    if settings.test_no_model or broker is None or not broker.ready:
+    active_runtime = qwen_runtime if settings.qwen_streaming_enabled else broker
+    if settings.test_no_model or active_runtime is None or not active_runtime.ready:
         if settings.test_no_model and settings.api_token:
             await websocket.accept()
             await websocket.send_json({"event": "error", "code": "model_not_ready", "message": "Transcription model is unavailable in CI smoke mode."})
@@ -151,6 +204,14 @@ async def websocket_asr(websocket: WebSocket, token: str | None = Query(default=
         return
 
     connection_id = uuid.uuid4().hex
+    if settings.qwen_streaming_enabled:
+        try:
+            await _websocket_qwen(websocket, connection_id)
+        finally:
+            if qwen_runtime is not None:
+                await qwen_runtime.close_connection(connection_id)
+            connection_slots.release()
+        return
     connection_started = time.perf_counter()
     buffers: dict[str, AudioBuffer] = {}
     inactivity_timers: dict[str, asyncio.Task[None]] = {}
@@ -215,6 +276,7 @@ async def websocket_asr(websocket: WebSocket, token: str | None = Query(default=
                     raw or b"",
                     max_message_bytes=settings.max_message_bytes,
                     max_chunk_seconds=settings.max_chunk_seconds,
+                    max_context_chars=settings.qwen_max_context_chars,
                 )
             except ProtocolError as exc:
                 await send_json({"event": "error", "code": exc.code, "message": exc.message})
@@ -222,6 +284,13 @@ async def websocket_asr(websocket: WebSocket, token: str | None = Query(default=
             now = time.perf_counter()
             if isinstance(message, BenchmarkPing):
                 await send_json({"event": "benchmark_pong", "request_id": message.request_id})
+                continue
+            if isinstance(message, StreamStart):
+                await send_json({
+                    "event": "error",
+                    "code": "streaming_backend_required",
+                    "message": "This ASR backend accepts complete segments only.",
+                })
                 continue
             if isinstance(message, FlushRequest):
                 audio = buffers.pop(message.source, None)
@@ -269,6 +338,125 @@ async def websocket_asr(websocket: WebSocket, token: str | None = Query(default=
             await asyncio.gather(*pending, return_exceptions=True)
         buffers.clear()
         connection_slots.release()
+
+
+async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
+    runtime = qwen_runtime
+    if runtime is None or not runtime.ready:
+        await websocket.close(code=1013, reason="model_not_ready")
+        return
+    send_lock = asyncio.Lock()
+    opened_sources: set[str] = set()
+
+    async def send_json(payload: dict[str, Any]) -> None:
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    async def open_default_session(source: str) -> None:
+        payload = await runtime.open_session(connection_id=connection_id, source=source)
+        opened_sources.add(source)
+        await send_json(payload)
+
+    await websocket.accept()
+    try:
+        while True:
+            frame = await websocket.receive()
+            if frame.get("type") == "websocket.disconnect":
+                return
+            raw: str | bytes | None = frame.get("text")
+            if raw is None:
+                raw = frame.get("bytes", b"")
+            try:
+                message = parse_message(
+                    raw or b"",
+                    max_message_bytes=settings.max_message_bytes,
+                    max_chunk_seconds=settings.max_chunk_seconds,
+                    max_context_chars=settings.qwen_max_context_chars,
+                )
+            except ProtocolError as exc:
+                await send_json({"event": "error", "code": exc.code, "message": exc.message})
+                continue
+
+            if isinstance(message, BenchmarkPing):
+                await send_json({"event": "benchmark_pong", "request_id": message.request_id})
+                continue
+
+            if isinstance(message, StreamStart):
+                if message.language not in QWEN_LANGUAGE_CODES:
+                    await send_json({
+                        "event": "error",
+                        "code": "invalid_language",
+                        "request_id": message.request_id,
+                        "message": "Qwen language must be auto or a supported language code.",
+                    })
+                    continue
+                try:
+                    result = await runtime.open_session(
+                        connection_id=connection_id,
+                        source=message.source,
+                        language=message.language,
+                        context=message.context,
+                        chunk_size_ms=message.chunk_size_ms,
+                        request_id=message.request_id,
+                    )
+                except StreamingError as exc:
+                    await send_json({
+                        "event": "error",
+                        "code": exc.code,
+                        "request_id": message.request_id,
+                        "message": "Streaming session could not be started.",
+                    })
+                    continue
+                opened_sources.add(message.source)
+                await send_json(result)
+                continue
+
+            if isinstance(message, FlushRequest):
+                if message.source not in opened_sources:
+                    await send_json({
+                        "event": "flush_complete",
+                        "request_id": message.request_id,
+                    })
+                    continue
+                try:
+                    result = await runtime.finish(
+                        connection_id=connection_id,
+                        source=message.source,
+                        server_eos_at=time.perf_counter(),
+                        request_id=message.request_id,
+                    )
+                    await send_json(validate_candidate_event(result, "final_candidate"))
+                    opened_sources.discard(message.source)
+                except StreamingError as exc:
+                    await send_json({"event": "error", "code": exc.code, "message": "Streaming finalization failed."})
+                if message.request_id is not None:
+                    await send_json({
+                        "event": "flush_complete",
+                        "request_id": message.request_id,
+                    })
+                continue
+
+            assert isinstance(message, AudioChunk)
+            if message.source not in opened_sources:
+                try:
+                    await open_default_session(message.source)
+                except StreamingError as exc:
+                    await send_json({"event": "error", "code": exc.code, "message": "Streaming session capacity is unavailable."})
+                    continue
+            try:
+                result = await runtime.push_audio(
+                    connection_id=connection_id,
+                    source=message.source,
+                    pcm16le=message.pcm16le,
+                )
+                if result is not None:
+                    await send_json(validate_candidate_event(result, "partial_candidate"))
+            except StreamingError as exc:
+                if exc.code in {"stream_duration_limit", "stream_not_started", "stream_worker_failed"}:
+                    opened_sources.discard(message.source)
+                await send_json({"event": "error", "code": exc.code, "message": "Streaming audio could not be processed."})
+    finally:
+        await runtime.close_connection(connection_id)
 
 
 async def _flush(
