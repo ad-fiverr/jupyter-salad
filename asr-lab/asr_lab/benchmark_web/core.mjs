@@ -5,6 +5,47 @@ export const SILENCE_THRESHOLD = 0.008;
 export const MIN_SPEECH_SAMPLES = 8_000;
 export const MAX_BUFFER_SAMPLES = 48_000;
 export const SILENCE_CHUNKS_TO_FLUSH = 4;
+export const RTT_SAMPLE_LIMIT = 720;
+
+export const METRIC_DEFINITIONS = Object.freeze({
+  AUDIO_DURATION_MS: "Duración del PCM enviado al modelo; no es latencia y puede incluir silencio final.",
+  SERVER_ENDPOINTING_MS: "perf_counter del servidor: último chunk clasificado como voz hasta entrega del job al broker; incluye cierre por VAD y scheduling previo a la cola.",
+  SERVER_QUEUE_WAIT_MS: "perf_counter del servidor: entrega al broker hasta el inicio real de backend.transcribe().",
+  SERVER_MODEL_INFERENCE_MS: "perf_counter del servidor alrededor de backend.transcribe(); wall time del adaptador, no tiempo de kernel GPU.",
+  SERVER_POSTPROCESS_MS: "perf_counter del servidor: retorno del adaptador hasta transcript listo para send_json; no incluye envío por red.",
+  SERVER_EOS_TO_TRANSCRIPT_MS: "perf_counter del servidor: último chunk clasificado como voz hasta transcript listo para send_json; no incluye navegador ni red.",
+  CLIENT_EOS_TO_TRANSCRIPT_MS: "performance.now del navegador: último chunk que el shadow VAD cliente clasifica como voz hasta recepción del transcript; incluye endpointing aproximado, navegador, red y servidor.",
+  PROXY_WS_RTT_MS: "RTT completo de benchmark_ping/pong por el WebSocket autenticado; incluye Gateway/nginx, red y scheduling. No es latencia unidireccional.",
+  SERVER_RECEIVE_TO_TRANSCRIPT_MS: "Diagnóstico heredado desde el inicio del buffer; puede incluir silencio inicial y duración del segmento hablado. No es KPI de latencia ASR.",
+  SEGMENT_WAIT_MS: "Alias heredado: último chunk con voz hasta decisión del cierre/flush, antes de la entrega al broker.",
+  MODEL_INFERENCE_MS: "Alias de SERVER_MODEL_INFERENCE_MS.",
+  queue_wait_ms: "Alias de SERVER_QUEUE_WAIT_MS.",
+  SERVER_AUDIO_END_TO_TRANSCRIPT_MS: "Alias de SERVER_EOS_TO_TRANSCRIPT_MS.",
+  CLIENT_AUDIO_END_TO_TRANSCRIPT_MS: "Alias de CLIENT_EOS_TO_TRANSCRIPT_MS.",
+});
+
+export function boundedPush(items, value, limit = RTT_SAMPLE_LIMIT) {
+  items.push(value);
+  if (items.length > limit) items.splice(0, items.length - limit);
+  return items;
+}
+
+export function rttPercentiles(samples) {
+  const values = samples.map((sample) => sample.PROXY_WS_RTT_MS).filter(Number.isFinite);
+  return { p50: median(values), p95: percentile(values, 0.95) };
+}
+
+export function formatMilliseconds(value) {
+  return Number.isFinite(value) ? `${Number(value).toFixed(2)} ms` : "—";
+}
+
+export function gpuStatusLabel(compute, telemetry) {
+  if (compute?.available === true || compute?.cuda === true) {
+    return compute.device || "CUDA disponible";
+  }
+  if (telemetry?.device) return `${telemetry.device} · cómputo CUDA no confirmado`;
+  return "GPU de cómputo no confirmada";
+}
 
 export function floatToPcm16LE(samples) {
   const buffer = new ArrayBuffer(samples.length * 2);

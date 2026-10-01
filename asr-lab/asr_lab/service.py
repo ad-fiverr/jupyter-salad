@@ -17,9 +17,9 @@ from starlette.responses import Response
 from .broker import InferenceBroker
 from .buffering import AudioBuffer, INACTIVITY_FLUSH_SECONDS
 from .config import Settings
-from .protocol import AudioChunk, FlushRequest, ProtocolError, parse_message
+from .protocol import AudioChunk, BenchmarkPing, FlushRequest, ProtocolError, parse_message
 from .security import token_matches
-from .telemetry import collect_telemetry
+from .telemetry import collect_telemetry, gpu_compute_state
 
 settings = Settings.from_env()
 logger = logging.getLogger("asr_lab.service")
@@ -105,13 +105,15 @@ def _worker_metrics() -> list[dict[str, Any]]:
 
 @app.get("/asr/health")
 async def health() -> dict[str, Any]:
+    compute = gpu_compute_state(broker, settings)
     return {
         "status": "ok",
         "backend": settings.backend,
         "model_id": settings.model_id,
         "model_revision": settings.model_revision,
         "model_loaded": bool(broker and broker.ready),
-        "cuda": any(worker.get("vram_after_warmup", {}).get("available") for worker in _worker_metrics()),
+        "cuda": compute["cuda"],
+        "gpu_compute": compute,
         "workers": settings.workers,
         "worker_metrics": _worker_metrics(),
     }
@@ -218,6 +220,9 @@ async def websocket_asr(websocket: WebSocket, token: str | None = Query(default=
                 await send_json({"event": "error", "code": exc.code, "message": exc.message})
                 continue
             now = time.perf_counter()
+            if isinstance(message, BenchmarkPing):
+                await send_json({"event": "benchmark_pong", "request_id": message.request_id})
+                continue
             if isinstance(message, FlushRequest):
                 audio = buffers.pop(message.source, None)
                 cancel_inactivity_timer(message.source)
@@ -289,18 +294,27 @@ async def _flush(
             segment_start_s=max(0.0, segment_started_at - connection_started),
             segment_end_s=max(0.0, last_voice_at - connection_started),
             segment_wait_ms=max(0.0, (now - last_voice_at) * 1000),
+            server_eos_at=last_voice_at,
         )
         if result.pop("_discarded_historical_output", False):
             return
+        internal_timing = result.pop("_internal_timing", {})
+        if client_request_id is not None:
+            result["client_request_id"] = client_request_id
         transcript_ready_at = time.perf_counter()
-        result["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"] = round(
-            max(0.0, transcript_ready_at - last_voice_at) * 1000, 2
-        )
+        model_finished_at = internal_timing.get("model_finished_at")
+        if not isinstance(model_finished_at, (int, float)):
+            model_finished_at = transcript_ready_at
+        postprocess_ms = max(0.0, transcript_ready_at - float(model_finished_at)) * 1000
+        server_eos_ms = max(0.0, transcript_ready_at - last_voice_at) * 1000
+        result["SERVER_POSTPROCESS_MS"] = round(postprocess_ms, 2)
+        result["SERVER_EOS_TO_TRANSCRIPT_MS"] = round(server_eos_ms, 2)
+        # Backwards-compatible aliases. SEGMENT_WAIT_MS remains the legacy
+        # last-voice-to-close decision interval, before broker submission.
+        result["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"] = round(server_eos_ms, 2)
         result["SERVER_RECEIVE_TO_TRANSCRIPT_MS"] = round(
             max(0.0, transcript_ready_at - segment_started_at) * 1000, 2
         )
-        if client_request_id is not None:
-            result["client_request_id"] = client_request_id
         await send_json(result)
     except RuntimeError as exc:
         code = str(exc) if str(exc) in {"backend_not_ready", "inference_queue_full", "inference_failed"} else "inference_failed"

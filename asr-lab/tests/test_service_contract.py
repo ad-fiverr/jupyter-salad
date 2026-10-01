@@ -58,7 +58,16 @@ def load_service_module():
     responses.JSONResponse = FakeJSONResponse
     responses.FileResponse = FakeFileResponse
     fastapi.responses = responses
-    with patch.dict(sys.modules, {"fastapi": fastapi, "fastapi.responses": responses}):
+    starlette = types.ModuleType("starlette")
+    starlette_responses = types.ModuleType("starlette.responses")
+    starlette_responses.Response = object
+    starlette.responses = starlette_responses
+    with patch.dict(sys.modules, {
+        "fastapi": fastapi,
+        "fastapi.responses": responses,
+        "starlette": starlette,
+        "starlette.responses": starlette_responses,
+    }):
         return importlib.import_module("asr_lab.service")
 
 
@@ -84,6 +93,9 @@ class FakeBroker:
             "speaker": kwargs["speaker"],
             "source": kwargs["source"],
             "MODEL_INFERENCE_MS": 2.0,
+            "SERVER_MODEL_INFERENCE_MS": 2.0,
+            "SERVER_ENDPOINTING_MS": kwargs["segment_wait_ms"],
+            "SERVER_QUEUE_WAIT_MS": 0.02,
             "SEGMENT_WAIT_MS": kwargs["segment_wait_ms"],
             "SERVER_TO_TRANSCRIPT_MS": 3.0,
         }
@@ -167,8 +179,27 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SERVER_TO_TRANSCRIPT_MS", transcripts[0])
         self.assertIn("SERVER_RECEIVE_TO_TRANSCRIPT_MS", transcripts[0])
         self.assertIn("SERVER_AUDIO_END_TO_TRANSCRIPT_MS", transcripts[0])
+        self.assertIn("SERVER_EOS_TO_TRANSCRIPT_MS", transcripts[0])
+        self.assertIn("SERVER_POSTPROCESS_MS", transcripts[0])
+        self.assertNotIn("_internal_timing", transcripts[0])
         self.assertEqual(transcripts[0]["client_request_id"], "segment-1")
         self.assertFalse(socket.closed)
+
+    async def test_benchmark_ping_pong_is_authenticated_and_does_not_interfere_with_audio_flush(self):
+        service = self.setup_service()
+        ping = {"event": "benchmark_ping", "request_id": "rtt-sample-1"}
+        socket = FakeWebSocket([
+            {"type": "websocket.receive", "text": json.dumps(ping)},
+            audio_frame(request_id="segment-after-ping"),
+            flush_frame("flush-after-ping"),
+            {"type": "websocket.disconnect"},
+        ])
+        await service.websocket_asr(socket, token=TOKEN)
+        self.assertEqual(socket.sent[0], {"event": "benchmark_pong", "request_id": "rtt-sample-1"})
+        self.assertEqual(service.broker.calls, 1)
+        transcript = next(item for item in socket.sent if item.get("event") == "transcript")
+        self.assertEqual(transcript["client_request_id"], "segment-after-ping")
+        self.assertIn({"event": "flush_complete", "request_id": "flush-after-ping"}, socket.sent)
 
     async def test_server_audio_end_metric_uses_server_monotonic_clock(self):
         service = self.setup_service()
@@ -192,6 +223,59 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(socket.sent[0]["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"], 500.0, places=2)
         self.assertEqual(socket.sent[0]["client_request_id"], "browser-segment-7")
 
+    async def test_server_metric_components_reconcile_without_audio_duration_or_client_clock(self):
+        service = self.setup_service()
+
+        class TimingBroker:
+            ready = True
+
+            async def transcribe(self, **_kwargs):
+                return {
+                    "event": "transcript", "type": "transcript", "text": "segmento siete",
+                    "AUDIO_DURATION_MS": 2_000.0, "audio_duration_ms": 2_000.0,
+                    "SERVER_ENDPOINTING_MS": 400.0,
+                    "SERVER_QUEUE_WAIT_MS": 0.02,
+                    "queue_wait_ms": 0.02,
+                    "SERVER_MODEL_INFERENCE_MS": 112.0,
+                    "MODEL_INFERENCE_MS": 112.0,
+                    "_internal_timing": {"model_finished_at": 10.712},
+                }
+
+        service.broker = TimingBroker()
+
+        class Audio:
+            can_flush = True
+            duration_seconds = 2.0
+            has_voice = True
+            speaker = "you"
+            started_at = 8.2
+            last_voice_at = 10.2
+            request_id = "browser-segment-7"
+
+            def take(self):
+                return b"\x01\x00" * 16_000
+
+        socket = FakeWebSocket()
+        with patch("asr_lab.service.time.perf_counter", return_value=10.713):
+            await service._flush(socket, "client-a", "mic", Audio(), 10.6, 0.0, socket.send_json)
+
+        transcript = socket.sent[0]
+        self.assertEqual(transcript["SERVER_ENDPOINTING_MS"], 400.0)
+        self.assertEqual(transcript["SERVER_QUEUE_WAIT_MS"], 0.02)
+        self.assertEqual(transcript["SERVER_MODEL_INFERENCE_MS"], 112.0)
+        self.assertEqual(transcript["SERVER_POSTPROCESS_MS"], 1.0)
+        self.assertEqual(transcript["SERVER_EOS_TO_TRANSCRIPT_MS"], 513.0)
+        self.assertAlmostEqual(
+            transcript["SERVER_EOS_TO_TRANSCRIPT_MS"],
+            transcript["SERVER_ENDPOINTING_MS"] + transcript["SERVER_QUEUE_WAIT_MS"]
+            + transcript["SERVER_MODEL_INFERENCE_MS"] + transcript["SERVER_POSTPROCESS_MS"],
+            delta=0.03,
+        )
+        self.assertEqual(transcript["SERVER_RECEIVE_TO_TRANSCRIPT_MS"], 2_513.0)
+        self.assertEqual(transcript["AUDIO_DURATION_MS"], 2_000.0)
+        self.assertEqual(transcript["MODEL_INFERENCE_MS"], 112.0)
+        self.assertNotIn("_internal_timing", transcript)
+
     async def test_benchmark_route_serves_allowlisted_page_assets_with_security_headers(self):
         service = self.setup_service()
         page = await service.benchmark_page()
@@ -210,12 +294,20 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         service = self.setup_service()
         page = Path(service.BENCHMARK_WEB_ROOT, "index.html").read_text(encoding="utf-8")
         app = Path(service.BENCHMARK_WEB_ROOT, "app.mjs").read_text(encoding="utf-8")
+        core = Path(service.BENCHMARK_WEB_ROOT, "core.mjs").read_text(encoding="utf-8")
         worklet = Path(service.BENCHMARK_WEB_ROOT, "audio-worklet.mjs").read_text(encoding="utf-8")
         self.assertIn('id="api-token" type="password"', page)
         self.assertIn("new AudioWorkletNode", app)
         self.assertIn("sample_rate: 16_000", app)
         self.assertIn("CHUNK_SAMPLES = 1_600", Path(service.BENCHMARK_WEB_ROOT, "core.mjs").read_text(encoding="utf-8"))
         self.assertIn('this.port.postMessage({ type: "flushed" })', worklet)
+        self.assertIn("Latencia del servidor / modelo", page)
+        self.assertIn("Client / proxy path", page)
+        self.assertIn("SERVER_RECEIVE_TO_TRANSCRIPT_MS", page)
+        self.assertNotIn("GPU no disponible", app)
+        self.assertIn("gpuStatusLabel", app + core)
+        self.assertIn("record_type", app)
+        self.assertIn("PROXY_WS_RTT_MS", app + core)
         for forbidden in ("localStorage", "sessionStorage", "document.cookie"):
             self.assertNotIn(forbidden, app)
         self.assertNotIn("state.token", app[app.index("function safeResult"):app.index("function download")])

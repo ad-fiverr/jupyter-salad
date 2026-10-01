@@ -4,7 +4,7 @@ import base64
 import unittest
 
 from asr_lab.config import Settings
-from asr_lab.protocol import AudioChunk, FlushRequest, ProtocolError, parse_message
+from asr_lab.protocol import AudioChunk, BenchmarkPing, FlushRequest, ProtocolError, parse_message
 from asr_lab.security import token_matches
 
 
@@ -33,6 +33,23 @@ class ProtocolTests(unittest.TestCase):
         import json
         parsed = parse_message(json.dumps({"event": "flush", "source": "system"}), max_message_bytes=1000, max_chunk_seconds=5)
         self.assertEqual(parsed, FlushRequest("system"))
+
+    def test_benchmark_ping_is_strict_and_requires_a_bounded_nonempty_id(self):
+        import json
+        parsed = parse_message(
+            json.dumps({"event": "benchmark_ping", "request_id": "ping-1"}),
+            max_message_bytes=1000,
+            max_chunk_seconds=5,
+        )
+        self.assertEqual(parsed, BenchmarkPing("ping-1"))
+        for payload in (
+            {"event": "benchmark_ping"},
+            {"event": "benchmark_ping", "request_id": ""},
+            {"event": "benchmark_ping", "request_id": "x" * 129},
+            {"event": "benchmark_ping", "request_id": "ping-1", "source": "mic"},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ProtocolError):
+                parse_message(json.dumps(payload), max_message_bytes=1000, max_chunk_seconds=5)
 
     def test_invalid_payloads_fail_closed(self):
         import json

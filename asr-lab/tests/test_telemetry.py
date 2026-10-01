@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from asr_lab.telemetry import collect_telemetry, gpu_telemetry, process_rss_mib, system_memory_mib
+from asr_lab.telemetry import collect_telemetry, gpu_compute_state, gpu_telemetry, process_rss_mib, system_memory_mib
 
 
 SECRET = "do-not-return-this-token"
@@ -84,7 +84,8 @@ class TelemetryTests(unittest.TestCase):
 
         fake = FakeNvml()
         self.assertEqual(gpu_telemetry(fake), {
-            "available": True, "device": "NVIDIA RTX Test", "utilization_pct": 67,
+            "available": True, "provider": "nvml", "scope": "device_global", "backend_attributed": False,
+            "device": "NVIDIA RTX Test", "utilization_pct": 67,
             "vram_used_mib": 2048.0, "vram_total_mib": 24576.0,
             "temperature_c": 55, "power_w": 150.0,
         })
@@ -105,15 +106,18 @@ class TelemetryTests(unittest.TestCase):
         )
         result = gpu_telemetry(fake)
         self.assertTrue(result["available"])
+        self.assertEqual(result["provider"], "nvml")
         self.assertEqual(result["device"], "GPU")
         self.assertEqual(result["utilization_pct"], 10)
         self.assertIsNone(result["temperature_c"])
         self.assertIsNone(result["power_w"])
 
     def test_no_nvml_or_gpu_is_a_valid_unavailable_state(self):
+        no_cuda = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
         with patch.dict(sys.modules, {"pynvml": None}):
-            no_package = gpu_telemetry()
+            no_package = gpu_telemetry(torch_module=no_cuda)
         self.assertFalse(no_package["available"])
+        self.assertEqual(no_package["provider"], "unavailable")
         self.assertIsNone(no_package["device"])
 
         fake_no_gpu = types.SimpleNamespace(
@@ -121,8 +125,35 @@ class TelemetryTests(unittest.TestCase):
             nvmlDeviceGetCount=lambda: 0,
             nvmlShutdown=lambda: None,
         )
-        no_device = gpu_telemetry(fake_no_gpu)
+        no_device = gpu_telemetry(fake_no_gpu, torch_module=no_cuda)
         self.assertFalse(no_device["available"])
+
+    def test_torch_fallback_reports_global_vram_not_torch_allocator_usage(self):
+        fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_name=lambda _index: "NVIDIA RTX Test",
+            mem_get_info=lambda: (8 * 1024 * 1024 * 1024, 24 * 1024 * 1024 * 1024),
+        ))
+        with patch.dict(sys.modules, {"pynvml": None}):
+            result = gpu_telemetry(torch_module=fake_torch)
+        self.assertEqual(result["provider"], "torch_fallback")
+        self.assertTrue(result["available"])
+        self.assertEqual(result["scope"], "device_global")
+        self.assertFalse(result["backend_attributed"])
+        self.assertEqual(result["vram_used_mib"], 16_384.0)
+        self.assertEqual(result["vram_total_mib"], 24_576.0)
+        self.assertIsNone(result["utilization_pct"])
+        self.assertNotIn("process_allocated_mib", result)
+
+    def test_compute_gpu_status_uses_health_snapshot_independent_of_nvml(self):
+        broker = types.SimpleNamespace(ready=True, worker_metrics=[{
+            "vram_after_warmup": {"available": True, "device": "NVIDIA RTX 3090"},
+        }])
+        settings = types.SimpleNamespace(backend="faster_whisper")
+        self.assertEqual(gpu_compute_state(broker, settings), {
+            "available": True, "cuda": True, "device": "NVIDIA RTX 3090",
+            "backend": "faster_whisper", "model_loaded": True,
+        })
 
     def test_collected_schema_is_allowlisted_and_excludes_secrets(self):
         broker = types.SimpleNamespace(ready=True, queued_jobs=2)
@@ -132,15 +163,18 @@ class TelemetryTests(unittest.TestCase):
         )
         with patch("asr_lab.telemetry.process_rss_mib", return_value=100.0), \
              patch("asr_lab.telemetry.system_memory_mib", return_value={"total_mib": 1000.0, "used_mib": 500.0}), \
-             patch("asr_lab.telemetry.gpu_telemetry", return_value={"available": False}):
+             patch("asr_lab.telemetry.gpu_compute_state", return_value={"available": True, "cuda": True, "device": "NVIDIA RTX Test"}), \
+             patch("asr_lab.telemetry.gpu_telemetry", return_value={"available": False, "device": None}):
             snapshot = collect_telemetry(broker, settings)
 
         self.assertEqual(set(snapshot), {
             "schema_version", "timestamp", "backend", "model_id", "model_revision",
             "model_loaded", "ready", "workers", "queue_depth", "process_rss_mib",
-            "system_ram", "gpu",
+            "system_ram", "gpu_compute", "gpu_telemetry", "gpu",
         })
         self.assertTrue(snapshot["model_loaded"])
+        self.assertTrue(snapshot["gpu_compute"]["available"])
+        self.assertEqual(snapshot["gpu"]["device"], "NVIDIA RTX Test")
         self.assertEqual(snapshot["queue_depth"], 2)
         self.assertNotIn(SECRET, json.dumps(snapshot))
 

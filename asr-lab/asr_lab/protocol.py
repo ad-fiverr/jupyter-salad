@@ -43,6 +43,11 @@ class FlushRequest:
     request_id: str | None = None
 
 
+@dataclass(frozen=True)
+class BenchmarkPing:
+    request_id: str
+
+
 def _safe_json(raw: str | bytes, max_message_bytes: int) -> Any:
     if isinstance(raw, bytes):
         if len(raw) > max_message_bytes:
@@ -69,9 +74,17 @@ def parse_message(
     *,
     max_message_bytes: int,
     max_chunk_seconds: float,
-) -> AudioChunk | FlushRequest:
+) -> AudioChunk | FlushRequest | BenchmarkPing:
     value = _safe_json(raw, max_message_bytes)
     event = value.get("event")
+
+    if event == "benchmark_ping":
+        if set(value) != {"event", "request_id"}:
+            raise ProtocolError("invalid_benchmark_ping", "Benchmark ping must contain only event and request_id.")
+        request_id = value.get("request_id")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            raise ProtocolError("invalid_request_id", "request_id must be a non-empty string up to 128 characters.")
+        return BenchmarkPing(request_id=request_id)
 
     if event == "flush":
         if set(value) - {"event", "source", "request_id"}:

@@ -46,14 +46,33 @@
       <div class="summary-grid" id="summary-grid" aria-live="polite">
         <div class="metric-card"><span>Segmentos</span><strong id="summary-segments">0</strong></div>
         <div class="metric-card"><span>Errores</span><strong id="summary-errors">0</strong></div>
-        <div class="metric-card"><span>Audio capturado</span><strong id="summary-audio">0.0 s</strong></div>
+        <div class="metric-card"><span>Audio capturado · no es latencia</span><strong id="summary-audio">0.0 s</strong></div>
         <div class="metric-card"><span>Inference RTF</span><strong id="summary-rtf">—</strong></div>
         <div class="metric-card"><span>WER</span><strong id="summary-wer">—</strong></div>
-        <div class="metric-card"><span>Client EOS p50 / p95</span><strong id="summary-client-eos">—</strong></div>
-        <div class="metric-card"><span>Server EOS p50 / p95</span><strong id="summary-server-eos">—</strong></div>
-        <div class="metric-card"><span>Inference p50 / p95</span><strong id="summary-inference">—</strong></div>
       </div>
     </section>
+
+    <div class="latency-groups">
+      <section class="panel" aria-labelledby="server-latency-title">
+        <div class="panel-heading"><div><p class="eyebrow">PANEL A</p><h2 id="server-latency-title">Latencia del servidor / modelo</h2></div></div>
+        <div class="summary-grid" aria-live="polite">
+          <div class="metric-card featured"><span>Model inference p50 / p95 · adapter wall time</span><strong id="summary-inference">—</strong><small>Objetivo experimental futuro: &lt;70 ms. Este tablero no afirma haberlo alcanzado.</small></div>
+          <div class="metric-card"><span>Server EOS → transcript p50 / p95</span><strong id="summary-server-eos">—</strong></div>
+          <div class="metric-card"><span>Endpointing p50 / p95</span><strong id="summary-endpoint">—</strong></div>
+          <div class="metric-card"><span>Queue p50 / p95</span><strong id="summary-queue">—</strong></div>
+          <div class="metric-card"><span>Postprocess p50 / p95</span><strong id="summary-postprocess">—</strong></div>
+        </div>
+        <p class="fine-print">Server EOS se mide sólo con el reloj monotónico del servidor y termina cuando el transcript está listo para enviarse. No incluye navegador, Gateway, nginx ni entrega por WebSocket.</p>
+      </section>
+      <section class="panel" aria-labelledby="client-latency-title">
+        <div class="panel-heading"><div><p class="eyebrow">PANEL B</p><h2 id="client-latency-title">Client / proxy path</h2></div></div>
+        <div class="summary-grid" aria-live="polite">
+          <div class="metric-card"><span>Client EOS → transcript p50 / p95</span><strong id="summary-client-eos">—</strong></div>
+          <div class="metric-card"><span>WebSocket proxy RTT p50 / p95</span><strong id="summary-proxy-rtt">—</strong></div>
+        </div>
+        <p class="fine-print">Client EOS incluye navegador, transporte, proxy, servidor y regreso del transcript. El RTT es ida y vuelta por el WebSocket autenticado; incluye scheduling y no es latencia unidireccional.</p>
+      </section>
+    </div>
 
     <section class="panel transcript-panel" aria-labelledby="transcript-title">
       <div class="panel-heading"><div><p class="eyebrow">RESULTADO</p><h2 id="transcript-title">Transcripción final</h2></div><div id="run-meta" class="run-meta">Sin sesión</div></div>
@@ -63,20 +82,24 @@
     <section class="panel" aria-labelledby="segments-title">
       <div class="panel-heading"><div><p class="eyebrow">MÉTRICAS REALES</p><h2 id="segments-title">Segmentos</h2></div><div class="export-row"><button id="export-json" class="quiet" type="button" disabled>Exportar JSON</button><button id="export-csv" class="quiet" type="button" disabled>Exportar CSV</button></div></div>
       <div class="table-wrap"><table><thead><tr>
-        <th># / voz</th><th>Transcripción</th><th>Modelo ms</th><th>Espera segmento ms</th><th>Cola ms</th><th>Servidor EOS ms</th><th>Cliente EOS ms*</th><th>Recepción total ms</th><th>Audio ms</th>
+        <th># / voz</th><th>Transcripción</th><th>Audio PCM ms · no latencia</th><th>Endpointing server ms</th><th>Queue ms</th><th>Model adapter ms</th><th>Postprocess ms</th><th>Server EOS → transcript ms</th><th>Client EOS → transcript ms*</th>
       </tr></thead><tbody id="segments-body"><tr><td colspan="9" class="empty">Aún no hay segmentos.</td></tr></tbody></table></div>
-      <p class="fine-print">* Medido en el reloj del navegador desde el último bloque de 100 ms sobre RMS 0.015. Resolución aproximada de un bloque y planificación del hilo del navegador; no se resta ningún reloj de servidor.</p>
+      <p class="fine-print">* performance.now() desde el último bloque de 100 ms sobre RMS 0.015 hasta recibir el transcript. La resolución depende del chunking y del scheduling del navegador; no se resta ningún reloj de servidor. La duración PCM es el audio entregado al modelo y puede contener silencio final.</p>
+      <details class="fine-print"><summary>Diagnóstico heredado, fuera de los KPI de latencia</summary><p>SERVER_RECEIVE_TO_TRANSCRIPT_MS mide desde el inicio del buffer hasta el transcript listo. Puede incluir silencio inicial y el tiempo durante el que se habló; se conserva en las exportaciones para diagnóstico.</p></details>
     </section>
 
     <section class="charts-grid" aria-label="Gráficas de benchmark">
-      <article class="panel chart-card"><h3>MODEL_INFERENCE_MS por segmento</h3><canvas id="chart-inference" aria-label="Latencia de inferencia por segmento"></canvas></article>
-      <article class="panel chart-card"><h3>Fin de voz → transcript por segmento</h3><canvas id="chart-eos" aria-label="Latencia fin de voz a transcripción"></canvas></article>
-      <article class="panel chart-card"><h3>GPU utilization % · muestreo 1 Hz</h3><canvas id="chart-gpu" aria-label="Uso de GPU"></canvas></article>
-      <article class="panel chart-card"><h3>VRAM usada / total MiB · 1 Hz</h3><canvas id="chart-vram" aria-label="Memoria de GPU"></canvas></article>
+      <article class="panel chart-card"><h3>SERVER_MODEL_INFERENCE_MS · adapter wall time</h3><canvas id="chart-inference" aria-label="Tiempo del adaptador de inferencia por segmento"></canvas></article>
+      <article class="panel chart-card"><h3>SERVER_ENDPOINTING_MS por segmento</h3><canvas id="chart-endpoint" aria-label="Endpointing servidor por segmento"></canvas></article>
+      <article class="panel chart-card"><h3>SERVER_EOS_TO_TRANSCRIPT_MS por segmento</h3><canvas id="chart-server-eos" aria-label="Server EOS a transcript por segmento"></canvas></article>
+      <article class="panel chart-card"><h3>CLIENT_EOS_TO_TRANSCRIPT_MS por segmento</h3><canvas id="chart-client-eos" aria-label="Client EOS a transcript por segmento"></canvas></article>
+      <article class="panel chart-card"><h3>PROXY_WS_RTT_MS · control ping/pong, 5 s</h3><canvas id="chart-rtt" aria-label="RTT de control del WebSocket a lo largo del tiempo"></canvas></article>
+      <article class="panel chart-card"><h3>GPU0 utilization % · NVML global, 1 Hz</h3><canvas id="chart-gpu" aria-label="Uso global de GPU reportado por NVML"></canvas></article>
+      <article class="panel chart-card"><h3>GPU0 VRAM used / total MiB · NVML/Torch global, 1 Hz</h3><canvas id="chart-vram" aria-label="VRAM global"></canvas></article>
       <article class="panel chart-card"><h3>Process RSS MiB · 1 Hz</h3><canvas id="chart-ram" aria-label="RAM del proceso"></canvas></article>
     </section>
 
-    <footer>Las métricas GPU pueden quedar como no disponibles si NVML no existe. No hay partials ni word-level streaming en este endpoint.</footer>
+    <footer>La disponibilidad de cómputo CUDA se informa separada de la telemetría. NVML/Torch reportan métricas globales del dispositivo, no del modelo; el allocator de PyTorch no mide VRAM de CTranslate2. No se mide tiempo de kernel GPU. No hay partials ni word-level streaming en este endpoint.</footer>
   </main>
 </body>
 </html>

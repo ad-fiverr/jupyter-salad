@@ -26,6 +26,10 @@ def _gpu_snapshot() -> dict[str, Any]:
             "total_mib": round(total / (1024 * 1024), 1),
             "used_global_mib": round((total - free) / (1024 * 1024), 1),
             "process_allocated_mib": round(torch.cuda.memory_allocated() / (1024 * 1024), 1),
+            "source": "torch_cuda_startup_snapshot",
+            "scope": "device_global",
+            "backend_attributed": False,
+            "process_allocated_scope": "pytorch_allocator_only",
         }
     except Exception:
         return {"available": False}
@@ -41,6 +45,7 @@ class InferenceJob:
     segment_end_s: float
     segment_wait_ms: float
     audio_duration_ms: float
+    server_eos_at: float
     submitted_at: float
     result: asyncio.Future[dict[str, Any]]
     job_id: str
@@ -124,9 +129,14 @@ class InferenceBroker:
                     if job is None:
                         return
                     self.queued_jobs -= 1
-                    inference_started = time.perf_counter()
-                    text = await asyncio.to_thread(backend.transcribe, job.pcm16le)
-                    inference_ms = (time.perf_counter() - inference_started) * 1000
+                    def transcribe_timed() -> tuple[str, float, float]:
+                        started_at = time.perf_counter()
+                        text_value = backend.transcribe(job.pcm16le)
+                        finished_at = time.perf_counter()
+                        return text_value, started_at, finished_at
+
+                    text, inference_started_at, inference_finished_at = await asyncio.to_thread(transcribe_timed)
+                    inference_ms = max(0.0, (inference_finished_at - inference_started_at) * 1000)
                     output = {
                         "type": "transcript",
                         "schema_version": 1,
@@ -140,13 +150,18 @@ class InferenceBroker:
                         "model_revision": self.model_revision,
                         "final": True,
                         "MODEL_INFERENCE_MS": round(inference_ms, 2),
+                        "SERVER_MODEL_INFERENCE_MS": round(inference_ms, 2),
+                        "AUDIO_DURATION_MS": round(job.audio_duration_ms, 2),
                         "audio_duration_ms": round(job.audio_duration_ms, 2),
                         "SEGMENT_WAIT_MS": round(job.segment_wait_ms, 2),
                         "SERVER_TO_TRANSCRIPT_MS": round(
                             max(0.0, (time.perf_counter() - job.submitted_at) * 1000), 2
                         ),
-                        "queue_wait_ms": round(max(0.0, inference_started - job.submitted_at) * 1000, 2),
+                        "SERVER_ENDPOINTING_MS": round(max(0.0, job.submitted_at - job.server_eos_at) * 1000, 2),
+                        "SERVER_QUEUE_WAIT_MS": round(max(0.0, inference_started_at - job.submitted_at) * 1000, 2),
+                        "queue_wait_ms": round(max(0.0, inference_started_at - job.submitted_at) * 1000, 2),
                         "request_id": job.job_id,
+                        "_internal_timing": {"model_finished_at": inference_finished_at},
                     }
                     if self.backend_name == "parakeet":
                         from .backends.parakeet import should_discard_historical_transcript
@@ -178,6 +193,7 @@ class InferenceBroker:
     async def transcribe(
         self, *, connection_id: str, source: str, speaker: str, pcm16le: bytes,
         segment_start_s: float, segment_end_s: float, segment_wait_ms: float,
+        server_eos_at: float,
     ) -> dict[str, Any]:
         if not self.ready:
             raise RuntimeError("backend_not_ready")
@@ -193,6 +209,7 @@ class InferenceBroker:
             segment_end_s=segment_end_s,
             segment_wait_ms=segment_wait_ms,
             audio_duration_ms=len(pcm16le) / 32.0,
+            server_eos_at=server_eos_at,
             submitted_at=time.perf_counter(),
             result=future,
             job_id=uuid.uuid4().hex,

@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   CHUNK_SAMPLES,
+  METRIC_DEFINITIONS,
   MAX_BUFFER_SAMPLES,
   MIN_SPEECH_SAMPLES,
   SILENCE_CHUNKS_TO_FLUSH,
@@ -9,13 +11,19 @@ import {
   SILENCE_THRESHOLD,
   ShadowVad,
   StreamingResampler,
+  boundedPush,
   csvCell,
   floatToPcm16LE,
+  formatMilliseconds,
+  gpuStatusLabel,
   median,
   pcm16RmsNormalized,
   percentile,
+  rttPercentiles,
   wordErrorRate,
 } from "../asr_lab/benchmark_web/core.mjs";
+
+const appSource = readFileSync(new URL("../asr_lab/benchmark_web/app.mjs", import.meta.url), "utf8");
 
 function sine(rate, frequency, sampleCount, start = 0) {
   return Float32Array.from(
@@ -113,4 +121,40 @@ test("CSV escapes cells and neutralizes spreadsheet formulas", () => {
   assert.equal(csvCell('texto,"con coma"'), '"texto,""con coma"""');
   assert.equal(csvCell("=HYPERLINK(\"https://example.invalid\")"), "\"'=HYPERLINK(\"\"https://example.invalid\"\")\"");
   assert.equal(csvCell(-12), "-12");
+});
+
+test("compute availability never becomes a false GPU-unavailable label when CUDA is confirmed", () => {
+  assert.equal(gpuStatusLabel({ available: true, cuda: true, device: "NVIDIA RTX 3090" }, { available: false }), "NVIDIA RTX 3090");
+  assert.equal(gpuStatusLabel({ available: false, cuda: false }, { device: "NVIDIA RTX 3090" }), "NVIDIA RTX 3090 · cómputo CUDA no confirmado");
+  assert.equal(gpuStatusLabel({}, {}), "GPU de cómputo no confirmada");
+});
+
+test("browser control RTT samples are bounded and expose separate p50/p95", () => {
+  const samples = [{ PROXY_WS_RTT_MS: 20 }, { PROXY_WS_RTT_MS: 31 }, { PROXY_WS_RTT_MS: 44 }, { PROXY_WS_RTT_MS: null }];
+  assert.deepEqual(rttPercentiles(samples), { p50: 31, p95: 44 });
+  for (let index = 0; index < 800; index += 1) boundedPush(samples, { PROXY_WS_RTT_MS: index }, 720);
+  assert.equal(samples.length, 720);
+});
+
+test("latency rendering preserves hundredth-millisecond queue values", () => {
+  assert.equal(formatMilliseconds(0.02), "0.02 ms");
+  assert.equal(formatMilliseconds(112), "112.00 ms");
+  assert.equal(formatMilliseconds(null), "—");
+});
+
+test("metric definitions distinguish duration, server-only clocks, client path and RTT", () => {
+  assert.match(METRIC_DEFINITIONS.AUDIO_DURATION_MS, /no es latencia/);
+  assert.match(METRIC_DEFINITIONS.SERVER_EOS_TO_TRANSCRIPT_MS, /no incluye navegador ni red/);
+  assert.match(METRIC_DEFINITIONS.PROXY_WS_RTT_MS, /No es latencia unidireccional/);
+  assert.match(METRIC_DEFINITIONS.SERVER_RECEIVE_TO_TRANSCRIPT_MS, /No es KPI/);
+});
+
+test("application RTT ping uses the authenticated ASR websocket and performance.now only", () => {
+  assert.match(appSource, /new URL\("\/asr\/ws"/);
+  assert.match(appSource, /event: "benchmark_ping"/);
+  assert.match(appSource, /event === "benchmark_pong"/);
+  assert.match(appSource, /const sentAt = performance\.now\(\)/);
+  assert.match(appSource, /const receivedAt = performance\.now\(\)/);
+  assert.match(appSource, /setInterval\(sendRttPing, 5000\)/);
+  assert.doesNotMatch(appSource, /localStorage|sessionStorage|document\.cookie/);
 });

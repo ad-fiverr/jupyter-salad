@@ -1,4 +1,7 @@
-import { ShadowVad, csvCell, median, percentile, wordErrorRate } from "/asr/benchmark/core.mjs";
+import {
+  METRIC_DEFINITIONS, ShadowVad, boundedPush, csvCell, formatMilliseconds, gpuStatusLabel,
+  median, percentile, rttPercentiles, wordErrorRate,
+} from "/asr/benchmark/core.mjs";
 
 const $ = (id) => document.getElementById(id);
 const state = {
@@ -21,6 +24,9 @@ const state = {
   segments: [],
   errors: [],
   telemetry: [],
+  rttSamples: [],
+  rttTimer: null,
+  rttPending: null,
   requestTimes: new Map(),
   segmentRequestIds: [],
   vad: new ShadowVad(),
@@ -40,7 +46,8 @@ const state = {
 };
 
 const charts = {
-  inference: $("chart-inference"), eos: $("chart-eos"), gpu: $("chart-gpu"),
+  inference: $("chart-inference"), endpoint: $("chart-endpoint"), serverEos: $("chart-server-eos"),
+  clientEos: $("chart-client-eos"), rtt: $("chart-rtt"), gpu: $("chart-gpu"),
   vram: $("chart-vram"), ram: $("chart-ram"),
 };
 
@@ -55,9 +62,7 @@ function status(node, label, value, stateName) {
   node.dataset.state = stateName;
 }
 
-function fmtMs(value) {
-  return Number.isFinite(value) ? `${Number(value).toFixed(1)} ms` : "—";
-}
+const fmtMs = formatMilliseconds;
 
 function bytesToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
@@ -84,15 +89,23 @@ function updateTranscript() {
   const text = transcriptText();
   $("transcript").textContent = text || "La transcripción aparecerá cuando el servidor cierre un segmento.";
   const latest = state.telemetry.at(-1);
-  const gpu = latest?.gpu_device || "GPU no disponible";
+  const gpu = gpuStatusLabel(
+    latest?.gpu_compute,
+    { device: latest?.gpu_device, provider: latest?.gpu_telemetry_provider },
+  );
   $("run-meta").textContent = [state.backend, state.modelId, `workers=${state.workers ?? "?"}`, gpu].filter(Boolean).join(" · ");
 }
 
 function updateSummary() {
   const rows = sortedSegments();
-  const inference = rows.map((row) => row.MODEL_INFERENCE_MS).filter(Number.isFinite);
-  const clientEos = rows.map((row) => row.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS).filter(Number.isFinite);
-  const serverEos = rows.map((row) => row.SERVER_AUDIO_END_TO_TRANSCRIPT_MS).filter(Number.isFinite);
+  const value = (row, canonical, legacy) => Number.isFinite(row[canonical]) ? row[canonical] : row[legacy];
+  const inference = rows.map((row) => value(row, "SERVER_MODEL_INFERENCE_MS", "MODEL_INFERENCE_MS")).filter(Number.isFinite);
+  const endpoint = rows.map((row) => row.SERVER_ENDPOINTING_MS).filter(Number.isFinite);
+  const queue = rows.map((row) => value(row, "SERVER_QUEUE_WAIT_MS", "queue_wait_ms")).filter(Number.isFinite);
+  const postprocess = rows.map((row) => row.SERVER_POSTPROCESS_MS).filter(Number.isFinite);
+  const clientEos = rows.map((row) => value(row, "CLIENT_EOS_TO_TRANSCRIPT_MS", "CLIENT_AUDIO_END_TO_TRANSCRIPT_MS")).filter(Number.isFinite);
+  const serverEos = rows.map((row) => value(row, "SERVER_EOS_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS")).filter(Number.isFinite);
+  const rtt = rttPercentiles(state.rttSamples);
   const audioMs = rows.map((row) => row.audio_duration_ms).filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
   const inferenceMs = inference.reduce((sum, value) => sum + value, 0);
   const wer = state.reference.trim() ? wordErrorRate(state.reference, transcriptText()) : null;
@@ -101,9 +114,17 @@ function updateSummary() {
   $("summary-audio").textContent = `${(state.capturedSamples / 16_000).toFixed(1)} s`;
   $("summary-rtf").textContent = audioMs > 0 ? (inferenceMs / audioMs).toFixed(3) : "—";
   $("summary-wer").textContent = wer == null ? "—" : `${(wer * 100).toFixed(1)}%`;
-  $("summary-client-eos").textContent = clientEos.length ? `${median(clientEos).toFixed(1)} / ${percentile(clientEos, 0.95).toFixed(1)} ms` : "—";
-  $("summary-server-eos").textContent = serverEos.length ? `${median(serverEos).toFixed(1)} / ${percentile(serverEos, 0.95).toFixed(1)} ms` : "—";
-  $("summary-inference").textContent = inference.length ? `${median(inference).toFixed(1)} / ${percentile(inference, 0.95).toFixed(1)} ms` : "—";
+  const displayPair = (values) => values.length
+    ? `${formatMilliseconds(median(values))} / ${formatMilliseconds(percentile(values, 0.95))}`
+    : "—";
+  $("summary-client-eos").textContent = displayPair(clientEos);
+  $("summary-server-eos").textContent = displayPair(serverEos);
+  $("summary-inference").textContent = displayPair(inference);
+  $("summary-endpoint").textContent = displayPair(endpoint);
+  $("summary-queue").textContent = displayPair(queue);
+  $("summary-postprocess").textContent = displayPair(postprocess);
+  $("summary-proxy-rtt").textContent = rtt.p50 == null ? "—"
+    : `${formatMilliseconds(rtt.p50)} / ${formatMilliseconds(rtt.p95)}`;
 }
 
 function renderSegments() {
@@ -125,13 +146,13 @@ function renderSegments() {
     const values = [
       `${index + 1}${Number.isFinite(item.start) ? ` · ${item.start.toFixed(2)} s` : ""}`,
       item.text,
-      fmtMs(item.MODEL_INFERENCE_MS),
-      fmtMs(item.SEGMENT_WAIT_MS),
-      fmtMs(item.queue_wait_ms),
-      fmtMs(item.SERVER_AUDIO_END_TO_TRANSCRIPT_MS),
-      fmtMs(item.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS),
-      fmtMs(item.SERVER_RECEIVE_TO_TRANSCRIPT_MS),
       fmtMs(item.audio_duration_ms),
+      fmtMs(item.SERVER_ENDPOINTING_MS),
+      fmtMs(Number.isFinite(item.SERVER_QUEUE_WAIT_MS) ? item.SERVER_QUEUE_WAIT_MS : item.queue_wait_ms),
+      fmtMs(Number.isFinite(item.SERVER_MODEL_INFERENCE_MS) ? item.SERVER_MODEL_INFERENCE_MS : item.MODEL_INFERENCE_MS),
+      fmtMs(item.SERVER_POSTPROCESS_MS),
+      fmtMs(Number.isFinite(item.SERVER_EOS_TO_TRANSCRIPT_MS) ? item.SERVER_EOS_TO_TRANSCRIPT_MS : item.SERVER_AUDIO_END_TO_TRANSCRIPT_MS),
+      fmtMs(Number.isFinite(item.CLIENT_EOS_TO_TRANSCRIPT_MS) ? item.CLIENT_EOS_TO_TRANSCRIPT_MS : item.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS),
     ];
     values.forEach((value) => {
       const td = document.createElement("td");
@@ -182,8 +203,11 @@ function drawChart(canvas, points, key, color = "#80e0b2", secondKey = null) {
 }
 
 function renderCharts() {
-  drawChart(charts.inference, sortedSegments(), "MODEL_INFERENCE_MS");
-  drawChart(charts.eos, sortedSegments(), "CLIENT_AUDIO_END_TO_TRANSCRIPT_MS", "#7dc4ff", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS");
+  drawChart(charts.inference, sortedSegments(), "SERVER_MODEL_INFERENCE_MS");
+  drawChart(charts.endpoint, sortedSegments(), "SERVER_ENDPOINTING_MS", "#f0c878");
+  drawChart(charts.serverEos, sortedSegments(), "SERVER_EOS_TO_TRANSCRIPT_MS", "#80e0b2");
+  drawChart(charts.clientEos, sortedSegments(), "CLIENT_EOS_TO_TRANSCRIPT_MS", "#7dc4ff");
+  drawChart(charts.rtt, state.rttSamples, "PROXY_WS_RTT_MS", "#f0c878");
   drawChart(charts.gpu, state.telemetry, "gpu_utilization_pct", "#80e0b2");
   drawChart(charts.vram, state.telemetry, "vram_used_mib", "#7dc4ff", "vram_total_mib");
   drawChart(charts.ram, state.telemetry, "process_rss_mib", "#f0c878");
@@ -207,17 +231,23 @@ async function getTelemetry() {
 }
 
 function recordTelemetry(snapshot) {
+  const gpuTelemetry = snapshot.gpu_telemetry ?? snapshot.gpu ?? {};
+  const gpuCompute = snapshot.gpu_compute ?? { available: Boolean(snapshot.cuda), cuda: Boolean(snapshot.cuda) };
   const point = {
     timestamp: snapshot.timestamp,
     process_rss_mib: snapshot.process_rss_mib,
     system_ram_total_mib: snapshot.system_ram?.total_mib ?? null,
     system_ram_used_mib: snapshot.system_ram?.used_mib ?? null,
-    gpu_device: snapshot.gpu?.device ?? null,
-    gpu_utilization_pct: snapshot.gpu?.utilization_pct ?? null,
-    vram_used_mib: snapshot.gpu?.vram_used_mib ?? null,
-    vram_total_mib: snapshot.gpu?.vram_total_mib ?? null,
-    gpu_temperature_c: snapshot.gpu?.temperature_c ?? null,
-    gpu_power_w: snapshot.gpu?.power_w ?? null,
+    gpu_compute: gpuCompute,
+    gpu_compute_available: gpuCompute.available === true || gpuCompute.cuda === true,
+    gpu_device: gpuCompute.device ?? gpuTelemetry.device ?? null,
+    gpu_telemetry_available: gpuTelemetry.available === true,
+    gpu_telemetry_provider: gpuTelemetry.provider ?? "unavailable",
+    gpu_utilization_pct: gpuTelemetry.utilization_pct ?? null,
+    vram_used_mib: gpuTelemetry.vram_used_mib ?? null,
+    vram_total_mib: gpuTelemetry.vram_total_mib ?? null,
+    gpu_temperature_c: gpuTelemetry.temperature_c ?? null,
+    gpu_power_w: gpuTelemetry.power_w ?? null,
     queue_depth: snapshot.queue_depth,
     model_loaded: snapshot.model_loaded,
     workers: snapshot.workers,
@@ -252,20 +282,38 @@ function onTranscript(message) {
     ? state.requestTimes.get(message.client_request_id)
     : null;
   if (typeof message.client_request_id === "string") state.requestTimes.delete(message.client_request_id);
+  const clientEosMs = Number.isFinite(clientStart) ? Math.max(0, receivedAt - clientStart) : null;
+  const modelMs = Number.isFinite(message.SERVER_MODEL_INFERENCE_MS)
+    ? message.SERVER_MODEL_INFERENCE_MS
+    : Number.isFinite(message.MODEL_INFERENCE_MS) ? message.MODEL_INFERENCE_MS : null;
+  const queueMs = Number.isFinite(message.SERVER_QUEUE_WAIT_MS)
+    ? message.SERVER_QUEUE_WAIT_MS
+    : Number.isFinite(message.queue_wait_ms) ? message.queue_wait_ms : null;
+  const serverEosMs = Number.isFinite(message.SERVER_EOS_TO_TRANSCRIPT_MS)
+    ? message.SERVER_EOS_TO_TRANSCRIPT_MS
+    : Number.isFinite(message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS) ? message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS : null;
   state.segments.push({
     text: String(message.text ?? ""),
     start: Number.isFinite(message.start) ? message.start : null,
     end: Number.isFinite(message.end) ? message.end : null,
     speaker: String(message.speaker ?? "you"),
     backend: String(message.backend ?? state.backend ?? "unknown"),
-    MODEL_INFERENCE_MS: Number.isFinite(message.MODEL_INFERENCE_MS) ? message.MODEL_INFERENCE_MS : null,
+    SERVER_MODEL_INFERENCE_MS: modelMs,
+    MODEL_INFERENCE_MS: modelMs,
+    SERVER_ENDPOINTING_MS: Number.isFinite(message.SERVER_ENDPOINTING_MS) ? message.SERVER_ENDPOINTING_MS : null,
+    SERVER_QUEUE_WAIT_MS: queueMs,
+    SERVER_POSTPROCESS_MS: Number.isFinite(message.SERVER_POSTPROCESS_MS) ? message.SERVER_POSTPROCESS_MS : null,
+    SERVER_EOS_TO_TRANSCRIPT_MS: serverEosMs,
+    CLIENT_EOS_TO_TRANSCRIPT_MS: clientEosMs,
     SEGMENT_WAIT_MS: Number.isFinite(message.SEGMENT_WAIT_MS) ? message.SEGMENT_WAIT_MS : null,
     SERVER_TO_TRANSCRIPT_MS: Number.isFinite(message.SERVER_TO_TRANSCRIPT_MS) ? message.SERVER_TO_TRANSCRIPT_MS : null,
     SERVER_RECEIVE_TO_TRANSCRIPT_MS: Number.isFinite(message.SERVER_RECEIVE_TO_TRANSCRIPT_MS) ? message.SERVER_RECEIVE_TO_TRANSCRIPT_MS : null,
-    SERVER_AUDIO_END_TO_TRANSCRIPT_MS: Number.isFinite(message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS) ? message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS : null,
-    CLIENT_AUDIO_END_TO_TRANSCRIPT_MS: Number.isFinite(clientStart) ? Math.max(0, receivedAt - clientStart) : null,
-    queue_wait_ms: Number.isFinite(message.queue_wait_ms) ? message.queue_wait_ms : null,
-    audio_duration_ms: Number.isFinite(message.audio_duration_ms) ? message.audio_duration_ms : null,
+    SERVER_AUDIO_END_TO_TRANSCRIPT_MS: serverEosMs,
+    CLIENT_AUDIO_END_TO_TRANSCRIPT_MS: clientEosMs,
+    queue_wait_ms: queueMs,
+    audio_duration_ms: Number.isFinite(message.AUDIO_DURATION_MS)
+      ? message.AUDIO_DURATION_MS
+      : Number.isFinite(message.audio_duration_ms) ? message.audio_duration_ms : null,
     request_id: typeof message.request_id === "string" ? message.request_id : null,
     client_request_id: typeof message.client_request_id === "string" ? message.client_request_id : null,
     receivedAt,
@@ -278,6 +326,22 @@ function onTranscript(message) {
 function onSocketMessage(raw) {
   let message;
   try { message = JSON.parse(raw); } catch { state.errors.push("invalid_server_message"); updateSummary(); return; }
+  if (message.event === "benchmark_pong") {
+    const pending = state.rttPending;
+    if (pending && message.request_id === pending.request_id) {
+      clearTimeout(pending.timeoutId);
+      state.rttPending = null;
+      const receivedAt = performance.now();
+      boundedPush(state.rttSamples, {
+        elapsed_ms: state.startedAt == null ? null : Math.max(0, receivedAt - state.startedAt),
+        PROXY_WS_RTT_MS: Math.max(0, receivedAt - pending.sentAt),
+        status: "ok",
+      });
+      updateSummary();
+      renderCharts();
+    }
+    return;
+  }
   if (message.event === "transcript" || message.type === "transcript") {
     onTranscript(message);
     return;
@@ -294,6 +358,51 @@ function onSocketMessage(raw) {
     state.flushResolver = null;
     state.flushId = null;
   }
+}
+
+function recordRttFailure(statusName) {
+  const now = performance.now();
+  boundedPush(state.rttSamples, {
+    elapsed_ms: state.startedAt == null ? null : Math.max(0, now - state.startedAt),
+    PROXY_WS_RTT_MS: null,
+    status: statusName,
+  });
+  updateSummary();
+  renderCharts();
+}
+
+function sendRttPing() {
+  const ws = state.ws;
+  if (!ws || ws.readyState !== WebSocket.OPEN || state.rttPending) return;
+  const requestId = crypto.randomUUID();
+  const sentAt = performance.now();
+  const pending = { request_id: requestId, sentAt, timeoutId: null };
+  pending.timeoutId = setTimeout(() => {
+    if (state.rttPending !== pending) return;
+    state.rttPending = null;
+    recordRttFailure("timeout");
+  }, 4500);
+  state.rttPending = pending;
+  try {
+    ws.send(JSON.stringify({ event: "benchmark_ping", request_id: requestId }));
+  } catch {
+    clearTimeout(pending.timeoutId);
+    if (state.rttPending === pending) state.rttPending = null;
+    recordRttFailure("send_error");
+  }
+}
+
+function startRttSampler() {
+  stopRttSampler();
+  sendRttPing();
+  state.rttTimer = setInterval(sendRttPing, 5000);
+}
+
+function stopRttSampler() {
+  if (state.rttTimer) clearInterval(state.rttTimer);
+  state.rttTimer = null;
+  if (state.rttPending) clearTimeout(state.rttPending.timeoutId);
+  state.rttPending = null;
 }
 
 function openSocket(token) {
@@ -439,6 +548,7 @@ async function startRun() {
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) throw new Error("websocket_closed");
     $("stop-button").disabled = false;
     $("disconnect-button").disabled = false;
+    startRttSampler();
     state.timer = setInterval(() => { updateTimer(); void pollTelemetry(); }, 1000);
     document.addEventListener("visibilitychange", onVisibilityChange);
     showNotice("Grabando. Habla con naturalidad; se mostrarán segmentos finales.", "ok");
@@ -490,6 +600,7 @@ function waitForFlushBarrier() {
 async function stopRun() {
   if (!state.ws || state.isStopping || state.finalised) return;
   state.isStopping = true;
+  stopRttSampler();
   state.isRecording = false;
   $("stop-button").disabled = true;
   showNotice("Cerrando el último bloque y esperando flush_complete…");
@@ -512,6 +623,7 @@ async function cleanup(complete) {
   state.isRecording = false;
   state.isStopping = false;
   state.finalised = true;
+  stopRttSampler();
   if (state.timer) clearInterval(state.timer);
   state.timer = null;
   document.removeEventListener("visibilitychange", onVisibilityChange);
@@ -542,9 +654,11 @@ async function cleanup(complete) {
 }
 
 function resetRun() {
+  stopRttSampler();
   state.segments = [];
   state.errors = [];
   state.telemetry = [];
+  state.rttSamples = [];
   state.requestTimes.clear();
   state.segmentRequestIds = [];
   state.vad = new ShadowVad();
@@ -573,6 +687,13 @@ function resetRun() {
 function safeResult() {
   const segments = sortedSegments().map((row) => ({
     text: row.text, start: row.start, end: row.end, speaker: row.speaker, backend: row.backend,
+    AUDIO_DURATION_MS: row.audio_duration_ms,
+    SERVER_ENDPOINTING_MS: row.SERVER_ENDPOINTING_MS,
+    SERVER_QUEUE_WAIT_MS: row.SERVER_QUEUE_WAIT_MS,
+    SERVER_MODEL_INFERENCE_MS: row.SERVER_MODEL_INFERENCE_MS,
+    SERVER_POSTPROCESS_MS: row.SERVER_POSTPROCESS_MS,
+    SERVER_EOS_TO_TRANSCRIPT_MS: row.SERVER_EOS_TO_TRANSCRIPT_MS,
+    CLIENT_EOS_TO_TRANSCRIPT_MS: row.CLIENT_EOS_TO_TRANSCRIPT_MS,
     MODEL_INFERENCE_MS: row.MODEL_INFERENCE_MS,
     SEGMENT_WAIT_MS: row.SEGMENT_WAIT_MS,
     SERVER_TO_TRANSCRIPT_MS: row.SERVER_TO_TRANSCRIPT_MS,
@@ -582,17 +703,37 @@ function safeResult() {
     queue_wait_ms: row.queue_wait_ms, audio_duration_ms: row.audio_duration_ms,
   }));
   const inference = segments.map((row) => row.MODEL_INFERENCE_MS).filter(Number.isFinite);
+  const endpoint = segments.map((row) => row.SERVER_ENDPOINTING_MS).filter(Number.isFinite);
+  const queue = segments.map((row) => row.SERVER_QUEUE_WAIT_MS).filter(Number.isFinite);
+  const postprocess = segments.map((row) => row.SERVER_POSTPROCESS_MS).filter(Number.isFinite);
   const serverEos = segments.map((row) => row.SERVER_AUDIO_END_TO_TRANSCRIPT_MS).filter(Number.isFinite);
   const clientEos = segments.map((row) => row.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS).filter(Number.isFinite);
+  const rtt = rttPercentiles(state.rttSamples);
   const audioMs = segments.map((row) => row.audio_duration_ms).filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
   const inferenceMs = inference.reduce((sum, value) => sum + value, 0);
+  const lastTelemetry = state.telemetry.at(-1);
   const result = {
     timestamp: state.runTimestamp,
     finished_at: new Date().toISOString(),
     backend: state.backend,
     model_id: state.modelId,
     model_revision: state.modelRevision,
-    gpu: state.telemetry.at(-1)?.gpu_device ?? null,
+    gpu: lastTelemetry?.gpu_device ?? null,
+    GPU_COMPUTE_AVAILABLE: lastTelemetry?.gpu_compute_available === true,
+    GPU_TELEMETRY_AVAILABLE: lastTelemetry?.gpu_telemetry_available === true,
+    gpu_compute: lastTelemetry?.gpu_compute ?? null,
+    gpu_telemetry: lastTelemetry ? {
+      available: lastTelemetry.gpu_telemetry_available,
+      provider: lastTelemetry.gpu_telemetry_provider,
+      scope: "device_global",
+      backend_attributed: false,
+      device: lastTelemetry.gpu_device,
+      utilization_pct: lastTelemetry.gpu_utilization_pct,
+      vram_used_mib: lastTelemetry.vram_used_mib,
+      vram_total_mib: lastTelemetry.vram_total_mib,
+      temperature_c: lastTelemetry.gpu_temperature_c,
+      power_w: lastTelemetry.gpu_power_w,
+    } : null,
     workers: state.workers,
     capture: {
       sample_rate_hz: 16_000,
@@ -613,6 +754,20 @@ function safeResult() {
       errors: [...state.errors],
       transcribed_audio_ms: audioMs,
       MODEL_INFERENCE_RTF: audioMs > 0 ? inferenceMs / audioMs : null,
+      SERVER_MODEL_INFERENCE_MS_P50: median(inference),
+      SERVER_MODEL_INFERENCE_MS_P95: percentile(inference, 0.95),
+      SERVER_ENDPOINTING_MS_P50: median(endpoint),
+      SERVER_ENDPOINTING_MS_P95: percentile(endpoint, 0.95),
+      SERVER_QUEUE_WAIT_MS_P50: median(queue),
+      SERVER_QUEUE_WAIT_MS_P95: percentile(queue, 0.95),
+      SERVER_POSTPROCESS_MS_P50: median(postprocess),
+      SERVER_POSTPROCESS_MS_P95: percentile(postprocess, 0.95),
+      SERVER_EOS_TO_TRANSCRIPT_MS_P50: median(serverEos),
+      SERVER_EOS_TO_TRANSCRIPT_MS_P95: percentile(serverEos, 0.95),
+      CLIENT_EOS_TO_TRANSCRIPT_MS_P50: median(clientEos),
+      CLIENT_EOS_TO_TRANSCRIPT_MS_P95: percentile(clientEos, 0.95),
+      PROXY_WS_RTT_MS_P50: rtt.p50,
+      PROXY_WS_RTT_MS_P95: rtt.p95,
       MODEL_INFERENCE_MS_P50: median(inference),
       MODEL_INFERENCE_MS_P95: percentile(inference, 0.95),
       SERVER_AUDIO_END_TO_TRANSCRIPT_MS_P50: median(serverEos),
@@ -622,6 +777,18 @@ function safeResult() {
       WER: state.reference.trim() ? wordErrorRate(state.reference, transcriptText()) : null,
     },
     telemetry: [...state.telemetry],
+    proxy_ws_rtt_samples: state.rttSamples.map((sample) => ({
+      elapsed_ms: sample.elapsed_ms,
+      PROXY_WS_RTT_MS: sample.PROXY_WS_RTT_MS,
+      status: sample.status,
+    })),
+    metric_definitions: METRIC_DEFINITIONS,
+    measurement_provenance: {
+      MODEL_INFERENCE_SCOPE: "adapter_wall_clock_not_gpu_kernel_time",
+      GPU_TELEMETRY_SCOPE: "optional_nvml_or_torch_device_global_not_backend_attributed",
+      SERVER_CLOCK: "time.perf_counter within ASR server process",
+      CLIENT_CLOCK: "performance.now within browser only",
+    },
     visibility_transitions: [...state.visibility],
   };
   return result;
@@ -644,13 +811,46 @@ function exportJson() {
 
 function exportCsv() {
   const result = safeResult();
-  const metadata = [result.timestamp, result.backend, result.model_id, result.gpu, result.workers];
-  const columns = ["timestamp", "backend", "model_id", "gpu", "workers", "start", "end", "text", "MODEL_INFERENCE_MS", "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS", "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS", "CLIENT_AUDIO_END_TO_TRANSCRIPT_MS", "queue_wait_ms", "audio_duration_ms"];
-  const lines = [columns.map(csvCell).join(",")];
+  const columns = ["record_type", "timestamp", "backend", "model_id", "gpu", "workers",
+    "PROXY_WS_RTT_MS_P50", "PROXY_WS_RTT_MS_P95", "elapsed_ms", "start", "end", "text",
+    "AUDIO_DURATION_MS", "SERVER_ENDPOINTING_MS", "SERVER_QUEUE_WAIT_MS", "SERVER_MODEL_INFERENCE_MS",
+    "SERVER_POSTPROCESS_MS", "SERVER_EOS_TO_TRANSCRIPT_MS", "CLIENT_EOS_TO_TRANSCRIPT_MS",
+    "PROXY_WS_RTT_MS", "MODEL_INFERENCE_MS", "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS",
+    "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS",
+    "CLIENT_AUDIO_END_TO_TRANSCRIPT_MS", "queue_wait_ms", "audio_duration_ms"];
+  const toCsvRow = (row) => columns.map((column) => csvCell(row[column] ?? "")).join(",");
+  const lines = [toCsvRow(Object.fromEntries(columns.map((column) => [column, column])))];
   for (const row of result.segments) {
-    lines.push([...metadata, row.start, row.end, row.text, row.MODEL_INFERENCE_MS, row.SEGMENT_WAIT_MS,
-      row.SERVER_TO_TRANSCRIPT_MS, row.SERVER_RECEIVE_TO_TRANSCRIPT_MS, row.SERVER_AUDIO_END_TO_TRANSCRIPT_MS,
-      row.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS, row.queue_wait_ms, row.audio_duration_ms].map(csvCell).join(","));
+    lines.push(toCsvRow({
+      record_type: "segment", timestamp: result.timestamp, backend: result.backend,
+      model_id: result.model_id, gpu: result.gpu, workers: result.workers,
+      PROXY_WS_RTT_MS_P50: result.summary.PROXY_WS_RTT_MS_P50,
+      PROXY_WS_RTT_MS_P95: result.summary.PROXY_WS_RTT_MS_P95,
+      start: row.start, end: row.end, text: row.text,
+      AUDIO_DURATION_MS: row.AUDIO_DURATION_MS,
+      SERVER_ENDPOINTING_MS: row.SERVER_ENDPOINTING_MS,
+      SERVER_QUEUE_WAIT_MS: row.SERVER_QUEUE_WAIT_MS,
+      SERVER_MODEL_INFERENCE_MS: row.SERVER_MODEL_INFERENCE_MS,
+      SERVER_POSTPROCESS_MS: row.SERVER_POSTPROCESS_MS,
+      SERVER_EOS_TO_TRANSCRIPT_MS: row.SERVER_EOS_TO_TRANSCRIPT_MS,
+      CLIENT_EOS_TO_TRANSCRIPT_MS: row.CLIENT_EOS_TO_TRANSCRIPT_MS,
+      MODEL_INFERENCE_MS: row.MODEL_INFERENCE_MS,
+      SEGMENT_WAIT_MS: row.SEGMENT_WAIT_MS,
+      SERVER_TO_TRANSCRIPT_MS: row.SERVER_TO_TRANSCRIPT_MS,
+      SERVER_RECEIVE_TO_TRANSCRIPT_MS: row.SERVER_RECEIVE_TO_TRANSCRIPT_MS,
+      SERVER_AUDIO_END_TO_TRANSCRIPT_MS: row.SERVER_AUDIO_END_TO_TRANSCRIPT_MS,
+      CLIENT_AUDIO_END_TO_TRANSCRIPT_MS: row.CLIENT_AUDIO_END_TO_TRANSCRIPT_MS,
+      queue_wait_ms: row.queue_wait_ms, audio_duration_ms: row.audio_duration_ms,
+    }));
+  }
+  for (const sample of result.proxy_ws_rtt_samples) {
+    lines.push(toCsvRow({
+      record_type: "proxy_ws_rtt", timestamp: result.timestamp, backend: result.backend,
+      model_id: result.model_id, gpu: result.gpu, workers: result.workers,
+      PROXY_WS_RTT_MS_P50: result.summary.PROXY_WS_RTT_MS_P50,
+      PROXY_WS_RTT_MS_P95: result.summary.PROXY_WS_RTT_MS_P95,
+      elapsed_ms: sample.elapsed_ms, PROXY_WS_RTT_MS: sample.PROXY_WS_RTT_MS,
+    }));
   }
   download(`asr-benchmark-${new Date().toISOString().replaceAll(":", "-")}.csv`, lines.join("\r\n"), "text/csv;charset=utf-8");
 }

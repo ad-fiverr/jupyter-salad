@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -50,13 +51,13 @@ class BrokerOwnershipTests(unittest.IsolatedAsyncioTestCase):
             try:
                 task_a = asyncio.create_task(broker.transcribe(
                     connection_id="client-a", source="mic", speaker="you", pcm16le=b"A" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=100,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=100, server_eos_at=time.perf_counter(),
                 ))
                 await asyncio.sleep(0.01)
                 self.assertIn("client-a", broker.job_owners.values())
                 task_b = asyncio.create_task(broker.transcribe(
                     connection_id="client-b", source="system", speaker="them", pcm16le=b"B" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=100,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=100, server_eos_at=time.perf_counter(),
                 ))
                 await asyncio.sleep(0.01)
                 self.assertIn("client-b", broker.job_owners.values())
@@ -66,6 +67,12 @@ class BrokerOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result_a["speaker"], "you")
                 self.assertEqual(result_b["speaker"], "them")
                 self.assertIn("MODEL_INFERENCE_MS", result_a)
+                self.assertIn("SERVER_MODEL_INFERENCE_MS", result_a)
+                self.assertIn("SERVER_ENDPOINTING_MS", result_a)
+                self.assertIn("SERVER_QUEUE_WAIT_MS", result_a)
+                self.assertIn("_internal_timing", result_a)
+                self.assertEqual(result_a["AUDIO_DURATION_MS"], 1000.0)
+                self.assertLess(result_a["SERVER_MODEL_INFERENCE_MS"], result_a["AUDIO_DURATION_MS"])
                 self.assertIn("SEGMENT_WAIT_MS", result_b)
                 self.assertEqual(backend_factory.call_count, 2)
                 self.assertEqual(sorted(backend.seen_jobs for backend in backends), [["A"], ["B"]])
@@ -82,7 +89,7 @@ class BrokerOwnershipTests(unittest.IsolatedAsyncioTestCase):
             try:
                 abandoned = asyncio.create_task(broker.transcribe(
                     connection_id="gone", source="mic", speaker="you", pcm16le=b"A" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=100,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=100, server_eos_at=time.perf_counter(),
                 ))
                 await asyncio.sleep(0.005)
                 abandoned.cancel()
@@ -90,7 +97,7 @@ class BrokerOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     await abandoned
                 result = await broker.transcribe(
                     connection_id="survivor", source="mic", speaker="them", pcm16le=b"B" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=100,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=100, server_eos_at=time.perf_counter(),
                 )
                 self.assertEqual(result["text"], "B")
                 self.assertEqual(result["speaker"], "them")
@@ -106,22 +113,22 @@ class BrokerOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 # jobs; at most the configured number may wait in the queues.
                 first = asyncio.create_task(broker.transcribe(
                     connection_id="one", source="mic", speaker="you", pcm16le=b"A" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0, server_eos_at=time.perf_counter(),
                 ))
                 await asyncio.sleep(0.01)
                 second = asyncio.create_task(broker.transcribe(
                     connection_id="two", source="mic", speaker="you", pcm16le=b"A" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0, server_eos_at=time.perf_counter(),
                 ))
                 await asyncio.sleep(0.01)
                 third = asyncio.create_task(broker.transcribe(
                     connection_id="three", source="mic", speaker="you", pcm16le=b"A" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0, server_eos_at=time.perf_counter(),
                 ))
                 await asyncio.sleep(0.01)
                 fourth = asyncio.create_task(broker.transcribe(
                     connection_id="four", source="mic", speaker="you", pcm16le=b"A" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0, server_eos_at=time.perf_counter(),
                 ))
                 with self.assertRaisesRegex(RuntimeError, "inference_queue_full"):
                     await fourth
@@ -136,7 +143,7 @@ class BrokerOwnershipTests(unittest.IsolatedAsyncioTestCase):
             try:
                 result = await parakeet.transcribe(
                     connection_id="parakeet-client", source="mic", speaker="you", pcm16le=b"A" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0, server_eos_at=time.perf_counter(),
                 )
                 self.assertTrue(result["_discarded_historical_output"])
             finally:
@@ -148,7 +155,7 @@ class BrokerOwnershipTests(unittest.IsolatedAsyncioTestCase):
             try:
                 result = await faster_whisper.transcribe(
                     connection_id="fw-client", source="mic", speaker="you", pcm16le=b"A" * 32000,
-                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0,
+                    segment_start_s=0, segment_end_s=1, segment_wait_ms=0, server_eos_at=time.perf_counter(),
                 )
                 self.assertEqual(result["text"], "You!")
                 self.assertNotIn("_discarded_historical_output", result)

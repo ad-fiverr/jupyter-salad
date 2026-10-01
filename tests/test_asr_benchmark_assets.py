@@ -41,6 +41,34 @@ class AsrBenchmarkImageContractTests(unittest.TestCase):
         self.assertIsNotNone(poll)
         self.assertEqual(poll.group(1).count("renderCharts()"), 1)
 
+    def test_live_latency_groups_rtt_control_and_gpu_compute_provenance_are_present(self):
+        telemetry = (ROOT / "asr-lab/asr_lab/telemetry.py").read_text(encoding="utf-8")
+        service = (ROOT / "asr-lab/asr_lab/service.py").read_text(encoding="utf-8")
+        core = (ROOT / "asr-lab/asr_lab/benchmark_web/core.mjs").read_text(encoding="utf-8")
+        app = (ROOT / "asr-lab/asr_lab/benchmark_web/app.mjs").read_text(encoding="utf-8")
+        page = (ROOT / "asr-lab/asr_lab/benchmark_web/index.html").read_text(encoding="utf-8")
+
+        for metric in (
+            "SERVER_ENDPOINTING_MS", "SERVER_QUEUE_WAIT_MS", "SERVER_MODEL_INFERENCE_MS",
+            "SERVER_POSTPROCESS_MS", "SERVER_EOS_TO_TRANSCRIPT_MS", "CLIENT_EOS_TO_TRANSCRIPT_MS",
+        ):
+            self.assertIn(metric, app)
+        for label in (
+            "Audio PCM ms", "Endpointing server ms", "Queue ms", "Model adapter ms",
+            "Postprocess ms", "Server EOS", "Client EOS",
+        ):
+            self.assertIn(label, page)
+        self.assertIn("isinstance(message, BenchmarkPing)", service)
+        self.assertIn('"event": "benchmark_pong"', service)
+        self.assertIn('event: "benchmark_ping"', app)
+        self.assertIn("formatMilliseconds", app)
+        self.assertIn("PROXY_WS_RTT_MS", core)
+        self.assertIn('"gpu_compute"', telemetry)
+        self.assertIn('"gpu_telemetry"', telemetry)
+        self.assertIn('"provider": "torch_fallback"', telemetry)
+        self.assertIn('"backend_attributed": False', telemetry)
+        self.assertNotIn("GPU no disponible", app)
+
     def test_real_fastapi_regression_is_in_the_image_unit_suite(self):
         regression = (ROOT / "asr-lab/tests/test_fastapi_real_import.py").read_text(encoding="utf-8")
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")

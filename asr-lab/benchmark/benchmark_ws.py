@@ -133,6 +133,13 @@ async def run_one(ws_url: str, token: str, fixture: Path) -> dict[str, object]:
     end_to_end_wall_ms = (time.perf_counter() - t0) * 1000
     segment_metrics = [
         {
+            "AUDIO_DURATION_MS": transcript.get("AUDIO_DURATION_MS", transcript.get("audio_duration_ms")),
+            "SERVER_ENDPOINTING_MS": transcript.get("SERVER_ENDPOINTING_MS"),
+            "SERVER_QUEUE_WAIT_MS": transcript.get("SERVER_QUEUE_WAIT_MS", transcript.get("queue_wait_ms")),
+            "SERVER_MODEL_INFERENCE_MS": transcript.get("SERVER_MODEL_INFERENCE_MS", transcript.get("MODEL_INFERENCE_MS")),
+            "SERVER_POSTPROCESS_MS": transcript.get("SERVER_POSTPROCESS_MS"),
+            "SERVER_EOS_TO_TRANSCRIPT_MS": transcript.get("SERVER_EOS_TO_TRANSCRIPT_MS", transcript.get("SERVER_AUDIO_END_TO_TRANSCRIPT_MS")),
+            "CLIENT_EOS_TO_TRANSCRIPT_MS": None,
             "MODEL_INFERENCE_MS": transcript.get("MODEL_INFERENCE_MS"),
             "SEGMENT_WAIT_MS": transcript.get("SEGMENT_WAIT_MS"),
             "SERVER_TO_TRANSCRIPT_MS": transcript.get("SERVER_TO_TRANSCRIPT_MS"),
@@ -145,9 +152,9 @@ async def run_one(ws_url: str, token: str, fixture: Path) -> dict[str, object]:
         for transcript in transcripts
     ]
     inference_values = [
-        float(segment["MODEL_INFERENCE_MS"])
+        float(segment["SERVER_MODEL_INFERENCE_MS"])
         for segment in segment_metrics
-        if isinstance(segment.get("MODEL_INFERENCE_MS"), (int, float))
+        if isinstance(segment.get("SERVER_MODEL_INFERENCE_MS"), (int, float))
     ]
     inference_ms = sum(inference_values) if inference_values else None
     inference_rtf = float(inference_ms) / duration_ms if inference_ms is not None and duration_ms else None
@@ -186,6 +193,9 @@ async def run_one(ws_url: str, token: str, fixture: Path) -> dict[str, object]:
         for segment in segment_metrics
         if isinstance(segment.get("SEGMENT_WAIT_MS"), (int, float))
     ]
+    endpoint_values = [float(s["SERVER_ENDPOINTING_MS"]) for s in segment_metrics if isinstance(s.get("SERVER_ENDPOINTING_MS"), (int, float))]
+    queue_values = [float(s["SERVER_QUEUE_WAIT_MS"]) for s in segment_metrics if isinstance(s.get("SERVER_QUEUE_WAIT_MS"), (int, float))]
+    postprocess_values = [float(s["SERVER_POSTPROCESS_MS"]) for s in segment_metrics if isinstance(s.get("SERVER_POSTPROCESS_MS"), (int, float))]
     return {
         "fixture": fixture.name,
         "ws_url": safe_url,
@@ -196,13 +206,21 @@ async def run_one(ws_url: str, token: str, fixture: Path) -> dict[str, object]:
         "model_load_ms": [item.get("model_load_ms") for item in health.get("worker_metrics", [])],
         "MODEL_STATE_AT_RUN": "warm_model_ready",
         "audio_duration_ms": duration_ms,
+        "AUDIO_DURATION_MS": duration_ms,
         "segments": segment_metrics,
         "segment_count": len(segment_metrics),
         "MODEL_INFERENCE_MS": inference_ms,
         "SEGMENT_WAIT_MS": sum(segment_wait_values) if segment_wait_values else None,
+        "SERVER_ENDPOINTING_MS": sum(endpoint_values) if endpoint_values else None,
+        "SERVER_QUEUE_WAIT_MS": sum(queue_values) if queue_values else None,
+        "SERVER_MODEL_INFERENCE_MS": inference_ms,
+        "SERVER_POSTPROCESS_MS": sum(postprocess_values) if postprocess_values else None,
         "SERVER_TO_TRANSCRIPT_MS": max(server_values) if server_values else None,
         "SERVER_RECEIVE_TO_TRANSCRIPT_MS": max(server_receive_values) if server_receive_values else None,
         "SERVER_AUDIO_END_TO_TRANSCRIPT_MS": max(server_audio_end_values) if server_audio_end_values else None,
+        "SERVER_EOS_TO_TRANSCRIPT_MS": max(server_audio_end_values) if server_audio_end_values else None,
+        "CLIENT_EOS_TO_TRANSCRIPT_MS": None,
+        "PROXY_WS_RTT_MS": None,
         "NETWORK_RTT_MS": round(network_rtt_ms, 2),
         "TOTAL_AUDIO_END_TO_TRANSCRIPT_MS": (
             round(total_audio_end_to_transcript_ms, 2)
@@ -211,6 +229,17 @@ async def run_one(ws_url: str, token: str, fixture: Path) -> dict[str, object]:
         ),
         "end_to_end_wall_ms": round(end_to_end_wall_ms, 2),
         "MODEL_INFERENCE_RTF": round(inference_rtf, 4) if inference_rtf is not None else None,
+        "metric_definitions": {
+            "AUDIO_DURATION_MS": "fixture PCM duration; not latency",
+            "SERVER_ENDPOINTING_MS": "sum of server-reported last-voice-to-broker intervals across segments",
+            "SERVER_QUEUE_WAIT_MS": "sum of server-reported broker-to-adapter-start intervals across segments",
+            "SERVER_MODEL_INFERENCE_MS": "sum of backend.transcribe adapter wall times across segments",
+            "SERVER_POSTPROCESS_MS": "sum of server post-adapter preparation intervals across segments",
+            "SERVER_EOS_TO_TRANSCRIPT_MS": "maximum per-segment server-only EOS-to-ready interval",
+            "CLIENT_EOS_TO_TRANSCRIPT_MS": "not measured by this fixture CLI; browser-only shadow-VAD metric",
+            "PROXY_WS_RTT_MS": "not measured by this CLI; browser application ping/pong metric",
+            "NETWORK_RTT_MS": "native WebSocket protocol ping frame RTT; distinct from browser application ping/pong",
+        },
         "END_TO_END_RTF": round(end_to_end_rtf, 4) if end_to_end_rtf is not None else None,
         "VRAM_MEASUREMENT": "UNAVAILABLE",
         "DEVICE_GLOBAL_VRAM_OBSERVATIONS": {
@@ -234,9 +263,10 @@ def percentile(values: list[float], fraction: float) -> float | None:
 
 def summarize(rows: list[dict[str, object]]) -> dict[str, object]:
     numeric = (
-        "MODEL_INFERENCE_MS", "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS",
-        "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS",
-        "NETWORK_RTT_MS", "TOTAL_AUDIO_END_TO_TRANSCRIPT_MS",
+        "MODEL_INFERENCE_MS", "SERVER_MODEL_INFERENCE_MS", "SERVER_ENDPOINTING_MS",
+        "SERVER_QUEUE_WAIT_MS", "SERVER_POSTPROCESS_MS", "SERVER_EOS_TO_TRANSCRIPT_MS",
+        "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS", "SERVER_RECEIVE_TO_TRANSCRIPT_MS",
+        "SERVER_AUDIO_END_TO_TRANSCRIPT_MS", "NETWORK_RTT_MS", "TOTAL_AUDIO_END_TO_TRANSCRIPT_MS",
         "MODEL_INFERENCE_RTF", "END_TO_END_RTF",
     )
     summary: dict[str, object] = {
@@ -251,8 +281,10 @@ def summarize(rows: list[dict[str, object]]) -> dict[str, object]:
             for row in rows
             for segment in row.get("segments", [])
             if key in {
-                "MODEL_INFERENCE_MS", "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS",
-                "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS",
+                "MODEL_INFERENCE_MS", "SERVER_MODEL_INFERENCE_MS", "SERVER_ENDPOINTING_MS",
+                "SERVER_QUEUE_WAIT_MS", "SERVER_POSTPROCESS_MS", "SERVER_EOS_TO_TRANSCRIPT_MS",
+                "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS", "SERVER_RECEIVE_TO_TRANSCRIPT_MS",
+                "SERVER_AUDIO_END_TO_TRANSCRIPT_MS",
             }
             and isinstance(segment, dict)
             and isinstance(segment.get(key), (int, float))

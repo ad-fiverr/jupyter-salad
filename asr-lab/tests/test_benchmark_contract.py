@@ -21,15 +21,21 @@ class FakeWebSocket:
             {
                 "event": "transcript", "type": "transcript", "text": "prueba",
                 "backend": "parakeet", "MODEL_INFERENCE_MS": 25.0,
+                "SERVER_MODEL_INFERENCE_MS": 25.0, "SERVER_ENDPOINTING_MS": 35.0,
+                "SERVER_QUEUE_WAIT_MS": 0.02, "SERVER_POSTPROCESS_MS": 9.98,
                 "SEGMENT_WAIT_MS": 10.0, "SERVER_TO_TRANSCRIPT_MS": 30.0,
                 "SERVER_RECEIVE_TO_TRANSCRIPT_MS": 40.0,
+                "SERVER_EOS_TO_TRANSCRIPT_MS": 70.0,
                 "SERVER_AUDIO_END_TO_TRANSCRIPT_MS": 70.0, "audio_duration_ms": 200.0,
             },
             {
                 "event": "transcript", "type": "transcript", "text": "benchmark",
                 "backend": "parakeet", "MODEL_INFERENCE_MS": 5.0,
+                "SERVER_MODEL_INFERENCE_MS": 5.0, "SERVER_ENDPOINTING_MS": 45.0,
+                "SERVER_QUEUE_WAIT_MS": 0.03, "SERVER_POSTPROCESS_MS": 39.97,
                 "SEGMENT_WAIT_MS": 20.0, "SERVER_TO_TRANSCRIPT_MS": 50.0,
                 "SERVER_RECEIVE_TO_TRANSCRIPT_MS": 60.0,
+                "SERVER_EOS_TO_TRANSCRIPT_MS": 90.0,
                 "SERVER_AUDIO_END_TO_TRANSCRIPT_MS": 90.0, "audio_duration_ms": 200.0,
             },
         ]
@@ -143,10 +149,17 @@ class BenchmarkContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["SERVER_TO_TRANSCRIPT_MS"], 50.0)
         self.assertEqual(result["SERVER_RECEIVE_TO_TRANSCRIPT_MS"], 60.0)
         self.assertEqual(result["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"], 90.0)
+        self.assertEqual(result["SERVER_EOS_TO_TRANSCRIPT_MS"], 90.0)
+        self.assertEqual(result["SERVER_ENDPOINTING_MS"], 80.0)
+        self.assertEqual(result["SERVER_QUEUE_WAIT_MS"], 0.05)
+        self.assertEqual(result["SERVER_MODEL_INFERENCE_MS"], 30.0)
+        self.assertEqual(result["SERVER_POSTPROCESS_MS"], 49.95)
         self.assertEqual(result["segments"][0]["SERVER_AUDIO_END_TO_TRANSCRIPT_MS"], 70.0)
         self.assertEqual(result["segment_count"], 2)
         self.assertEqual(result["transcript"], "prueba benchmark")
         self.assertIsInstance(result["NETWORK_RTT_MS"], float)
+        self.assertIsNone(result["PROXY_WS_RTT_MS"])
+        self.assertIn("PROXY_WS_RTT_MS", result["metric_definitions"])
         self.assertIsInstance(result["TOTAL_AUDIO_END_TO_TRANSCRIPT_MS"], float)
         self.assertEqual(result["VRAM_MEASUREMENT"], "UNAVAILABLE")
         self.assertIn("DEVICE_GLOBAL_VRAM_OBSERVATIONS", result)
@@ -155,6 +168,11 @@ class BenchmarkContractTests(unittest.IsolatedAsyncioTestCase):
     def test_unmeasurable_server_metrics_remain_null_in_summary(self):
         summary = benchmark_ws.summarize([{
             "MODEL_INFERENCE_MS": None,
+            "SERVER_MODEL_INFERENCE_MS": None,
+            "SERVER_ENDPOINTING_MS": None,
+            "SERVER_QUEUE_WAIT_MS": None,
+            "SERVER_POSTPROCESS_MS": None,
+            "SERVER_EOS_TO_TRANSCRIPT_MS": None,
             "SEGMENT_WAIT_MS": None,
             "SERVER_TO_TRANSCRIPT_MS": None,
             "SERVER_RECEIVE_TO_TRANSCRIPT_MS": None,

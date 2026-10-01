@@ -38,10 +38,12 @@ def system_memory_mib(path: str | Path = "/proc/meminfo") -> dict[str, float | N
         return {"total_mib": None, "used_mib": None}
 
 
-def gpu_telemetry(nvml: Any | None = None) -> dict[str, Any]:
-    """Read one NVML snapshot without letting optional metrics break the API."""
-    empty = {
+def _empty_gpu_telemetry(provider: str = "unavailable") -> dict[str, Any]:
+    return {
         "available": False,
+        "provider": provider,
+        "scope": "device_global",
+        "backend_attributed": False,
         "device": None,
         "utilization_pct": None,
         "vram_used_mib": None,
@@ -49,52 +51,111 @@ def gpu_telemetry(nvml: Any | None = None) -> dict[str, Any]:
         "temperature_c": None,
         "power_w": None,
     }
+
+
+def gpu_compute_state(broker: Any, settings: Any) -> dict[str, Any]:
+    """Report CUDA/model compute visibility independently of NVML telemetry."""
+    workers = getattr(broker, "worker_metrics", []) if broker is not None else []
+    snapshots = [
+        worker.get("vram_after_warmup", {})
+        for worker in workers
+        if isinstance(worker, dict)
+    ]
+    detected = next((item for item in snapshots if item.get("available") is True), None)
+    if detected is None:
+        detected = next((item for item in snapshots if item.get("device")), None)
+    available = bool(detected and detected.get("available") is True)
+    return {
+        "available": available,
+        "cuda": available,
+        "device": detected.get("device") if detected else None,
+        "backend": getattr(settings, "backend", None),
+        "model_loaded": bool(broker and getattr(broker, "ready", False)),
+    }
+
+
+def _torch_gpu_fallback(torch_module: Any | None = None) -> dict[str, Any]:
+    """Best-effort global CUDA memory snapshot; never imply model attribution."""
+    try:
+        if torch_module is None:
+            import torch as torch_module
+        cuda = torch_module.cuda
+        if not cuda.is_available():
+            return _empty_gpu_telemetry()
+        device = cuda.get_device_name(0)
+        free, total = cuda.mem_get_info()
+        return {
+            "available": True,
+            "provider": "torch_fallback",
+            "scope": "device_global",
+            "backend_attributed": False,
+            "device": str(device),
+            "utilization_pct": None,
+            "vram_used_mib": round((total - free) / (1024 * 1024), 1),
+            "vram_total_mib": round(total / (1024 * 1024), 1),
+            "temperature_c": None,
+            "power_w": None,
+        }
+    except Exception:
+        return _empty_gpu_telemetry()
+
+
+def gpu_telemetry(nvml: Any | None = None, *, torch_module: Any | None = None) -> dict[str, Any]:
+    """Read NVML if present, otherwise return a safe device-global Torch fallback."""
     initialized = False
     try:
         if nvml is None:
             import pynvml as nvml
         nvml.nvmlInit()
         initialized = True
-        if nvml.nvmlDeviceGetCount() < 1:
-            return empty
-        handle = nvml.nvmlDeviceGetHandleByIndex(0)
+        if nvml.nvmlDeviceGetCount() > 0:
+            handle = nvml.nvmlDeviceGetHandleByIndex(0)
 
-        def read(callable_: Any) -> Any | None:
-            try:
-                return callable_()
-            except Exception:
-                return None
+            def read(callable_: Any) -> Any | None:
+                try:
+                    return callable_()
+                except Exception:
+                    return None
 
-        name = read(lambda: nvml.nvmlDeviceGetName(handle))
-        memory = read(lambda: nvml.nvmlDeviceGetMemoryInfo(handle))
-        utilization = read(lambda: nvml.nvmlDeviceGetUtilizationRates(handle))
-        temperature = read(
-            lambda: nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
-        )
-        power_mw = read(lambda: nvml.nvmlDeviceGetPowerUsage(handle))
-        if isinstance(name, bytes):
-            name = name.decode("utf-8", errors="replace")
-        return {
-            "available": name is not None or memory is not None or utilization is not None,
-            "device": str(name) if name is not None else None,
-            "utilization_pct": int(utilization.gpu) if utilization is not None else None,
-            "vram_used_mib": round(memory.used / (1024 * 1024), 1) if memory is not None else None,
-            "vram_total_mib": round(memory.total / (1024 * 1024), 1) if memory is not None else None,
-            "temperature_c": int(temperature) if temperature is not None else None,
-            "power_w": round(power_mw / 1000.0, 1) if power_mw is not None else None,
-        }
+            name = read(lambda: nvml.nvmlDeviceGetName(handle))
+            memory = read(lambda: nvml.nvmlDeviceGetMemoryInfo(handle))
+            utilization = read(lambda: nvml.nvmlDeviceGetUtilizationRates(handle))
+            temperature = read(
+                lambda: nvml.nvmlDeviceGetTemperature(handle, nvml.NVML_TEMPERATURE_GPU)
+            )
+            power_mw = read(lambda: nvml.nvmlDeviceGetPowerUsage(handle))
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            if name is not None or memory is not None or utilization is not None:
+                return {
+                    "available": True,
+                    "provider": "nvml",
+                    "scope": "device_global",
+                    "backend_attributed": False,
+                    "device": str(name) if name is not None else None,
+                    "utilization_pct": int(utilization.gpu) if utilization is not None else None,
+                    "vram_used_mib": round(memory.used / (1024 * 1024), 1) if memory is not None else None,
+                    "vram_total_mib": round(memory.total / (1024 * 1024), 1) if memory is not None else None,
+                    "temperature_c": int(temperature) if temperature is not None else None,
+                    "power_w": round(power_mw / 1000.0, 1) if power_mw is not None else None,
+                }
     except Exception:
-        return empty
+        pass
     finally:
         if initialized:
             try:
                 nvml.nvmlShutdown()
             except Exception:
                 pass
+    return _torch_gpu_fallback(torch_module)
 
 
 def collect_telemetry(broker: Any, settings: Any) -> dict[str, Any]:
     """Return an allowlisted schema; never include environment or process args."""
+    compute = gpu_compute_state(broker, settings)
+    gpu = gpu_telemetry()
+    if not gpu.get("device") and compute.get("device"):
+        gpu["device"] = compute["device"]
     return {
         "schema_version": 1,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -107,5 +168,8 @@ def collect_telemetry(broker: Any, settings: Any) -> dict[str, Any]:
         "queue_depth": getattr(broker, "queued_jobs", None) if broker is not None else 0,
         "process_rss_mib": process_rss_mib(),
         "system_ram": system_memory_mib(),
-        "gpu": gpu_telemetry(),
+        "gpu_compute": compute,
+        "gpu_telemetry": gpu,
+        # Backwards-compatible telemetry alias; provider/scope identify it.
+        "gpu": gpu,
     }
