@@ -41,6 +41,16 @@ class AsrBenchmarkImageContractTests(unittest.TestCase):
         self.assertIsNotNone(poll)
         self.assertEqual(poll.group(1).count("renderCharts()"), 1)
 
+    def test_real_fastapi_regression_is_in_the_image_unit_suite(self):
+        regression = (ROOT / "asr-lab/tests/test_fastapi_real_import.py").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn('from asr_lab.service import app', regression)
+        self.assertIn('version("fastapi") == "0.142.1"', regression)
+        self.assertIn('get("/asr/benchmark")', regression)
+        self.assertIn('get("/asr/benchmark/app.mjs")', regression)
+        self.assertIn('get("/asr/benchmark/not-allowlisted")', regression)
+        self.assertIn("-s /opt/asr-lab/tests -v", dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()

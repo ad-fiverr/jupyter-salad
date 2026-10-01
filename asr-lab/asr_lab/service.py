@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import FastAPI, Header, Query, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.responses import Response
 
 from .broker import InferenceBroker
 from .buffering import AudioBuffer, INACTIVITY_FLUSH_SECONDS
@@ -82,8 +83,8 @@ async def benchmark_page() -> FileResponse:
     return FileResponse(BENCHMARK_WEB_ROOT / "index.html", headers=BENCHMARK_HEADERS)
 
 
-@app.get("/asr/benchmark/{asset_name}", include_in_schema=False)
-async def benchmark_asset(asset_name: str) -> FileResponse | JSONResponse:
+@app.get("/asr/benchmark/{asset_name}", include_in_schema=False, response_model=None)
+async def benchmark_asset(asset_name: str) -> Response:
     if asset_name not in BENCHMARK_ASSETS:
         return JSONResponse({"detail": "Not found"}, status_code=404, headers=BENCHMARK_HEADERS)
     return FileResponse(BENCHMARK_WEB_ROOT / asset_name, headers=BENCHMARK_HEADERS)
