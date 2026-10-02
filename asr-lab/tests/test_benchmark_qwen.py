@@ -17,6 +17,7 @@ from benchmark.benchmark_ws import (
     resolve_concurrency_levels,
     run_one,
     summarize,
+    _worker_warmup_chunk_ms,
 )
 
 
@@ -295,6 +296,10 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
                 if message.get("event") == "stream_start":
                     await self.messages.put(json.dumps({
                         "event": "stream_started", "stream_id": "stream-fixture",
+                        "model_chunk_ms": 250, "audio_push_interval_ms": 100,
+                        "effective_max_backlog_ms": 1000, "qwen_max_backlog_chunks": 4,
+                        "FIRST_STREAM_INIT_MS": 7, "FIRST_STREAM_STATE_INIT_WALL_MS": 2,
+                        "FIRST_STREAM_INIT_RPC_OVERHEAD_MS": 5,
                     }))
                 elif "audio" in message:
                     self.audio_sends += 1
@@ -305,6 +310,16 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
                             "truth_status": "candidate_only", "provisional": True, "final": False,
                             "QWEN_SCHEDULER_WAIT_MS": 8,
                             "QWEN_DECODE_CALL_WALL_MS": 90,
+                            "FIRST_AUDIO_TO_FIRST_DECODE_READY_MS": 10,
+                            "FIRST_SCHEDULER_WAIT_MS": 3,
+                            "FIRST_AUDIO_TO_FIRST_DECODE_START_MS": 13,
+                            "EPOCH_FIRST_DECODE_WALL_MS": 90,
+                            "QWEN_DECODE_SLO_TARGET_MS": 100,
+                            "QWEN_DECODE_SLO_VIOLATION": False,
+                            "SERVER_FIRST_PARTIAL_MS": 13,
+                            "FIRST_PARTIAL_MS": 13,
+                            "QWEN_CUMULATIVE_DECODE_WALL_MS": 90,
+                            "QWEN_STREAM_RTF": 0.18,
                         }))
                     elif self.audio_sends == 3:
                         await self.messages.put(json.dumps({
@@ -354,7 +369,19 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
             pass
 
         fake_websockets = SimpleNamespace(connect=lambda *_args, **_kwargs: ws)
-        health_response = HttpResponse({"backend": "qwen3_asr", "model_id": "Qwen/Qwen3-ASR-1.7B"})
+        readiness_response = HttpResponse({"ready": True})
+        health_response = HttpResponse({
+            "backend": "qwen3_asr", "model_id": "Qwen/Qwen3-ASR-1.7B",
+            "model_revision": "revision-fixture", "runtime_provenance": {
+                "qwen_asr_version": "0.0.6", "vllm_version": "0.14.0",
+                "transformers_version": "fixture-transformers", "torch_version": "fixture-torch",
+                "torch_cuda_version": "fixture-cuda", "experiment_config": {"warmup_chunk_ms": 1000},
+            },
+            "worker_metrics": [{
+                "model_load_ms": 42, "warmup_ms": 5,
+                "experiment_config": {"warmup_chunk_ms": 1000},
+            }],
+        })
 
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = Path(temp_dir) / "fixture.wav"
@@ -367,13 +394,38 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
 
             with (
                 patch.dict(sys.modules, {"websockets": fake_websockets}),
-                patch("urllib.request.urlopen", return_value=health_response),
+                patch("urllib.request.urlopen", side_effect=[readiness_response, health_response]),
             ):
                 row = asyncio.run(run_one("ws://localhost/asr/ws", "token", fixture, qwen_chunk_ms=250))
 
         self.assertEqual(row["run_status"], "failed")
         self.assertIsNone(row["final_candidate"])
         self.assertIsNone(row["FINAL_CANDIDATE_WER"])
+        self.assertTrue(row["readiness_at_start"]["ready"])
+        self.assertEqual(row["MODEL_STATE_AT_RUN"], "warm_model_ready")
+        self.assertEqual(row["model_revision"], "revision-fixture")
+        self.assertEqual(row["model_load_ms"], [42])
+        self.assertEqual(row["warmup_ms"], [5])
+        self.assertEqual(row["warmup_chunk_ms"], [1000])
+        self.assertEqual(row["model_id"], "Qwen/Qwen3-ASR-1.7B")
+        self.assertEqual(row["runtime_provenance"]["qwen_asr_version"], "0.0.6")
+        self.assertEqual(row["runtime_provenance"]["vllm_version"], "0.14.0")
+        self.assertEqual(row["runtime_provenance"]["transformers_version"], "fixture-transformers")
+        self.assertEqual(row["runtime_provenance"]["torch_version"], "fixture-torch")
+        self.assertEqual(row["runtime_provenance"]["torch_cuda_version"], "fixture-cuda")
+        self.assertEqual(row["streaming"]["effective_max_backlog_ms"], 1000)
+        self.assertEqual(row["streaming"]["qwen_max_backlog_chunks"], 4)
+        self.assertEqual(row["streaming"]["FIRST_STREAM_INIT_MS"], 7)
+        self.assertEqual(row["streaming"]["FIRST_STREAM_INIT_RPC_OVERHEAD_MS"], 5)
+        self.assertEqual(row["streaming"]["FIRST_AUDIO_TO_FIRST_DECODE_START_MS"], 13)
+        self.assertEqual(row["streaming"]["EPOCH_FIRST_DECODE_WALL_MS"], 90)
+        self.assertFalse(row["streaming"]["QWEN_DECODE_SLO_VIOLATION"])
+        self.assertEqual(row["streaming"]["SERVER_FIRST_PARTIAL_MS"], 13)
+        self.assertEqual(row["streaming"]["FIRST_PARTIAL_MS"], 13)
+        self.assertEqual(row["streaming"]["QWEN_CUMULATIVE_DECODE_WALL_MS"], 90)
+        self.assertEqual(row["streaming"]["QWEN_STREAM_RTF"], 0.18)
+        self.assertIsInstance(row["streaming"]["CLIENT_FIRST_PARTIAL_MS"], (int, float))
+        self.assertGreaterEqual(row["streaming"]["CLIENT_FIRST_PARTIAL_MS"], 0)
         self.assertEqual(row["streaming"]["QWEN_SCHEDULER_WAIT_MS_P50"], 12)
         self.assertEqual(row["streaming"]["QWEN_SCHEDULER_WAIT_MS_P95"], 18)
         self.assertEqual(row["streaming"]["QWEN_SCHEDULER_WAIT_JOB_SAMPLE_COUNT"], 3)
@@ -412,6 +464,11 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(wer_summary["FINAL_CANDIDATE_WER_P95"], 0.25)
         self.assertEqual(wer_summary["failed_runs"], 1)
         self.assertEqual(wer_summary["scheduler"]["scheduler_wait_job_sample_count_per_run"]["max"], 3)
+
+    def test_warmup_chunk_top_level_legacy_schema_remains_supported(self):
+        self.assertEqual(_worker_warmup_chunk_ms({"warmup_chunk_ms": 750}), 750)
+        self.assertEqual(_worker_warmup_chunk_ms({"experiment_config": {"warmup_chunk_ms": 500}}), 500)
+        self.assertIsNone(_worker_warmup_chunk_ms({}))
 
 
 if __name__ == "__main__":

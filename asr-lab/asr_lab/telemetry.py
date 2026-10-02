@@ -187,7 +187,7 @@ def collect_telemetry(
                 "qwen_scheduler_wait_p95_ms", "qwen_scheduler_wait_max_ms",
                 "qwen_decode_wall_p50_ms", "qwen_decode_wall_p95_ms",
                 "qwen_decode_steps_delta_total", "qwen_scheduler_overrun_total",
-                "qwen_decode_budget_overrun_total",
+                "qwen_decode_budget_overrun_total", "qwen_decode_slo_violation_total",
             )
         }
     return snapshot

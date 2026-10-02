@@ -14,7 +14,8 @@ MODEL_REVISIONS = {
 }
 QWEN_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
 QWEN_MODEL_REVISION = "7278e1e70fe206f11671096ffdd38061171dd6e5"
-QWEN_STREAM_CHUNK_MS_VALUES = (250, 500, 1000, 2000)
+QWEN_MODEL_CHUNK_MS_VALUES = (50, 100, 150, 200, 250, 500, 1000, 2000)
+QWEN_STREAM_CHUNK_MS_VALUES = QWEN_MODEL_CHUNK_MS_VALUES
 QWEN_LANGUAGE_CODES = frozenset({
     "auto", "zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it",
     "ko", "ru", "th", "vi", "ja", "tr", "hi", "ms", "nl", "sv", "da",
@@ -37,7 +38,12 @@ class Settings:
     max_pending_per_connection: int
     error: str | None = None
     test_no_model: bool = False
-    qwen_stream_chunk_ms: int = 1000
+    qwen_model_chunk_ms: int = 1000
+
+    @property
+    def qwen_stream_chunk_ms(self) -> int:
+        """Read-only compatibility alias for the old environment name."""
+        return self.qwen_model_chunk_ms
     qwen_unfixed_chunk_num: int = 2
     qwen_unfixed_token_num: int = 5
     qwen_language: str = "auto"
@@ -145,13 +151,31 @@ class Settings:
         qwen_session_idle_ttl_seconds = 120.0
         qwen_max_context_chars = 512
         if qwen_streaming_enabled:
-            raw_qwen_chunk = env.get("QWEN_STREAM_CHUNK_MS", "1000")
-            try:
-                qwen_chunk_ms = int(raw_qwen_chunk)
-                if qwen_chunk_ms not in QWEN_STREAM_CHUNK_MS_VALUES:
-                    raise ValueError
-            except (TypeError, ValueError):
-                errors.append("invalid_qwen_stream_chunk_ms")
+            canonical_present = "QWEN_MODEL_CHUNK_MS" in env
+            legacy_present = "QWEN_STREAM_CHUNK_MS" in env
+            def qwen_chunk(name: str) -> int | None:
+                raw = env.get(name, "1000")
+                if not isinstance(raw, str) or not raw.isascii() or not raw.isdecimal():
+                    errors.append("invalid_qwen_model_chunk_ms")
+                    return None
+                value = int(raw)
+                if value not in QWEN_MODEL_CHUNK_MS_VALUES:
+                    errors.append("invalid_qwen_model_chunk_ms")
+                    return None
+                return value
+            canonical = qwen_chunk("QWEN_MODEL_CHUNK_MS") if canonical_present else None
+            legacy = qwen_chunk("QWEN_STREAM_CHUNK_MS") if legacy_present else None
+            if canonical_present and legacy_present:
+                if canonical is None or legacy is None:
+                    pass
+                elif canonical != legacy:
+                    errors.append("conflicting_qwen_model_chunk_ms")
+                else:
+                    qwen_chunk_ms = canonical
+            elif canonical_present:
+                qwen_chunk_ms = canonical if canonical is not None else 1000
+            elif legacy_present:
+                qwen_chunk_ms = legacy if legacy is not None else 1000
 
             qwen_language = env.get("QWEN_LANGUAGE", "auto").strip().lower()
             if qwen_language not in QWEN_LANGUAGE_CODES:
@@ -191,7 +215,7 @@ class Settings:
             max_pending_per_connection=integer("ASR_MAX_PENDING_PER_CONNECTION", 2, 1, 4),
             error=errors[0] if errors else None,
             test_no_model=test_no_model and env.get("CI", "").lower() == "true",
-            qwen_stream_chunk_ms=qwen_chunk_ms,
+            qwen_model_chunk_ms=qwen_chunk_ms,
             qwen_unfixed_chunk_num=qwen_unfixed_chunk_num,
             qwen_unfixed_token_num=qwen_unfixed_token_num,
             qwen_language=qwen_language,

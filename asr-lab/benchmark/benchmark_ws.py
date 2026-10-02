@@ -17,7 +17,8 @@ import wave
 from pathlib import Path
 
 SAMPLE_RATE = 16_000
-CHUNK_SAMPLES = 1_600  # 100 ms, like the historical AudioWorklet client.
+AUDIO_PUSH_INTERVAL_MS = 100
+CHUNK_SAMPLES = SAMPLE_RATE * AUDIO_PUSH_INTERVAL_MS // 1000
 
 
 class BenchmarkRunError(RuntimeError):
@@ -44,6 +45,7 @@ _TERMINAL_SCHEDULER_NUMERIC_FIELDS = {
     "stream_pending_jobs", "active_stream_count", "backlog_audio_ms",
     "stream_lag_ms", "max_backlog_audio_ms", "max_stream_lag_ms",
     "accepted_audio_total_ms", "dispatched_audio_total_ms", "overrun_limit_value",
+    "effective_max_backlog_ms", "qwen_max_backlog_chunks", "model_chunk_ms",
     "scheduler_metric_history_limit",
 }
 
@@ -102,10 +104,25 @@ def read_fixture(path: Path) -> tuple[bytes, float]:
     return pcm, duration_ms
 
 
+def readiness_url(ws_url: str) -> str:
+    parsed = urllib.parse.urlsplit(ws_url)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    return urllib.parse.urlunsplit((scheme, parsed.netloc, "/asr/readiness", "", ""))
+
+
 def health_url(ws_url: str) -> str:
     parsed = urllib.parse.urlsplit(ws_url)
     scheme = "https" if parsed.scheme == "wss" else "http"
     return urllib.parse.urlunsplit((scheme, parsed.netloc, "/asr/health", "", ""))
+
+
+def _worker_warmup_chunk_ms(worker_metric: object) -> object:
+    if not isinstance(worker_metric, dict):
+        return None
+    experiment = worker_metric.get("experiment_config")
+    if isinstance(experiment, dict) and experiment.get("warmup_chunk_ms") is not None:
+        return experiment["warmup_chunk_ms"]
+    return worker_metric.get("warmup_chunk_ms")
 
 
 def build_ws_url(ws_url: str, token: str) -> str:
@@ -230,6 +247,11 @@ async def run_one(
     reference = reference_file.read_text(encoding="utf-8").strip() if reference_file.exists() else None
     url = build_ws_url(ws_url, token)
     try:
+        with urllib.request.urlopen(readiness_url(ws_url), timeout=5) as response:
+            readiness = json.load(response)
+    except Exception:
+        readiness = {"ready": False}
+    try:
         with urllib.request.urlopen(health_url(ws_url), timeout=5) as response:
             health = json.load(response)
     except Exception:
@@ -241,6 +263,7 @@ async def run_one(
     t0 = time.perf_counter()
     client_eos_at: float | None = None
     expected_stream_id: str | None = None
+    started_message: dict[str, object] = {}
     terminal_event = asyncio.Event()
     async with websockets.connect(url, ping_interval=30, ping_timeout=20, max_size=1_048_576) as ws:
         ping_started = time.perf_counter()
@@ -255,7 +278,7 @@ async def run_one(
                 "request_id": start_request_id,
                 "language": qwen_language,
                 "context": qwen_context,
-                "chunk_size_ms": qwen_chunk_ms,
+                "model_chunk_ms": qwen_chunk_ms,
             }, separators=(",", ":")))
             started_message = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
             if started_message.get("event") != "stream_started":
@@ -272,7 +295,7 @@ async def run_one(
             expected_stream_id=expected_stream_id if backend == "qwen3_asr" else None,
             terminal_event=terminal_event if backend == "qwen3_asr" else None,
         ))
-        audio_started_at = time.perf_counter()
+        audio_started_at: float | None = None
         for offset in range(0, len(pcm), CHUNK_SAMPLES * 2):
             if backend == "qwen3_asr" and terminal_event.is_set():
                 break
@@ -284,6 +307,8 @@ async def run_one(
                 "sample_rate": SAMPLE_RATE,
                 "audio": base64.b64encode(chunk).decode("ascii"),
             }
+            if audio_started_at is None:
+                audio_started_at = time.perf_counter()
             await ws.send(json.dumps(payload, separators=(",", ":")))
             await asyncio.sleep(len(chunk) / (SAMPLE_RATE * 2))
         # Chunks are sent at real-time cadence. The timestamp after the final
@@ -305,6 +330,10 @@ async def run_one(
         (candidate for candidate in reversed(candidates) if _valid_final_candidate(candidate)),
         {},
     ) if is_qwen else {}
+    qwen_diag: dict[str, object] = dict(started_message) if is_qwen else {}
+    if is_qwen and partials:
+        qwen_diag.update(partials[-1])
+    qwen_diag.update(qwen_final)
     terminal_scheduler_metrics = next(
         (
             error.get("scheduler", {}).get("terminal_metrics", {})
@@ -317,7 +346,9 @@ async def run_one(
     ) if is_qwen else {}
 
     def qwen_metric(candidate_field: str, terminal_field: str) -> object:
-        value = qwen_final.get(candidate_field)
+        value = qwen_diag.get(candidate_field)
+        if value is None:
+            value = qwen_diag.get(candidate_field.lower())
         if value is not None:
             return value
         return terminal_scheduler_metrics.get(terminal_field)
@@ -424,10 +455,10 @@ async def run_one(
         for previous, current in zip(partials, partials[1:])
     ]
     first_partial_client_ms = (
-        max(0.0, (float(partials[0]["client_received_at"]) - audio_started_at) * 1000)
+        max(0.0, (float(partials[0]["client_received_at"]) - (audio_started_at if audio_started_at is not None else float(partials[0]["client_received_at"]))) * 1000)
         if partials else None
     )
-    qwen_cumulative_decode_ms = qwen_final.get("QWEN_CUMULATIVE_DECODE_WALL_MS")
+    qwen_cumulative_decode_ms = qwen_diag.get("QWEN_CUMULATIVE_DECODE_WALL_MS")
     scheduler_events = [*partials, *candidates]
     scheduler_waits = [
         float(item["QWEN_SCHEDULER_WAIT_MS"])
@@ -474,9 +505,12 @@ async def run_one(
         "model_id": health.get("model_id"),
         "model_revision": health.get("model_revision"),
         "runtime_provenance": health.get("runtime_provenance"),
+        "readiness_at_start": readiness,
         "gpu": [item.get("vram_after_warmup", {}).get("device") for item in health.get("worker_metrics", [])],
         "model_load_ms": [item.get("model_load_ms") for item in health.get("worker_metrics", [])],
-        "MODEL_STATE_AT_RUN": "warm_model_ready",
+        "warmup_ms": [item.get("warmup_ms") for item in health.get("worker_metrics", [])],
+        "warmup_chunk_ms": [_worker_warmup_chunk_ms(item) for item in health.get("worker_metrics", [])],
+        "MODEL_STATE_AT_RUN": "warm_model_ready" if readiness.get("ready") is True else "readiness_not_confirmed",
         "audio_duration_ms": duration_ms,
         "AUDIO_DURATION_MS": duration_ms,
         "benchmark_concurrency": benchmark_concurrency,
@@ -486,11 +520,26 @@ async def run_one(
             "streaming_class": "accumulated-audio-pseudostreaming" if is_qwen else None,
             "audio_push_interval_ms": 100 if is_qwen else None,
             "model_decode_chunk_ms": qwen_chunk_ms if is_qwen else None,
+            "effective_max_backlog_ms": qwen_diag.get("EFFECTIVE_MAX_BACKLOG_MS", qwen_diag.get("effective_max_backlog_ms")) if is_qwen else None,
+            "qwen_max_backlog_chunks": qwen_diag.get("QWEN_MAX_BACKLOG_CHUNKS", qwen_diag.get("qwen_max_backlog_chunks")) if is_qwen else None,
+            "FIRST_STREAM_INIT_MS": qwen_diag.get("FIRST_STREAM_INIT_MS") if is_qwen else None,
+            "FIRST_STREAM_STATE_INIT_WALL_MS": qwen_diag.get("FIRST_STREAM_STATE_INIT_WALL_MS") if is_qwen else None,
+            "FIRST_STREAM_INIT_RPC_OVERHEAD_MS": qwen_diag.get("FIRST_STREAM_INIT_RPC_OVERHEAD_MS") if is_qwen else None,
+            "FIRST_AUDIO_TO_FIRST_DECODE_READY_MS": qwen_diag.get("FIRST_AUDIO_TO_FIRST_DECODE_READY_MS") if is_qwen else None,
+            "FIRST_SCHEDULER_WAIT_MS": qwen_diag.get("FIRST_SCHEDULER_WAIT_MS") if is_qwen else None,
+            "FIRST_AUDIO_TO_FIRST_DECODE_START_MS": qwen_diag.get("FIRST_AUDIO_TO_FIRST_DECODE_START_MS") if is_qwen else None,
+            "EPOCH_FIRST_DECODE_WALL_MS": qwen_diag.get("EPOCH_FIRST_DECODE_WALL_MS") if is_qwen else None,
+            "EPOCH_SECOND_DECODE_WALL_MS": qwen_diag.get("EPOCH_SECOND_DECODE_WALL_MS") if is_qwen else None,
+            "EPOCH_STEADY_DECODE_WALL_P50_MS": qwen_diag.get("EPOCH_STEADY_DECODE_WALL_P50_MS") if is_qwen else None,
+            "EPOCH_STEADY_DECODE_WALL_P95_MS": qwen_diag.get("EPOCH_STEADY_DECODE_WALL_P95_MS") if is_qwen else None,
+            "QWEN_DECODE_SLO_TARGET_MS": qwen_diag.get("QWEN_DECODE_SLO_TARGET_MS") if is_qwen else None,
+            "QWEN_DECODE_SLO_VIOLATION": qwen_diag.get("QWEN_DECODE_SLO_VIOLATION") if is_qwen else None,
             "language": qwen_language if is_qwen else None,
             "QWEN_STREAM_ID": expected_stream_id if is_qwen else None,
             "partial_count": len(partials),
             "partials": partials,
             "FIRST_PARTIAL_MS": partials[0].get("FIRST_PARTIAL_MS") if partials else None,
+            "SERVER_FIRST_PARTIAL_MS": partials[0].get("SERVER_FIRST_PARTIAL_MS") if partials else None,
             "CLIENT_FIRST_PARTIAL_MS": first_partial_client_ms,
             "PARTIAL_INTERVAL_MS_P50": statistics.median(partial_intervals) if partial_intervals else None,
             "PARTIAL_STABILITY": partials[-1].get("PARTIAL_STABILITY") if partials else None,
@@ -499,7 +548,7 @@ async def run_one(
             "CLIENT_EOS_TO_FINAL_CANDIDATE_MS": client_eos_to_candidate_ms,
             "QWEN_DECODE_CALL_WALL_MS_SUM": qwen_cumulative_decode_ms,
             "QWEN_CUMULATIVE_DECODE_WALL_MS": qwen_cumulative_decode_ms,
-            "QWEN_STREAM_RTF": qwen_final.get("QWEN_STREAM_RTF"),
+            "QWEN_STREAM_RTF": qwen_diag.get("QWEN_STREAM_RTF"),
             "QWEN_SCHEDULER_WAIT_MS_P50": qwen_metric("QWEN_SCHEDULER_WAIT_P50_MS", "scheduler_wait_p50_ms"),
             "QWEN_SCHEDULER_WAIT_MS_P95": qwen_metric("QWEN_SCHEDULER_WAIT_P95_MS", "scheduler_wait_p95_ms"),
             "QWEN_SCHEDULER_WAIT_JOB_SAMPLE_COUNT": qwen_metric("QWEN_SCHEDULER_WAIT_SAMPLE_COUNT", "scheduler_wait_sample_count"),
@@ -1002,7 +1051,7 @@ async def main() -> None:
     parser.add_argument("fixtures", nargs="+", type=Path)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--qwen-chunk-ms", type=int, choices=(250, 500, 1000, 2000), default=1000)
+    parser.add_argument("--qwen-model-chunk-ms", "--qwen-chunk-ms", dest="qwen_chunk_ms", type=int, choices=(50, 100, 150, 200, 250, 500, 1000, 2000), default=1000)
     parser.add_argument("--qwen-language", default="auto")
     parser.add_argument("--qwen-context", default="")
     parser.add_argument(
@@ -1072,4 +1121,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

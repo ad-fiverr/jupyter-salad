@@ -677,5 +677,34 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(TOKEN not in message for message in records))
 
 
+    async def test_conflicting_model_chunk_fields_fail_before_runtime_open(self):
+        service = self.setup_service()
+        service.settings = Settings.from_env({
+            "ASR_BACKEND": "parakeet", "ASR_API_TOKEN": TOKEN,
+            "QWEN_STREAMING_ENABLED": "1", "QWEN_STREAMING_RUNTIME_AVAILABLE": "1",
+        })
+        class Runtime:
+            ready = True
+            opened = 0
+            async def open_session(self, **_kwargs):
+                self.opened += 1
+                return {"event": "stream_started"}
+            async def close_connection(self, _connection_id):
+                return None
+        runtime = Runtime()
+        service.qwen_runtime = runtime
+        socket = FakeWebSocket([
+            {"type": "websocket.receive", "text": json.dumps({
+                "event": "stream_start", "source": "mic", "model_chunk_ms": 50,
+                "chunk_size_ms": 100,
+            })},
+            {"type": "websocket.disconnect"},
+        ])
+        await service.websocket_asr(socket, token=TOKEN)
+        errors = [item for item in socket.sent if item.get("event") == "error"]
+        self.assertEqual(errors[0]["code"], "conflicting_model_chunk")
+        self.assertEqual(runtime.opened, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

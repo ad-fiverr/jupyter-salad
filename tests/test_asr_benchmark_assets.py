@@ -146,5 +146,29 @@ class QwenBuildArtifactContractTests(unittest.TestCase):
         self.assertIn("weights=NOT_LOADED", smoke)
 
 
+    def test_qwen_chunk_default_is_not_synthesized_by_entrypoint_or_docker(self):
+        entrypoint = (ROOT / "salad-jupyter-entrypoint.sh").read_text(encoding="utf-8")
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertNotRegex(entrypoint, r"QWEN_(?:MODEL|STREAM)_CHUNK_MS")
+        self.assertNotRegex(dockerfile, r"ENV\s+QWEN_(?:MODEL|STREAM)_CHUNK_MS")
+        self.assertNotIn("QWEN_MODEL_CHUNK_MS=${QWEN_STREAM_CHUNK_MS", entrypoint)
+
+    def test_browser_json_export_keeps_safe_qwen_startup_provenance_without_candidates(self):
+        core = (ROOT / "asr-lab/asr_lab/benchmark_web/core.mjs").read_text(encoding="utf-8")
+        app = (ROOT / "asr-lab/asr_lab/benchmark_web/app.mjs").read_text(encoding="utf-8")
+        self.assertIn("export function safeQwenStartupEvidence", core)
+        self.assertIn("startup_evidence: safeQwenStartupEvidence({", app)
+        for field in (
+            "readinessAtStart: state.readinessAtStart", "qwenStartMetrics: state.qwenStartMetrics",
+            "health: state.health", "model_load_ms", "warmup_ms", "warmup_chunk_ms",
+            "runtime_provenance", "FIRST_STREAM_INIT_MS", "FIRST_STREAM_STATE_INIT_WALL_MS",
+            "FIRST_STREAM_INIT_RPC_OVERHEAD_MS",
+        ):
+            self.assertIn(field, core + app)
+        safe_result = app[app.index("function safeResult()") : app.index("function download(")]
+        self.assertIn("startup_evidence: safeQwenStartupEvidence", safe_result)
+        self.assertLess(safe_result.index("startup_evidence:"), safe_result.index("streaming:"))
+
+
 if __name__ == "__main__":
     unittest.main()

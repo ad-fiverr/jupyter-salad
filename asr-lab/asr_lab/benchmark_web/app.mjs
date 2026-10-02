@@ -1,7 +1,7 @@
 import {
-  METRIC_DEFINITIONS, ShadowVad, boundedPush, canvasBackingSize, csvCell, formatMilliseconds, gpuStatusLabel,
+  AUDIO_PUSH_INTERVAL_MS, METRIC_DEFINITIONS, ShadowVad, boundedPush, clientFirstPartialMs, canvasBackingSize, csvCell, decodeSloLabel, formatMilliseconds, gpuStatusLabel,
   isTerminalQwenError, median, percentile, qwenDeviceTelemetryLabel, rttPercentiles, wordErrorRate,
-  shouldDrawCanvas,
+  shouldDrawCanvas, safeQwenStartupEvidence,
 } from "/asr/benchmark/core.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -53,7 +53,11 @@ const state = {
   lastPartialAt: null,
   clientEosAt: null,
   clientFinalizationMs: null,
-  qwenChunkMs: null,
+  qwenChunkMs: 1000,
+  effectiveMaxBacklogMs: null,
+  firstAudioSentAt: null,
+  readinessAtStart: null,
+  qwenStartMetrics: null,
   qwenLanguage: "auto",
   qwenContext: "",
 };
@@ -196,6 +200,8 @@ function updateQwenSummary() {
   $("qwen-wait-percentiles").textContent = `${fmtMs(scheduler.qwen_scheduler_wait_p50_ms)} / ${fmtMs(scheduler.qwen_scheduler_wait_p95_ms)}`;
   $("qwen-stream-lag").textContent = `${fmtMs(latestEvent.STREAM_LAG_MS)} / ${fmtMs(latestEvent.STREAM_LAG_MAX_MS ?? scheduler.qwen_scheduler_max_stream_lag_ms)}`;
   $("qwen-overruns").textContent = `${scheduler.qwen_decode_budget_overrun_total ?? "—"} / ${scheduler.qwen_scheduler_overrun_total ?? "—"}`;
+  const startMetrics = state.qwenStartMetrics ?? {};
+  $("qwen-cadence-latency").textContent = `init ${fmtMs(startMetrics.FIRST_STREAM_INIT_MS)} (worker ${fmtMs(startMetrics.FIRST_STREAM_STATE_INIT_WALL_MS)}, RPC overhead ${fmtMs(startMetrics.FIRST_STREAM_INIT_RPC_OVERHEAD_MS)}); first ready ${fmtMs(latestEvent.FIRST_AUDIO_TO_FIRST_DECODE_READY_MS)} + wait ${fmtMs(latestEvent.FIRST_SCHEDULER_WAIT_MS)} = start ${fmtMs(latestEvent.FIRST_AUDIO_TO_FIRST_DECODE_START_MS)}; decode #1 ${fmtMs(latestEvent.EPOCH_FIRST_DECODE_WALL_MS)}, #2 ${fmtMs(latestEvent.EPOCH_SECOND_DECODE_WALL_MS)}, steady p50/p95 ${fmtMs(latestEvent.EPOCH_STEADY_DECODE_WALL_P50_MS)} / ${fmtMs(latestEvent.EPOCH_STEADY_DECODE_WALL_P95_MS)}; first partial client/server ${fmtMs(first?.CLIENT_FIRST_PARTIAL_MS)} / ${fmtMs(first?.SERVER_FIRST_PARTIAL_MS)}; bound ${fmtMs(latestEvent.EFFECTIVE_MAX_BACKLOG_MS ?? state.effectiveMaxBacklogMs)}; SLO 100 ms ${decodeSloLabel(latestEvent.QWEN_DECODE_SLO_VIOLATION)}`;
   // collectTelemetry flattens GPU fields onto each point; keep the device
   // attribution explicitly global instead of expecting a nested snapshot.
   $("qwen-device-telemetry").textContent = qwenDeviceTelemetryLabel(latestTelemetry);
@@ -239,7 +245,7 @@ function renderQwenPartials() {
   $("qwen-stream-meta").textContent = [
     "stream=" + String(state.streamId ?? "").slice(0, 8),
     "language=" + state.qwenLanguage,
-    "push=100 ms",
+    `push=${AUDIO_PUSH_INTERVAL_MS} ms`,
     "decode=" + (state.qwenChunkMs ?? "?") + " ms",
   ].join(" · ");
   updateQwenSummary();
@@ -447,6 +453,7 @@ function onPartialTranscript(message) {
   const receivedAt = performance.now();
   const previousAt = state.lastPartialAt;
   const clientElapsedMs = state.startedAt == null ? null : Math.max(0, receivedAt - state.startedAt);
+  const clientFirstAudioMs = clientFirstPartialMs(state.firstAudioSentAt, receivedAt);
   const item = {
     event: "partial_candidate",
     stream_id: message.stream_id,
@@ -455,9 +462,21 @@ function onPartialTranscript(message) {
     language: typeof message.language === "string" ? message.language : null,
     audio_cursor_ms: Number.isFinite(message.audio_cursor_ms) ? message.audio_cursor_ms : null,
     CLIENT_ELAPSED_MS: clientElapsedMs,
-    CLIENT_FIRST_PARTIAL_MS: state.streamEvents.length === 0 ? clientElapsedMs : null,
+    CLIENT_FIRST_PARTIAL_MS: state.streamEvents.length === 0 ? clientFirstAudioMs : null,
     CLIENT_PARTIAL_UPDATE_INTERVAL_MS: previousAt == null ? null : Math.max(0, receivedAt - previousAt),
     FIRST_PARTIAL_MS: message.FIRST_PARTIAL_MS,
+    SERVER_FIRST_PARTIAL_MS: message.SERVER_FIRST_PARTIAL_MS,
+    FIRST_AUDIO_TO_FIRST_DECODE_READY_MS: message.FIRST_AUDIO_TO_FIRST_DECODE_READY_MS,
+    FIRST_SCHEDULER_WAIT_MS: message.FIRST_SCHEDULER_WAIT_MS,
+    FIRST_AUDIO_TO_FIRST_DECODE_START_MS: message.FIRST_AUDIO_TO_FIRST_DECODE_START_MS,
+    EPOCH_FIRST_DECODE_WALL_MS: message.EPOCH_FIRST_DECODE_WALL_MS,
+    EPOCH_SECOND_DECODE_WALL_MS: message.EPOCH_SECOND_DECODE_WALL_MS,
+    EPOCH_STEADY_DECODE_WALL_P50_MS: message.EPOCH_STEADY_DECODE_WALL_P50_MS,
+    EPOCH_STEADY_DECODE_WALL_P95_MS: message.EPOCH_STEADY_DECODE_WALL_P95_MS,
+    EFFECTIVE_MAX_BACKLOG_MS: message.EFFECTIVE_MAX_BACKLOG_MS,
+    QWEN_MAX_BACKLOG_CHUNKS: message.QWEN_MAX_BACKLOG_CHUNKS,
+    QWEN_DECODE_SLO_TARGET_MS: message.QWEN_DECODE_SLO_TARGET_MS,
+    QWEN_DECODE_SLO_VIOLATION: message.QWEN_DECODE_SLO_VIOLATION,
     PARTIAL_UPDATE_INTERVAL_MS: message.PARTIAL_UPDATE_INTERVAL_MS,
     PARTIAL_COUNT: message.PARTIAL_COUNT,
     PARTIAL_REVISION_RATE: message.PARTIAL_REVISION_RATE,
@@ -553,6 +572,20 @@ function onTranscript(message, candidateOnly = false) {
     QWEN_DECODE_STEPS_DELTA: Number.isInteger(message.QWEN_DECODE_STEPS_DELTA) ? message.QWEN_DECODE_STEPS_DELTA : null,
     QWEN_DECODE_STEPS_DELTA_TOTAL: Number.isInteger(message.QWEN_DECODE_STEPS_DELTA_TOTAL) ? message.QWEN_DECODE_STEPS_DELTA_TOTAL : null,
     QWEN_FINISH_DECODE_WALL_MS: Number.isFinite(message.QWEN_FINISH_DECODE_WALL_MS) ? message.QWEN_FINISH_DECODE_WALL_MS : null,
+    FIRST_STREAM_INIT_MS: message.FIRST_STREAM_INIT_MS ?? null,
+    FIRST_STREAM_STATE_INIT_WALL_MS: message.FIRST_STREAM_STATE_INIT_WALL_MS ?? null,
+    FIRST_STREAM_INIT_RPC_OVERHEAD_MS: message.FIRST_STREAM_INIT_RPC_OVERHEAD_MS ?? null,
+    FIRST_AUDIO_TO_FIRST_DECODE_READY_MS: message.FIRST_AUDIO_TO_FIRST_DECODE_READY_MS ?? null,
+    FIRST_SCHEDULER_WAIT_MS: message.FIRST_SCHEDULER_WAIT_MS ?? null,
+    FIRST_AUDIO_TO_FIRST_DECODE_START_MS: message.FIRST_AUDIO_TO_FIRST_DECODE_START_MS ?? null,
+    EPOCH_FIRST_DECODE_WALL_MS: message.EPOCH_FIRST_DECODE_WALL_MS ?? null,
+    EPOCH_SECOND_DECODE_WALL_MS: message.EPOCH_SECOND_DECODE_WALL_MS ?? null,
+    EPOCH_STEADY_DECODE_WALL_P50_MS: message.EPOCH_STEADY_DECODE_WALL_P50_MS ?? null,
+    EPOCH_STEADY_DECODE_WALL_P95_MS: message.EPOCH_STEADY_DECODE_WALL_P95_MS ?? null,
+    EFFECTIVE_MAX_BACKLOG_MS: message.EFFECTIVE_MAX_BACKLOG_MS ?? null,
+    QWEN_MAX_BACKLOG_CHUNKS: message.QWEN_MAX_BACKLOG_CHUNKS ?? null,
+    QWEN_DECODE_SLO_TARGET_MS: message.QWEN_DECODE_SLO_TARGET_MS ?? 100,
+    QWEN_DECODE_SLO_VIOLATION: message.QWEN_DECODE_SLO_VIOLATION === true,
     PARTIAL_COUNT: Number.isFinite(message.PARTIAL_COUNT) ? message.PARTIAL_COUNT : null,
     FIRST_PARTIAL_MS: Number.isFinite(message.FIRST_PARTIAL_MS) ? message.FIRST_PARTIAL_MS : null,
     PARTIAL_REVISION_RATE: Number.isFinite(message.PARTIAL_REVISION_RATE) ? message.PARTIAL_REVISION_RATE : null,
@@ -603,7 +636,18 @@ function onSocketMessage(raw) {
   if (message.event === "stream_started") {
     if (message.request_id && message.request_id !== state.streamStartRequestId) return;
     state.streamId = message.stream_id ?? null;
-    state.qwenChunkMs = Number.isFinite(message.model_decode_chunk_ms) ? message.model_decode_chunk_ms : state.qwenChunkMs;
+    state.qwenChunkMs = Number.isFinite(message.model_chunk_ms) ? message.model_chunk_ms : (Number.isFinite(message.model_decode_chunk_ms) ? message.model_decode_chunk_ms : state.qwenChunkMs);
+    state.effectiveMaxBacklogMs = Number.isFinite(message.effective_max_backlog_ms) ? message.effective_max_backlog_ms : state.effectiveMaxBacklogMs;
+    state.qwenStartMetrics = {
+      FIRST_STREAM_INIT_MS: message.FIRST_STREAM_INIT_MS ?? null,
+      FIRST_STREAM_STATE_INIT_WALL_MS: message.FIRST_STREAM_STATE_INIT_WALL_MS ?? null,
+      FIRST_STREAM_INIT_RPC_OVERHEAD_MS: message.FIRST_STREAM_INIT_RPC_OVERHEAD_MS ?? null,
+      model_chunk_ms: state.qwenChunkMs,
+      audio_push_interval_ms: AUDIO_PUSH_INTERVAL_MS,
+      effective_max_backlog_ms: state.effectiveMaxBacklogMs,
+      qwen_max_backlog_chunks: message.qwen_max_backlog_chunks ?? null,
+      readiness_at_start: state.readinessAtStart,
+    };
     state.qwenLanguage = message.language ?? state.qwenLanguage;
     state.streamStartResolver?.resolve(message);
     state.streamStartResolver = null;
@@ -746,6 +790,12 @@ function waitForQwenStreamStart(requestId) {
 }
 
 async function startQwenStream() {
+  try {
+    const readinessResponse = await fetch("/asr/readiness", { cache: "no-store" });
+    state.readinessAtStart = await readinessResponse.json();
+  } catch {
+    state.readinessAtStart = { ready: false };
+  }
   state.qwenChunkMs = Number($("qwen-chunk-size").value);
   state.qwenLanguage = $("qwen-language").value;
   state.qwenContext = $("qwen-context").value.trim();
@@ -758,7 +808,7 @@ async function startQwenStream() {
     request_id: requestId,
     language: state.qwenLanguage,
     context: state.qwenContext,
-    chunk_size_ms: state.qwenChunkMs,
+    model_chunk_ms: state.qwenChunkMs,
   }));
   await started;
 }
@@ -776,6 +826,7 @@ function receivePcmChunk(buffer, sampleCount) {
       return;
     }
     const bytes = new Uint8Array(buffer);
+    if (state.firstAudioSentAt == null) state.firstAudioSentAt = performance.now();
     state.sentBytes += bytes.byteLength;
     state.ws.send(JSON.stringify({
       type: "audio", source: "mic", speaker: "you", encoding: "pcm_int16",
@@ -815,6 +866,7 @@ function receivePcmChunk(buffer, sampleCount) {
   };
   if (requestId) payload.request_id = requestId;
   const json = JSON.stringify(payload);
+  if (state.backend === "qwen3_asr" && state.firstAudioSentAt == null) state.firstAudioSentAt = performance.now();
   state.sentBytes += bytes.byteLength;
   state.ws.send(json);
 }
@@ -875,6 +927,10 @@ async function startRun() {
   state.reference = $("reference-text").value;
   state.runTimestamp = new Date().toISOString();
   state.runPrefix = crypto.randomUUID().replaceAll("-", "");
+  state.firstAudioSentAt = null;
+  state.readinessAtStart = null;
+  state.effectiveMaxBacklogMs = null;
+  state.qwenStartMetrics = null;
   state.isStopping = false;
   state.finalised = false;
   showNotice("Comprobando readiness y solicitando permiso del micrófono…");
@@ -1038,7 +1094,11 @@ function resetRun() {
   state.lastPartialAt = null;
   state.clientEosAt = null;
   state.clientFinalizationMs = null;
-  state.qwenChunkMs = null;
+  state.qwenChunkMs = 1000;
+  state.effectiveMaxBacklogMs = null;
+  state.firstAudioSentAt = null;
+  state.readinessAtStart = null;
+  state.qwenStartMetrics = null;
   state.qwenLanguage = $("qwen-language").value;
   state.qwenContext = "";
   state.finalised = false;
@@ -1124,6 +1184,11 @@ function safeResult() {
     model_id: state.modelId,
     model_revision: state.modelRevision,
     runtime_provenance: state.runtimeProvenance,
+    startup_evidence: safeQwenStartupEvidence({
+      readinessAtStart: state.readinessAtStart,
+      qwenStartMetrics: state.qwenStartMetrics,
+      health: state.health,
+    }),
     gpu: lastTelemetry?.gpu_device ?? null,
     GPU_COMPUTE_AVAILABLE: lastTelemetry?.gpu_compute_available === true,
     GPU_TELEMETRY_AVAILABLE: lastTelemetry?.gpu_telemetry_available === true,
@@ -1153,8 +1218,10 @@ function safeResult() {
     transcript_mode: state.backend === "qwen3_asr" ? "STREAMING_PARTIALS" : "FINAL_SEGMENT",
     streaming: state.backend === "qwen3_asr" ? {
       streaming_class: "accumulated-audio-pseudostreaming",
-      audio_push_interval_ms: 100,
+      audio_push_interval_ms: AUDIO_PUSH_INTERVAL_MS,
+      model_chunk_ms: state.qwenChunkMs,
       model_decode_chunk_ms: state.qwenChunkMs,
+      effective_max_backlog_ms: state.effectiveMaxBacklogMs,
       language: state.qwenLanguage,
       context_supplied: Boolean(state.qwenContext),
       partials: [...state.streamEvents],

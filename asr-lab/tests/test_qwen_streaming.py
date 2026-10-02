@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import unittest
+from unittest.mock import patch
 
 from asr_lab.qwen_streaming import (
     QWEN_LANGUAGE_NAMES, QwenStreamingRuntime, StreamingError,
@@ -31,7 +32,7 @@ class FakeWorker:
                 "index": 0,
                 "text": "",
             }
-            return {"stream_id": stream_id}
+            return {"stream_id": stream_id, "stream_state_init_wall_ms": 2.0}
         if operation == "push":
             stream = self.streams[stream_id]
             sequence = self.text_sequences.get(stream["context"], [""])
@@ -148,6 +149,9 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first.get("type"), "transcript")
         self.assertAlmostEqual(second["PARTIAL_REVISION_RATE"], 0.25)
         self.assertAlmostEqual(second["PARTIAL_STABILITY"], 0.75)
+        self.assertEqual(first["SERVER_FIRST_PARTIAL_MS"], first["FIRST_PARTIAL_MS"])
+        self.assertEqual(second["SERVER_FIRST_PARTIAL_MS"], first["SERVER_FIRST_PARTIAL_MS"])
+        self.assertEqual(second["FIRST_PARTIAL_MS"], first["FIRST_PARTIAL_MS"])
         final = await self.runtime.finish(connection_id="conn-a", source="mic")
         self.assertTrue(final["final"])
         self.assertEqual(final["revision"], 3)
@@ -207,6 +211,37 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await asyncio.wait_for(failure, 1))['code'], "stream_worker_failed")
         await asyncio.sleep(0)
         self.assertEqual(self.runtime.active_sessions, 0)
+
+    async def test_runtime_boundary_rejects_multi_step_worker_reply(self):
+        from asr_lab.qwen_scheduler import DecodeJob, RequestKey
+        started = await self.runtime.open_session(
+            connection_id="invalid-delta", source="mic", model_chunk_ms=50,
+        )
+        async def invalid_reply(_operation, **payload):
+            return {
+                "scheduler_key": payload["scheduler_key"],
+                "decode_steps_delta": 2,
+                "decode_wall_ms": 10,
+                "text": "must not become a candidate",
+            }
+        with patch.object(self.worker, "request", side_effect=invalid_reply):
+            with self.assertRaisesRegex(StreamingError, "invalid_worker_response"):
+                await self.runtime._execute_scheduled(
+                    RequestKey("invalid-delta", started["stream_id"], 1),
+                    DecodeJob("push", b"\x01\x00" * 800, 800, 0.0),
+                )
+
+    async def test_open_session_validates_each_present_chunk_alias_before_comparing(self):
+        for canonical, legacy in ((50, 50.0), (None, 50.0)):
+            with self.subTest(canonical=canonical, legacy=legacy), self.assertRaisesRegex(StreamingError, "invalid_stream_chunk"):
+                await self.runtime.open_session(
+                    connection_id=f"alias-{canonical}-{legacy}", source="mic",
+                    model_chunk_ms=canonical, chunk_size_ms=legacy,
+                )
+        with self.assertRaisesRegex(StreamingError, "conflicting_model_chunk"):
+            await self.runtime.open_session(
+                connection_id="alias-conflict", source="mic", model_chunk_ms=50, chunk_size_ms=100,
+            )
 
     async def test_late_partial_from_disconnected_connection_is_discarded(self):
         class DelayedWorker(FakeWorker):
@@ -337,6 +372,114 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(token_revision_metrics("", "quiero"), (None, None))
         self.assertEqual(token_revision_metrics("quiero mesa", "quiero mesa cuatro"), (0.0, 1.0))
         self.assertEqual(token_revision_metrics("quiero cuatro", "quiero seis"), (0.5, 0.5))
+
+
+    async def test_init_rpc_latency_excludes_scheduler_registration(self):
+        from types import SimpleNamespace
+        import asr_lab.qwen_streaming as streaming_module
+        clock_values = iter((0.0, 0.0, 0.0, 0.007))
+        with patch.object(streaming_module, "time", SimpleNamespace(perf_counter=lambda: next(clock_values))):
+            started = await self.runtime.open_session(connection_id="init-clock", source="mic", model_chunk_ms=50)
+        self.assertEqual(started["FIRST_STREAM_INIT_MS"], 7.0)
+        self.assertEqual(started["FIRST_STREAM_STATE_INIT_WALL_MS"], 2.0)
+        self.assertEqual(started["FIRST_STREAM_INIT_RPC_OVERHEAD_MS"], 5.0)
+
+    async def test_first_decode_clocks_use_server_admission_ready_and_dispatch(self):
+        from types import SimpleNamespace
+        import asr_lab.qwen_scheduler as scheduler_module
+        import asr_lab.qwen_streaming as streaming_module
+        await self.runtime.open_session(connection_id="clocked", source="mic", model_chunk_ms=50, context="client A")
+        stream_clock = [0.010, 0.012]
+        def server_clock():
+            return stream_clock.pop(0) if stream_clock else 0.016
+        with (
+            patch.object(streaming_module, "time", SimpleNamespace(perf_counter=server_clock)),
+            patch.object(scheduler_module, "time", SimpleNamespace(perf_counter=lambda: 0.015)),
+        ):
+            await self.runtime.push_audio(connection_id="clocked", source="mic", pcm16le=b"\x01\x00" * 400)
+            await self.runtime.push_audio(connection_id="clocked", source="mic", pcm16le=b"\x02\x00" * 400)
+            partial = await self.runtime.receive_event(connection_id="clocked", source="mic")
+        self.assertEqual(partial["FIRST_AUDIO_TO_FIRST_DECODE_READY_MS"], 2.0)
+        self.assertEqual(partial["FIRST_SCHEDULER_WAIT_MS"], 3.0)
+        self.assertEqual(partial["FIRST_AUDIO_TO_FIRST_DECODE_START_MS"], 5.0)
+        self.assertEqual(partial["FIRST_AUDIO_TO_FIRST_DECODE_READY_MS"] + partial["FIRST_SCHEDULER_WAIT_MS"], partial["FIRST_AUDIO_TO_FIRST_DECODE_START_MS"])
+        self.assertEqual(partial["SERVER_FIRST_PARTIAL_MS"], partial["FIRST_PARTIAL_MS"])
+
+    async def test_real_decode_ordinals_exclude_zero_step_and_include_eos_finish(self):
+        class SequenceWorker(FakeWorker):
+            def __init__(self):
+                super().__init__()
+                self.push_index = 0
+
+            async def request(self, operation, **payload):
+                self.requests.append((operation, payload.copy()))
+                stream_id = payload.get("stream_id")
+                if operation == "init":
+                    self.streams[stream_id] = {"context": "ordinal", "index": 0, "text": ""}
+                    return {"stream_id": stream_id, "stream_state_init_wall_ms": 2.0}
+                if operation == "close":
+                    return {"closed": True}
+                if operation == "push":
+                    cases = [(1, 10.0, "one"), (0, 999.0, "one"), (1, 20.0, "two"), (0, 999.0, "two")]
+                    steps, wall, text = cases[self.push_index]
+                    self.push_index += 1
+                elif operation == "finish":
+                    steps, wall, text = (1, 30.0, "two")
+                else:
+                    raise AssertionError(operation)
+                response = {"decode_steps_delta": steps, "decode_wall_ms": wall, "text": text, "language": "es"}
+                if payload.get("scheduler_key") is not None:
+                    response["scheduler_key"] = payload["scheduler_key"]
+                return response
+
+        worker = SequenceWorker()
+        runtime = QwenStreamingRuntime(
+            worker=worker, model_id="qwen", model_revision="fixed", gpu_memory_utilization=0.65,
+            max_active_sessions=2, max_stream_seconds=2, session_idle_ttl_seconds=120,
+            max_context_chars=512, default_chunk_ms=50, default_language="auto",
+            unfixed_chunk_num=2, unfixed_token_num=5,
+        )
+        await runtime.start()
+        try:
+            await runtime.open_session(connection_id="ordinal", source="mic", model_chunk_ms=50)
+            frame = b"\x03\x00" * 800
+            await runtime.push_audio(connection_id="ordinal", source="mic", pcm16le=frame)
+            first = await runtime.receive_event(connection_id="ordinal", source="mic")
+            await runtime.push_audio(connection_id="ordinal", source="mic", pcm16le=frame)
+            await runtime.push_audio(connection_id="ordinal", source="mic", pcm16le=frame)
+            second = await runtime.receive_event(connection_id="ordinal", source="mic")
+            await runtime.push_audio(connection_id="ordinal", source="mic", pcm16le=b"\x04\x00" * 400)
+            final = await runtime.finish(connection_id="ordinal", source="mic")
+            self.assertEqual(first["EPOCH_FIRST_DECODE_WALL_MS"], 10.0)
+            self.assertEqual(second["EPOCH_SECOND_DECODE_WALL_MS"], 20.0)
+            self.assertEqual(final["EPOCH_FIRST_DECODE_WALL_MS"], 10.0)
+            self.assertEqual(final["EPOCH_SECOND_DECODE_WALL_MS"], 20.0)
+            self.assertEqual(final["EPOCH_STEADY_DECODE_WALL_P50_MS"], 30.0)
+            self.assertEqual(final["EPOCH_STEADY_DECODE_WALL_P95_MS"], 30.0)
+            self.assertEqual(final["QWEN_CUMULATIVE_DECODE_WALL_MS"], 60.0)
+            self.assertEqual(final["QWEN_DECODE_WALL_SAMPLE_COUNT"], 3)
+            self.assertEqual(final["QWEN_DECODE_STEPS_DELTA_TOTAL"], 3)
+            self.assertIsNotNone(final["FIRST_PARTIAL_MS"])
+            self.assertEqual(final["SERVER_FIRST_PARTIAL_MS"], final["FIRST_PARTIAL_MS"])
+        finally:
+            await runtime.close()
+
+
+    def test_decode_ordinal_metric_nullability_for_zero_one_and_two_real_steps(self):
+        from asr_lab.qwen_streaming import StreamSession, _decode_ordinal_metrics
+        session = StreamSession("c", "mic", "s", None, "auto", 100, "", 0, 0, 60)
+        expected = (None, None, None, None)
+        self.assertEqual(tuple(_decode_ordinal_metrics(session).values()), expected * 2)
+        session.decode_wall_samples[:] = [10.0]
+        one = _decode_ordinal_metrics(session)
+        self.assertEqual(one["FIRST_DECODE_WALL_MS"], 10.0)
+        self.assertIsNone(one["SECOND_DECODE_WALL_MS"])
+        self.assertIsNone(one["STEADY_DECODE_WALL_P50_MS"])
+        session.decode_wall_samples[:] = [10.0, 20.0]
+        two = _decode_ordinal_metrics(session)
+        self.assertEqual(two["FIRST_DECODE_WALL_MS"], 10.0)
+        self.assertEqual(two["SECOND_DECODE_WALL_MS"], 20.0)
+        self.assertIsNone(two["STEADY_DECODE_WALL_P95_MS"])
 
 
 if __name__ == "__main__":

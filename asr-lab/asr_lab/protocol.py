@@ -9,6 +9,8 @@ import struct
 from dataclasses import dataclass
 from typing import Any
 
+from .config import QWEN_MODEL_CHUNK_MS_VALUES
+
 SAMPLE_RATE = 16_000
 BYTES_PER_SAMPLE = 2
 
@@ -48,8 +50,16 @@ class StreamStart:
     source: str
     language: str
     context: str
-    chunk_size_ms: int | None = None
+    model_chunk_ms: int | None = None
     request_id: str | None = None
+
+    @property
+    def chunk_size_ms(self) -> int | None:
+        """Compatibility alias for the historical stream-start field."""
+        return self.model_chunk_ms
+
+# request_id was historically the fifth positional field; retain keyword semantics
+
 
 
 @dataclass(frozen=True)
@@ -108,7 +118,7 @@ def parse_message(
         return FlushRequest(source=source, request_id=request_id)
 
     if event == "stream_start":
-        if set(value) - {"event", "source", "language", "context", "chunk_size_ms", "request_id"}:
+        if set(value) - {"event", "source", "language", "context", "chunk_size_ms", "model_chunk_ms", "request_id"}:
             raise ProtocolError("invalid_stream_start", "Stream start contains unsupported fields.")
         source = value.get("source")
         if source not in ("mic", "system"):
@@ -124,13 +134,22 @@ def parse_message(
             raise ProtocolError("invalid_context", "context exceeds the configured character limit.")
         if any(ord(char) < 32 or ord(char) == 127 for char in context):
             raise ProtocolError("invalid_context", "context must not contain control characters.")
-        chunk_size_ms = value.get("chunk_size_ms")
-        if chunk_size_ms is not None and (
-            not isinstance(chunk_size_ms, int)
-            or isinstance(chunk_size_ms, bool)
-            or chunk_size_ms not in (250, 500, 1000, 2000)
-        ):
-            raise ProtocolError("invalid_stream_chunk", "chunk_size_ms must be one of 250, 500, 1000, or 2000.")
+        has_model_chunk = "model_chunk_ms" in value
+        has_legacy_chunk = "chunk_size_ms" in value
+        model_chunk_ms = None
+        for field_name in ("model_chunk_ms", "chunk_size_ms"):
+            if field_name not in value:
+                continue
+            raw_value = value[field_name]
+            if (isinstance(raw_value, bool) or not isinstance(raw_value, int)
+                    or raw_value not in QWEN_MODEL_CHUNK_MS_VALUES):
+                raise ProtocolError("invalid_model_chunk", f"{field_name} must be an allowed integer model window.")
+        if has_model_chunk and has_legacy_chunk and value["model_chunk_ms"] != value["chunk_size_ms"]:
+            raise ProtocolError("conflicting_model_chunk", "model_chunk_ms and chunk_size_ms must match.")
+        if has_model_chunk:
+            model_chunk_ms = value["model_chunk_ms"]
+        elif has_legacy_chunk:
+            model_chunk_ms = value["chunk_size_ms"]
         request_id = value.get("request_id")
         if request_id is not None and (
             not isinstance(request_id, str) or not request_id or len(request_id) > 128
@@ -140,7 +159,7 @@ def parse_message(
             source=source,
             language=language,
             context=" ".join(context.split()),
-            chunk_size_ms=chunk_size_ms,
+            model_chunk_ms=model_chunk_ms,
             request_id=request_id,
         )
 

@@ -167,6 +167,7 @@ class QwenWorkerEngine:
                 raise ValueError("stream_exists")
             if len(self.sessions) >= self.max_active_sessions:
                 raise RuntimeError("stream_capacity_exceeded")
+            state_init_started = time.perf_counter()
             state = self.model.init_streaming_state(
                 context=payload.get("context", ""),
                 language=payload.get("language"),
@@ -174,8 +175,10 @@ class QwenWorkerEngine:
                 unfixed_token_num=int(payload["unfixed_token_num"]),
                 chunk_size_sec=float(payload["chunk_size_sec"]),
             )
+            state_init_wall_ms = (time.perf_counter() - state_init_started) * 1000.0
             self.sessions[stream_id] = state
-            return {"stream_id": stream_id, "active_sessions": len(self.sessions)}
+            return {"stream_id": stream_id, "active_sessions": len(self.sessions),
+                    "stream_state_init_wall_ms": round(state_init_wall_ms, 3)}
         state = self.sessions.get(stream_id)
         if state is None:
             raise KeyError("stream_not_found")
@@ -220,6 +223,8 @@ class QwenWorkerEngine:
         self.model.streaming_transcribe(audio, state)
         decode_wall_ms = (time.perf_counter() - started) * 1000
         after_chunk = int(state.chunk_id)
+        if after_chunk - before_chunk not in (0, 1):
+            raise ValueError("invalid_decode_steps_delta")
         return {
             "decoded": after_chunk > before_chunk,
             "decode_steps_delta": max(0, after_chunk - before_chunk),

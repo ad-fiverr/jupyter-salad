@@ -44,6 +44,7 @@ _TERMINAL_SCHEDULER_NUMERIC_FIELDS = {
     "stream_pending_jobs", "active_stream_count", "backlog_audio_ms",
     "stream_lag_ms", "max_backlog_audio_ms", "max_stream_lag_ms",
     "accepted_audio_total_ms", "dispatched_audio_total_ms", "overrun_limit_value",
+    "effective_max_backlog_ms", "qwen_max_backlog_chunks", "model_chunk_ms",
     "scheduler_metric_history_limit",
 }
 
@@ -96,7 +97,7 @@ async def lifespan(app: FastAPI):
                 max_stream_seconds=settings.qwen_max_stream_seconds,
                 session_idle_ttl_seconds=settings.qwen_session_idle_ttl_seconds,
                 max_context_chars=settings.qwen_max_context_chars,
-                default_chunk_ms=settings.qwen_stream_chunk_ms,
+                default_chunk_ms=settings.qwen_model_chunk_ms,
                 default_language=settings.qwen_language,
                 unfixed_chunk_num=settings.qwen_unfixed_chunk_num,
                 unfixed_token_num=settings.qwen_unfixed_token_num,
@@ -493,7 +494,7 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                         source=message.source,
                         language=message.language,
                         context=message.context,
-                        chunk_size_ms=message.chunk_size_ms,
+                        model_chunk_ms=message.model_chunk_ms,
                         request_id=message.request_id,
                         event_sink=enqueue_result,
                     )

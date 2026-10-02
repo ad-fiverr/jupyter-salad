@@ -190,6 +190,7 @@ class TelemetryTests(unittest.TestCase):
             "qwen_scheduler_backlog_ms": 825.0,
             "qwen_scheduler_wait_p95_ms": 137.5,
             "qwen_decode_budget_overrun_total": 3,
+            "qwen_decode_slo_violation_total": 2,
             "connection_id": "must-not-leak", "stream_id": "must-not-leak-either",
         }
         with patch("asr_lab.telemetry.process_rss_mib", return_value=100.0), \
@@ -200,6 +201,7 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(snapshot["qwen_scheduler"]["active_stream_count"], 6)
         self.assertEqual(snapshot["qwen_scheduler"]["pending_decode_count"], 4)
         self.assertEqual(snapshot["qwen_scheduler"]["qwen_decode_budget_overrun_total"], 3)
+        self.assertEqual(snapshot["qwen_scheduler"]["qwen_decode_slo_violation_total"], 2)
         encoded = json.dumps(snapshot)
         self.assertNotIn("connection_id", encoded)
         self.assertNotIn("stream_id", encoded)

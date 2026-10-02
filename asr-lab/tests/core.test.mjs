@@ -2,7 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
+  AUDIO_PUSH_INTERVAL_MS,
   CHUNK_SAMPLES,
+  clientFirstPartialMs,
+  decodeSloLabel,
   METRIC_DEFINITIONS,
   MAX_BUFFER_SAMPLES,
   MIN_SPEECH_SAMPLES,
@@ -23,6 +26,7 @@ import {
   percentile,
   rttPercentiles,
   qwenDeviceTelemetryLabel,
+  safeQwenStartupEvidence,
   wordErrorRate,
   shouldDrawCanvas,
 } from "../asr_lab/benchmark_web/core.mjs";
@@ -111,6 +115,72 @@ test("shadow VAD mirrors the server thresholds and flush boundary", () => {
   assert.equal(state.canTranscribe, true);
   assert.equal(state.lastVoiceAt, 400);
   assert.equal(vad.speaking, false);
+});
+
+test("safe startup evidence retains real nested warmup provenance and readiness", () => {
+  const evidence = safeQwenStartupEvidence({
+    readinessAtStart: { ready: false, backend: "qwen3_asr", production_backend: "qwen3_asr", model_loaded: false, api_token: "secret" },
+    qwenStartMetrics: {
+      FIRST_STREAM_INIT_MS: 7,
+      FIRST_STREAM_STATE_INIT_WALL_MS: 2,
+      FIRST_STREAM_INIT_RPC_OVERHEAD_MS: 5,
+      private_value: "must-not-export",
+    },
+    health: {
+      model_id: "Qwen/Qwen3-ASR-1.7B", model_revision: "revision-fixture", workers: 1,
+      worker_metrics: [{ model_load_ms: 42, warmup_ms: 5, experiment_config: { warmup_chunk_ms: 1000 } }],
+      runtime_provenance: {
+        qwen_asr_version: "0.0.6", vllm_version: "0.14.0", transformers_version: "4.1",
+        torch_version: "2.7", torch_cuda_version: "12.8",
+        experiment_config: { warmup_chunk_ms: 1000, max_num_seqs: 1, api_token: "secret" },
+        process_args: "must-not-export",
+      },
+      environment: { API_TOKEN: "must-not-export" },
+    },
+  });
+  assert.equal(evidence.readiness_at_start.ready, false);
+  assert.equal(evidence.FIRST_STREAM_INIT_MS, 7);
+  assert.equal(evidence.FIRST_STREAM_STATE_INIT_WALL_MS, 2);
+  assert.equal(evidence.FIRST_STREAM_INIT_RPC_OVERHEAD_MS, 5);
+  assert.equal(evidence.model_id, "Qwen/Qwen3-ASR-1.7B");
+  assert.equal(evidence.model_revision, "revision-fixture");
+  assert.deepEqual(evidence.model_load_ms, [42]);
+  assert.deepEqual(evidence.warmup_ms, [5]);
+  assert.deepEqual(evidence.warmup_chunk_ms, [1000]);
+  assert.equal(evidence.runtime_provenance.vllm_version, "0.14.0");
+  assert.equal(evidence.runtime_provenance.experiment_config.max_num_seqs, 1);
+  assert.equal(JSON.stringify(evidence).includes("must-not-export"), false);
+  assert.equal(JSON.stringify(evidence).includes("secret"), false);
+});
+
+test("startup evidence supports legacy warmup field and missing values stay null or empty", () => {
+  const legacy = safeQwenStartupEvidence({
+    health: { worker_metrics: [{ model_load_ms: 4, warmup_ms: 2, warmup_chunk_ms: 500 }] },
+  });
+  assert.deepEqual(legacy.warmup_chunk_ms, [500]);
+  const missing = safeQwenStartupEvidence({ readinessAtStart: { ready: false } });
+  assert.equal(missing.readiness_at_start.ready, false);
+  assert.equal(missing.FIRST_STREAM_INIT_MS, null);
+  assert.equal(missing.FIRST_STREAM_STATE_INIT_WALL_MS, null);
+  assert.equal(missing.FIRST_STREAM_INIT_RPC_OVERHEAD_MS, null);
+  assert.deepEqual(missing.model_load_ms, []);
+  assert.deepEqual(missing.warmup_ms, []);
+  assert.deepEqual(missing.warmup_chunk_ms, []);
+  assert.equal(missing.runtime_provenance.torch_version, null);
+});
+
+test("JSON startup evidence is exported independently of partial or final candidates", () => {
+  const resultBuilder = appSource.slice(appSource.indexOf("function safeResult()"), appSource.indexOf("function download("));
+  assert.match(resultBuilder, /startup_evidence:\s*safeQwenStartupEvidence\(\{/);
+  assert.match(resultBuilder, /readinessAtStart:\s*state\.readinessAtStart/);
+  assert.match(resultBuilder, /health:\s*state\.health/);
+  assert.ok(resultBuilder.indexOf("startup_evidence:") < resultBuilder.indexOf("streaming:"));
+  const noCandidate = safeQwenStartupEvidence({
+    readinessAtStart: { ready: true },
+    qwenStartMetrics: { FIRST_STREAM_INIT_MS: 9 },
+  });
+  assert.equal(noCandidate.FIRST_STREAM_INIT_MS, 9);
+  assert.equal(noCandidate.readiness_at_start.ready, true);
 });
 
 test("summary helpers calculate WER and percentiles deterministically", () => {
@@ -265,4 +335,27 @@ test("Stop drains the last worklet PCM chunk before freezing capture and marking
   );
   assert.ok(stopSource.indexOf("await waitForWorkletFlush()") < stopSource.indexOf("state.isRecording = false"));
   assert.ok(stopSource.indexOf("state.isRecording = false") < stopSource.indexOf("state.clientEosAt = performance.now()"));
+});
+
+
+test("client first partial begins immediately before the first audio send", () => {
+  const runStartedAt = 100;
+  const firstAudioSentAt = 250;
+  const receivedAt = 410;
+  assert.equal(AUDIO_PUSH_INTERVAL_MS, 100);
+  assert.equal(clientFirstPartialMs(firstAudioSentAt, receivedAt), 160);
+  assert.notEqual(clientFirstPartialMs(firstAudioSentAt, receivedAt), receivedAt - runStartedAt);
+  assert.equal(clientFirstPartialMs(null, receivedAt), null);
+});
+
+test("decode SLO display distinguishes unmeasured from a measured pass", () => {
+  assert.equal(decodeSloLabel(null), "unmeasured");
+  assert.equal(decodeSloLabel(undefined), "unmeasured");
+  assert.equal(decodeSloLabel(false), "within target");
+  assert.equal(decodeSloLabel(true), "violation");
+  for (const metric of [
+    "FIRST_STREAM_INIT_RPC_OVERHEAD_MS", "EPOCH_FIRST_DECODE_WALL_MS",
+    "EPOCH_SECOND_DECODE_WALL_MS", "EPOCH_STEADY_DECODE_WALL_P50_MS",
+    "EPOCH_STEADY_DECODE_WALL_P95_MS", "SERVER_FIRST_PARTIAL_MS", "CLIENT_FIRST_PARTIAL_MS",
+  ]) assert.ok(appSource.includes(metric), `missing visible metric ${metric}`);
 });

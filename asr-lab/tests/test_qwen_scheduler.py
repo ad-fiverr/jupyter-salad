@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from asr_lab.qwen_scheduler import QwenDecodeScheduler, SchedulerError
 
@@ -100,6 +101,36 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row[0].connection_id for row in self.jobs], list("ABCDEF"))
         self.assertEqual(self.max_active, 1)
         self.assertLessEqual(self.scheduler.active_jobs, 1)
+
+    async def test_50ms_round_robin_gives_competing_stream_turn_between_split_jobs(self):
+        await self.register("A", "sa", 50)
+        await self.register("B", "sb", 50)
+        await self.scheduler.append_pcm("A", "sa", b"\x11\x00" * 1600)
+        await self.scheduler.append_pcm("B", "sb", b"\x22\x00" * 800)
+        self.release.set()
+        await self._wait_for(lambda: len(self.jobs) == 3)
+        self.assertEqual([row[0].connection_id for row in self.jobs], ["A", "B", "A"])
+        self.assertEqual([len(row[2]) // 2 for row in self.jobs], [800, 800, 800])
+        self.assertEqual([row[0].scheduler_revision for row in self.jobs], [1, 1, 2])
+        self.assertEqual(self.max_active, 1)
+
+    async def test_50ms_backlog_overrun_fences_only_owner_and_preserves_competitor(self):
+        await self.register("A", "sa", 50)
+        await self.register("B", "sb", 50)
+        frame_a = b"\x31\x00" * 1600
+        frame_b = b"\x42\x00" * 1600
+        await self.scheduler.append_pcm("A", "sa", frame_a)
+        await asyncio.wait_for(self.started.wait(), 1)
+        await self.scheduler.append_pcm("A", "sa", frame_a)
+        await self.scheduler.append_pcm("B", "sb", frame_b)
+        with self.assertRaisesRegex(SchedulerError, "stream_scheduler_overrun"):
+            await self.scheduler.append_pcm("A", "sa", frame_a)
+        self.assertNotIn(("A", "sa"), self.scheduler.streams)
+        self.assertIn(("B", "sb"), self.scheduler.streams)
+        self.release.set()
+        await self._wait_for(lambda: len([row for row in self.jobs if row[0].connection_id == "B"]) == 2)
+        self.assertEqual(self.max_active, 1)
+        self.assertEqual(self.faults[-1][2], "stream_scheduler_overrun")
 
     async def test_pending_and_active_stream_high_water_marks_cover_the_six_stream_group(self):
         await self.register("A", "sa")
@@ -234,6 +265,110 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.sleep(0.005)
         self.fail("timed out waiting for scheduler state")
+
+
+    async def test_50ms_jobs_are_distinct_and_150ms_tail_cursors_are_exact(self):
+        self.release.set()
+        await self.register("small", "s50", 50)
+        samples = [((i % 30000) - 15000) for i in range(1600)]
+        import struct
+        pcm = struct.pack("<1600h", *samples)
+        await self.scheduler.append_pcm("small", "s50", pcm)
+        await self._wait_for(lambda: len(self.jobs) == 2)
+        self.assertEqual([len(row[2]) // 2 for row in self.jobs], [800, 800])
+        self.assertEqual([row[0].scheduler_revision for row in self.jobs], [1, 2])
+        self.assertEqual(b"".join(row[2] for row in self.jobs), pcm)
+        self.assertEqual([row[3] for row in self.jobs], [800, 1600])
+        await self.register("mid", "s150", 150)
+        frame = struct.pack("<1600h", *[i - 800 for i in range(1600)])
+        await self.scheduler.append_pcm("mid", "s150", frame)
+        await self.scheduler.append_pcm("mid", "s150", frame)
+        self.assertEqual(self.scheduler.streams[("mid", "s150")].pending[0].cursor_end_samples, 2400)
+        self.assertEqual(len(self.scheduler.streams[("mid", "s150")].tail) // 2, 800)
+        await self.scheduler.append_pcm("mid", "s150", frame)
+        await self._wait_for(lambda: len(self.jobs) == 4)
+        mid_jobs = [row for row in self.jobs if row[0].connection_id == "mid"]
+        self.assertEqual([len(row[2]) // 2 for row in mid_jobs], [2400, 2400])
+        self.assertEqual([row[3] for row in mid_jobs], [2400, 4800])
+        self.assertEqual(b"".join(row[2] for row in mid_jobs) + bytes(self.scheduler.streams[("mid", "s150")].tail), frame * 3)
+
+    async def test_100_150_200_250ms_windows_preserve_exact_pcm_through_eos(self):
+        self.release.set()
+        import struct
+        frames = [struct.pack("<1600h", *[frame * 5000 + i for i in range(1600)]) for frame in range(3)]
+        expected_samples = {100: [1600, 1600, 1600], 150: [2400, 2400], 200: [3200, 1600], 250: [4000, 800]}
+        for chunk_ms, sample_counts in expected_samples.items():
+            connection, stream = f"eos-{chunk_ms}", f"s-{chunk_ms}"
+            before = len(self.jobs)
+            await self.register(connection, stream, chunk_ms)
+            for frame in frames:
+                await self.scheduler.append_pcm(connection, stream, frame)
+            await self.scheduler.finish_stream(connection, stream)
+            jobs = [job for job in self.jobs[before:] if job[0].connection_id == connection]
+            pushes = [job for job in jobs if job[1] == "push"]
+            finishes = [job for job in jobs if job[1] == "finish"]
+            self.assertEqual([len(job[2]) // 2 for job in pushes], sample_counts, f"chunk={chunk_ms}")
+            self.assertEqual(len(finishes), 1, f"chunk={chunk_ms}")
+            self.assertEqual(jobs[-1][1], "finish", f"chunk={chunk_ms}")
+            self.assertEqual(b"".join(job[2] for job in pushes), b"".join(frames), f"chunk={chunk_ms}")
+            self.assertEqual(sum(len(job[2]) // 2 for job in pushes), 4800, f"chunk={chunk_ms}")
+
+    async def test_invalid_multi_step_reply_fences_only_its_owner(self):
+        self.release.set()
+        async def invalid_for_a(key, job):
+            return {"decode_wall_ms": 10, "decode_steps_delta": 2 if key.connection_id == "A" else 1}
+        self.scheduler.execute = invalid_for_a
+        await self.register("A", "sa", 50)
+        await self.register("B", "sb", 50)
+        frame = b"\x11\x00" * 800
+        await self.scheduler.append_pcm("A", "sa", frame)
+        await self.scheduler.append_pcm("B", "sb", frame)
+        await self._wait_for(lambda: len(self.results) + len(self.faults) >= 2)
+        self.assertNotIn(("A", "sa"), self.scheduler.streams)
+        self.assertIn(("B", "sb"), self.scheduler.streams)
+        self.assertEqual(self.faults[0][2], "invalid_worker_response")
+        self.assertEqual([row[0].connection_id for row in self.results], ["B"])
+
+
+    async def test_first_decode_ready_wait_start_clocks_reconcile_without_sleep(self):
+        from types import SimpleNamespace
+        import asr_lab.qwen_scheduler as scheduler_module
+        self.release.set()
+        await self.register("clock", "stream-clock", 50)
+        with patch.object(scheduler_module, "time", SimpleNamespace(perf_counter=lambda: 0.015)):
+            await self.scheduler.append_pcm("clock", "stream-clock", b"\x01\x00" * 400, received_at=0.010)
+            await self.scheduler.append_pcm("clock", "stream-clock", b"\x02\x00" * 400, received_at=0.012)
+            await self._wait_for(lambda: len(self.results) == 1)
+        metrics = self.results[0][3]
+        first_audio = metrics["first_audio_at"]
+        ready_at = metrics["job_ready_at"]
+        dispatch_at = metrics["dispatch_at"]
+        ready_ms = (ready_at - first_audio) * 1000
+        wait_ms = (dispatch_at - ready_at) * 1000
+        start_ms = (dispatch_at - first_audio) * 1000
+        self.assertAlmostEqual(ready_ms, 2.0)
+        self.assertAlmostEqual(wait_ms, 3.0)
+        self.assertAlmostEqual(start_ms, 5.0)
+        self.assertAlmostEqual(ready_ms + wait_ms, start_ms)
+
+    async def test_absolute_decode_slo_is_independent_of_chunk_ratio(self):
+        self.release.set()
+        walls = {"absolute": (1000, 150.0), "ratio": (50, 90.0)}
+        async def execute(key, job):
+            _, wall = walls[key.connection_id]
+            return {"decode_wall_ms": wall, "decode_steps_delta": 1}
+        self.scheduler.execute = execute
+        await self.register("absolute", "sa", 1000)
+        await self.register("ratio", "sr", 50)
+        await self.scheduler.append_pcm("absolute", "sa", b"\x01\x00" * 16000)
+        await self.scheduler.append_pcm("ratio", "sr", b"\x02\x00" * 800)
+        await self._wait_for(lambda: len(self.results) == 2)
+        metrics = {row[0].connection_id: row[3] for row in self.results}
+        self.assertTrue(metrics["absolute"]["qwen_decode_slo_violation"])
+        self.assertFalse(metrics["absolute"]["decode_overrun"])
+        self.assertFalse(metrics["ratio"]["qwen_decode_slo_violation"])
+        self.assertTrue(metrics["ratio"]["decode_overrun"])
+        self.assertEqual(self.scheduler.snapshot()["qwen_decode_slo_violation_total"], 1)
 
 
 if __name__ == "__main__":

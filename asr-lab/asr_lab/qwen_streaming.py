@@ -19,7 +19,8 @@ from .qwen_scheduler import (
 )
 
 STREAMING_CLASS = "accumulated-audio-pseudostreaming"
-ALLOWED_CHUNK_MS = (250, 500, 1000, 2000)
+ALLOWED_CHUNK_MS = (50, 100, 150, 200, 250, 500, 1000, 2000)
+AUDIO_PUSH_INTERVAL_MS = 100
 QWEN_LANGUAGE_NAMES = {
     "zh": "Chinese", "en": "English", "yue": "Cantonese", "ar": "Arabic",
     "de": "German", "fr": "French", "es": "Spanish", "pt": "Portuguese",
@@ -76,6 +77,12 @@ class StreamSession:
     event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     event_queue: asyncio.Queue[dict[str, Any]] = dataclass_field(default_factory=lambda: asyncio.Queue(maxsize=32))
     first_audio_at: float | None = None
+    stream_init_ms: float | None = None
+    stream_state_init_wall_ms: float | None = None
+    decode_wall_samples: list[float] = dataclass_field(default_factory=list)
+    first_decode_ready_ms: float | None = None
+    first_scheduler_wait_ms: float | None = None
+    first_decode_start_ms: float | None = None
     audio_samples: int = 0
     revision: int = 0
     partial_count: int = 0
@@ -86,6 +93,31 @@ class StreamSession:
     cumulative_decode_wall_ms: float = 0.0
     scheduler_metrics: deque[dict[str, Any]] = dataclass_field(default_factory=lambda: deque(maxlen=256))
     latest_scheduler_key: RequestKey | None = None
+
+
+def _decode_ordinal_metrics(session: StreamSession) -> dict[str, float | None]:
+    samples = session.decode_wall_samples
+    first = samples[0] if samples else None
+    second = samples[1] if len(samples) > 1 else None
+    steady = samples[2:]
+    def percentile(values: list[float], fraction: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = max(0, min(len(ordered) - 1, int((len(ordered) - 1) * fraction + 0.9999)))
+        return round(ordered[index], 3)
+    steady_p50 = percentile(steady, 0.50)
+    steady_p95 = percentile(steady, 0.95)
+    return {
+        "EPOCH_FIRST_DECODE_WALL_MS": round(first, 3) if first is not None else None,
+        "EPOCH_SECOND_DECODE_WALL_MS": round(second, 3) if second is not None else None,
+        "EPOCH_STEADY_DECODE_WALL_P50_MS": steady_p50,
+        "EPOCH_STEADY_DECODE_WALL_P95_MS": steady_p95,
+        "FIRST_DECODE_WALL_MS": round(first, 3) if first is not None else None,
+        "SECOND_DECODE_WALL_MS": round(second, 3) if second is not None else None,
+        "STEADY_DECODE_WALL_P50_MS": steady_p50,
+        "STEADY_DECODE_WALL_P95_MS": steady_p95,
+    }
 
 
 def token_revision_metrics(previous: str, current: str) -> tuple[float | None, float | None]:
@@ -199,6 +231,7 @@ class QwenStreamingRuntime:
         source: str,
         language: str | None = None,
         context: str = "",
+        model_chunk_ms: int | None = None,
         chunk_size_ms: int | None = None,
         request_id: str | None = None,
         event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -206,8 +239,18 @@ class QwenStreamingRuntime:
         if not self.ready:
             raise StreamingError("backend_not_ready")
         language_value = self.default_language if language is None else language
-        chunk_ms = self.default_chunk_ms if chunk_size_ms is None else chunk_size_ms
-        if chunk_ms not in ALLOWED_CHUNK_MS:
+        for supplied_chunk in (model_chunk_ms, chunk_size_ms):
+            if supplied_chunk is not None and (
+                isinstance(supplied_chunk, bool) or not isinstance(supplied_chunk, int)
+                or supplied_chunk not in ALLOWED_CHUNK_MS
+            ):
+                raise StreamingError("invalid_stream_chunk")
+        if model_chunk_ms is not None and chunk_size_ms is not None and model_chunk_ms != chunk_size_ms:
+            raise StreamingError("conflicting_model_chunk")
+        selected_chunk_ms = model_chunk_ms if model_chunk_ms is not None else chunk_size_ms
+        chunk_ms = self.default_chunk_ms if selected_chunk_ms is None else selected_chunk_ms
+        if (isinstance(chunk_ms, bool) or not isinstance(chunk_ms, int)
+                or chunk_ms not in ALLOWED_CHUNK_MS):
             raise StreamingError("invalid_stream_chunk")
         if len(context) > self.max_context_chars:
             raise StreamingError("invalid_context")
@@ -221,7 +264,8 @@ class QwenStreamingRuntime:
             stream_id = uuid.uuid4().hex
             now = time.perf_counter()
             try:
-                await self.worker.request(
+                init_started = time.perf_counter()
+                init_reply = await self.worker.request(
                     "init",
                     stream_id=stream_id,
                     chunk_size_sec=chunk_ms / 1000.0,
@@ -230,6 +274,8 @@ class QwenStreamingRuntime:
                     unfixed_chunk_num=self.unfixed_chunk_num,
                     unfixed_token_num=self.unfixed_token_num,
                 )
+                init_finished = time.perf_counter()
+                state_init_ms = init_reply.get("stream_state_init_wall_ms") if isinstance(init_reply, dict) else None
                 await self.scheduler.register(connection_id, stream_id, chunk_ms)
             except Exception:
                 try:
@@ -249,6 +295,8 @@ class QwenStreamingRuntime:
                 last_activity_at=now,
                 max_stream_seconds=self.max_stream_seconds,
                 event_sink=event_sink,
+                stream_init_ms=(init_finished - init_started) * 1000.0,
+                stream_state_init_wall_ms=float(state_init_ms) if isinstance(state_init_ms, (int, float)) and not isinstance(state_init_ms, bool) else None,
             )
             self.sessions[key] = session
             self.sessions_by_stream_id[(connection_id, stream_id)] = session
@@ -259,8 +307,14 @@ class QwenStreamingRuntime:
             "request_id": request_id,
             "transcript_mode": "STREAMING_PARTIALS",
             "streaming_class": STREAMING_CLASS,
-            "audio_push_interval_ms": 100,
+            "audio_push_interval_ms": AUDIO_PUSH_INTERVAL_MS,
+            "model_chunk_ms": chunk_ms,
             "model_decode_chunk_ms": chunk_ms,
+            "effective_max_backlog_ms": self.scheduler.max_backlog_chunks * chunk_ms,
+            "qwen_max_backlog_chunks": self.scheduler.max_backlog_chunks,
+            "FIRST_STREAM_INIT_MS": round(session.stream_init_ms or 0.0, 3),
+            "FIRST_STREAM_STATE_INIT_WALL_MS": round(session.stream_state_init_wall_ms, 3) if session.stream_state_init_wall_ms is not None else None,
+            "FIRST_STREAM_INIT_RPC_OVERHEAD_MS": round(max(0.0, session.stream_init_ms - session.stream_state_init_wall_ms), 3) if session.stream_init_ms is not None and session.stream_state_init_wall_ms is not None else None,
             "language": language_value,
         }
 
@@ -280,15 +334,13 @@ class QwenStreamingRuntime:
         received_at = time.perf_counter()
         try:
             await self.scheduler.append_pcm(
-                connection_id, session.stream_id, pcm16le,
+                connection_id, session.stream_id, pcm16le, received_at=received_at,
             )
         except SchedulerError as exc:
             await self.close_session(connection_id=connection_id, source=source)
             raise StreamingError(exc.code, exc.details) from exc
         session.audio_samples += samples
         session.last_activity_at = received_at
-        if session.first_audio_at is None:
-            session.first_audio_at = received_at
         return None
 
     async def _execute_scheduled(self, key: RequestKey, job: DecodeJob) -> dict[str, Any]:
@@ -312,6 +364,9 @@ class QwenStreamingRuntime:
         reply = await self.worker.request(job.kind, **payload)
         if reply.get("scheduler_key") != scheduler_key:
             raise StreamingError("invalid_worker_response")
+        delta = reply.get("decode_steps_delta", 0)
+        if isinstance(delta, bool) or not isinstance(delta, int) or delta not in (0, 1):
+            raise StreamingError("invalid_worker_response")
         return reply
 
     async def _scheduled_result(
@@ -323,11 +378,24 @@ class QwenStreamingRuntime:
         if session is None or session.latest_scheduler_key != key:
             return
         ready = time.perf_counter()
+        stream_queue = self.scheduler.streams.get((key.connection_id, key.stream_id))
+        if session.first_audio_at is None and stream_queue is not None:
+            session.first_audio_at = stream_queue.first_audio_at
         stream_metrics = self.scheduler.stream_snapshot(key.connection_id, key.stream_id) or {}
         session.last_activity_at = ready
         decode_wall_ms = max(0.0, float(reply.get("decode_wall_ms", 0.0)))
-        if reply.get("decoded") is True:
+        step_delta = metrics.get("qwen_decode_steps_delta", 0)
+        if step_delta > 0:
             session.cumulative_decode_wall_ms += decode_wall_ms
+            session.decode_wall_samples.append(decode_wall_ms)
+            if session.first_decode_ready_ms is None:
+                origin = metrics.get("first_audio_at")
+                ready_at = metrics.get("job_ready_at")
+                dispatch_at = metrics.get("dispatch_at")
+                if origin is not None and ready_at is not None and dispatch_at is not None:
+                    session.first_decode_ready_ms = max(0.0, (ready_at - origin) * 1000.0)
+                    session.first_scheduler_wait_ms = max(0.0, (dispatch_at - ready_at) * 1000.0)
+                    session.first_decode_start_ms = max(0.0, (dispatch_at - origin) * 1000.0)
         session.scheduler_metrics.append(dict(metrics))
         text = reply.get("text")
         if not isinstance(text, str):
@@ -370,17 +438,29 @@ class QwenStreamingRuntime:
             "audio_cursor_ms": round(cursor_ms, 2),
             "request_id": session.request_id,
             "PARTIAL_COUNT": session.partial_count,
-            "FIRST_PARTIAL_MS": round((ready - (session.first_audio_at or session.started_at)) * 1000, 2),
+            "SERVER_FIRST_PARTIAL_MS": round(((session.first_partial_at if session.first_partial_at is not None else ready) - (session.first_audio_at if session.first_audio_at is not None else session.started_at)) * 1000, 2),
+            "FIRST_PARTIAL_MS": round(((session.first_partial_at if session.first_partial_at is not None else ready) - (session.first_audio_at if session.first_audio_at is not None else session.started_at)) * 1000, 2),
+            "EFFECTIVE_MAX_BACKLOG_MS": session.chunk_size_ms * self.scheduler.max_backlog_chunks,
+            "QWEN_MAX_BACKLOG_CHUNKS": self.scheduler.max_backlog_chunks,
+            "QWEN_DECODE_SLO_TARGET_MS": 100,
+            "QWEN_DECODE_SLO_VIOLATION": None if step_delta <= 0 else bool(metrics.get("qwen_decode_slo_violation", False)),
+            **_decode_ordinal_metrics(session),
             "PARTIAL_UPDATE_INTERVAL_MS": round(interval_ms, 2) if interval_ms is not None else None,
             "PARTIAL_REVISION_RATE": round(revision_rate, 4) if revision_rate is not None else None,
             "PARTIAL_STABILITY": round(stability, 4) if stability is not None else None,
             "SERVER_CHUNK_TO_PARTIAL_MS": round((ready - job.ready_at) * 1000, 2),
-            "QWEN_DECODE_CALL_WALL_MS": round(decode_wall_ms, 2) if reply.get("decoded") else None,
+            "QWEN_DECODE_CALL_WALL_MS": round(decode_wall_ms, 2) if step_delta > 0 else None,
             "QWEN_CUMULATIVE_DECODE_WALL_MS": round(session.cumulative_decode_wall_ms, 2),
             "QWEN_STREAM_RTF": round(session.cumulative_decode_wall_ms / duration_ms, 4),
             "AUDIO_DURATION_MS": round(cursor_ms, 2),
             "MODEL_DECODE_CHUNK_MS": session.chunk_size_ms,
-            "AUDIO_PUSH_INTERVAL_MS": 100,
+            "FIRST_STREAM_INIT_MS": round(session.stream_init_ms or 0.0, 3),
+            "FIRST_STREAM_STATE_INIT_WALL_MS": round(session.stream_state_init_wall_ms, 3) if session.stream_state_init_wall_ms is not None else None,
+            "FIRST_STREAM_INIT_RPC_OVERHEAD_MS": round(max(0.0, session.stream_init_ms - session.stream_state_init_wall_ms), 3) if session.stream_init_ms is not None and session.stream_state_init_wall_ms is not None else None,
+            "FIRST_AUDIO_TO_FIRST_DECODE_READY_MS": round(session.first_decode_ready_ms, 3) if session.first_decode_ready_ms is not None else None,
+            "FIRST_SCHEDULER_WAIT_MS": round(session.first_scheduler_wait_ms, 3) if session.first_scheduler_wait_ms is not None else None,
+            "FIRST_AUDIO_TO_FIRST_DECODE_START_MS": round(session.first_decode_start_ms, 3) if session.first_decode_start_ms is not None else None,
+            "AUDIO_PUSH_INTERVAL_MS": AUDIO_PUSH_INTERVAL_MS,
             "QWEN_SCHEDULER_WAIT_MS": metrics.get("qwen_scheduler_wait_ms"),
             "QWEN_SCHEDULER_REVISION": key.scheduler_revision,
             "QWEN_DECODE_BACKLOG_MS": metrics.get("qwen_decode_backlog_ms"),
@@ -428,7 +508,18 @@ class QwenStreamingRuntime:
         if isinstance(language, str) and language:
             session.current_language = language
         finish_decode_ms = max(0.0, float(reply.get("decode_wall_ms", 0.0)))
-        session.cumulative_decode_wall_ms += finish_decode_ms
+        finish_steps = dispatch.metrics.get("qwen_decode_steps_delta", 0)
+        if finish_steps > 0:
+            session.cumulative_decode_wall_ms += finish_decode_ms
+            session.decode_wall_samples.append(finish_decode_ms)
+            if session.first_decode_ready_ms is None:
+                origin = dispatch.metrics.get("first_audio_at")
+                ready_at = dispatch.metrics.get("job_ready_at")
+                dispatch_at = dispatch.metrics.get("dispatch_at")
+                if origin is not None and ready_at is not None and dispatch_at is not None:
+                    session.first_decode_ready_ms = max(0.0, (ready_at - origin) * 1000.0)
+                    session.first_scheduler_wait_ms = max(0.0, (dispatch_at - ready_at) * 1000.0)
+                    session.first_decode_start_ms = max(0.0, (dispatch_at - origin) * 1000.0)
         cursor_ms = session.audio_samples * 1000.0 / 16_000
         stream_metrics = self.scheduler.stream_snapshot(connection_id, session.stream_id) or {}
         session.scheduler_metrics.append(dict(dispatch.metrics))
@@ -465,7 +556,20 @@ class QwenStreamingRuntime:
             "QWEN_CUMULATIVE_DECODE_WALL_MS": round(session.cumulative_decode_wall_ms, 2),
             "QWEN_STREAM_RTF": round(session.cumulative_decode_wall_ms / max(cursor_ms, 1.0), 4),
             "MODEL_DECODE_CHUNK_MS": session.chunk_size_ms,
-            "AUDIO_PUSH_INTERVAL_MS": 100,
+            "EFFECTIVE_MAX_BACKLOG_MS": session.chunk_size_ms * self.scheduler.max_backlog_chunks,
+            "QWEN_MAX_BACKLOG_CHUNKS": self.scheduler.max_backlog_chunks,
+            "FIRST_STREAM_INIT_MS": round(session.stream_init_ms or 0.0, 3),
+            "FIRST_STREAM_STATE_INIT_WALL_MS": round(session.stream_state_init_wall_ms, 3) if session.stream_state_init_wall_ms is not None else None,
+            "FIRST_STREAM_INIT_RPC_OVERHEAD_MS": round(max(0.0, session.stream_init_ms - session.stream_state_init_wall_ms), 3) if session.stream_init_ms is not None and session.stream_state_init_wall_ms is not None else None,
+            "FIRST_AUDIO_TO_FIRST_DECODE_READY_MS": round(session.first_decode_ready_ms, 3) if session.first_decode_ready_ms is not None else None,
+            "FIRST_SCHEDULER_WAIT_MS": round(session.first_scheduler_wait_ms, 3) if session.first_scheduler_wait_ms is not None else None,
+            "FIRST_AUDIO_TO_FIRST_DECODE_START_MS": round(session.first_decode_start_ms, 3) if session.first_decode_start_ms is not None else None,
+            **_decode_ordinal_metrics(session),
+            "QWEN_DECODE_SLO_TARGET_MS": 100,
+            "QWEN_DECODE_SLO_VIOLATION": None if finish_steps <= 0 else bool(dispatch.metrics.get("qwen_decode_slo_violation", False)),
+            "SERVER_FIRST_PARTIAL_MS": round((session.first_partial_at - session.first_audio_at) * 1000, 2) if session.first_partial_at is not None and session.first_audio_at is not None else None,
+            "FIRST_PARTIAL_MS": round((session.first_partial_at - session.first_audio_at) * 1000, 2) if session.first_partial_at is not None and session.first_audio_at is not None else None,
+            "AUDIO_PUSH_INTERVAL_MS": AUDIO_PUSH_INTERVAL_MS,
             "QWEN_SCHEDULER_WAIT_MS": dispatch.metrics.get("qwen_scheduler_wait_ms"),
             "QWEN_SCHEDULER_REVISION": dispatch.key.scheduler_revision,
             "QWEN_SCHEDULER_WAIT_P50_MS": stream_metrics.get("scheduler_wait_p50_ms"),

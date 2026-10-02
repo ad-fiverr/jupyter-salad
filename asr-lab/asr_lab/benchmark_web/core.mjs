@@ -1,4 +1,5 @@
 export const OUTPUT_RATE = 16_000;
+export const AUDIO_PUSH_INTERVAL_MS = 100;
 export const CHUNK_SAMPLES = 1_600;
 export const SPEECH_THRESHOLD = 0.015;
 export const SILENCE_THRESHOLD = 0.008;
@@ -36,6 +37,17 @@ export const METRIC_DEFINITIONS = Object.freeze({
   SERVER_EOS_TO_TRANSCRIPT_MS: "perf_counter del servidor: último chunk clasificado como voz hasta transcript listo para send_json; no incluye navegador ni red.",
   CLIENT_EOS_TO_TRANSCRIPT_MS: "performance.now del navegador: último chunk que el shadow VAD cliente clasifica como voz hasta recepción del transcript; incluye endpointing aproximado, navegador, red y servidor.",
   PROXY_WS_RTT_MS: "RTT completo de benchmark_ping/pong por el WebSocket autenticado; incluye Gateway/nginx, red y scheduling. No es latencia unidireccional.",
+  FIRST_STREAM_INIT_MS: "Wall time del RPC init de estado Qwen, excluye registro en scheduler.",
+  FIRST_STREAM_STATE_INIT_WALL_MS: "Wall time medido alrededor de model.init_streaming_state dentro del worker.",
+  FIRST_STREAM_INIT_RPC_OVERHEAD_MS: "Diferencia no negativa entre RPC parent y init del worker; nula si falta medición interna.",
+  FIRST_AUDIO_TO_FIRST_DECODE_READY_MS: "Reloj monotónico servidor: primer PCM aceptado hasta job real listo para despacho.",
+  FIRST_SCHEDULER_WAIT_MS: "Reloj monotónico servidor: job listo hasta dispatch del primer decode con step real.",
+  FIRST_AUDIO_TO_FIRST_DECODE_START_MS: "Reloj monotónico servidor: primer PCM aceptado hasta dispatch del primer decode con step real.",
+  SERVER_FIRST_PARTIAL_MS: "Primer PCM aceptado por servidor hasta el primer partial candidate no vacío.",
+  CLIENT_FIRST_PARTIAL_MS: "Primer envío real de audio del navegador/CLI hasta recepción del primer partial candidate no vacío.",
+  EFFECTIVE_MAX_BACKLOG_MS: "Límite efectivo configurado: max_backlog_chunks multiplicado por model_chunk_ms; no se autoajusta.",
+  QWEN_DECODE_SLO_TARGET_MS: "Objetivo absoluto de wall time por llamada Qwen: menos de 100 ms.",
+  QWEN_DECODE_SLO_VIOLATION: "Verdadero si un decode real tarda 100 ms o más, independiente de la ventana de audio.",
   SERVER_RECEIVE_TO_TRANSCRIPT_MS: "Diagnóstico heredado desde el inicio del buffer; puede incluir silencio inicial y duración del segmento hablado. No es KPI de latencia ASR.",
   SEGMENT_WAIT_MS: "Alias heredado: último chunk con voz hasta decisión del cierre/flush, antes de la entrega al broker.",
   MODEL_INFERENCE_MS: "Alias de SERVER_MODEL_INFERENCE_MS.",
@@ -57,6 +69,12 @@ export function rttPercentiles(samples) {
 
 export function formatMilliseconds(value) {
   return Number.isFinite(value) ? `${Number(value).toFixed(2)} ms` : "—";
+}
+
+export function decodeSloLabel(violation) {
+  if (violation === true) return "violation";
+  if (violation === false) return "within target";
+  return "unmeasured";
 }
 
 export function gpuStatusLabel(compute, telemetry) {
@@ -280,4 +298,65 @@ export function csvCell(value) {
   // Avoid spreadsheet formula execution when a transcript is opened as CSV.
   if (typeof value === "string" && /^[\s\u0000-\u001f]*[=+\-@]/.test(text)) text = `'${text}`;
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+export function clientFirstPartialMs(firstAudioSentAt, receivedAt) {
+  if (![firstAudioSentAt, receivedAt].every(Number.isFinite)) return null;
+  return Math.max(0, receivedAt - firstAudioSentAt);
+}
+
+const STARTUP_VERSION_FIELDS = [
+  "qwen_asr_version", "vllm_version", "transformers_version", "torch_version", "torch_cuda_version",
+];
+const STARTUP_EXPERIMENT_FIELDS = [
+  "gpu_memory_utilization", "max_active_sessions", "max_num_seqs", "max_new_tokens",
+  "max_model_len", "warmup_chunk_ms", "unfixed_chunk_num", "unfixed_token_num",
+];
+
+function safeStartupScalar(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string" && value.length <= 160) return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return null;
+}
+
+function safeWorkerStartupMetric(worker, key) {
+  if (!worker || typeof worker !== "object") return null;
+  const value = key === "warmup_chunk_ms"
+    ? worker.experiment_config?.warmup_chunk_ms ?? worker.warmup_chunk_ms
+    : worker[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export function safeQwenStartupEvidence({ readinessAtStart, qwenStartMetrics, health } = {}) {
+  const readiness = readinessAtStart && typeof readinessAtStart === "object" ? readinessAtStart : {};
+  const start = qwenStartMetrics && typeof qwenStartMetrics === "object" ? qwenStartMetrics : {};
+  const snapshot = health && typeof health === "object" ? health : {};
+  const workers = Array.isArray(snapshot.worker_metrics) ? snapshot.worker_metrics : [];
+  const provenance = snapshot.runtime_provenance && typeof snapshot.runtime_provenance === "object"
+    ? snapshot.runtime_provenance : {};
+  const runtimeProvenance = Object.fromEntries(STARTUP_VERSION_FIELDS.map((key) => [key, safeStartupScalar(provenance[key])]));
+  const experiment = provenance.experiment_config && typeof provenance.experiment_config === "object"
+    ? provenance.experiment_config : {};
+  runtimeProvenance.experiment_config = Object.fromEntries(
+    STARTUP_EXPERIMENT_FIELDS.map((key) => [key, safeStartupScalar(experiment[key])]),
+  );
+  return {
+    readiness_at_start: {
+      ready: typeof readiness.ready === "boolean" ? readiness.ready : null,
+      backend: typeof readiness.backend === "string" ? readiness.backend : null,
+      production_backend: typeof readiness.production_backend === "string" ? readiness.production_backend : null,
+      model_loaded: typeof readiness.model_loaded === "boolean" ? readiness.model_loaded : null,
+    },
+    FIRST_STREAM_INIT_MS: safeStartupScalar(start.FIRST_STREAM_INIT_MS),
+    FIRST_STREAM_STATE_INIT_WALL_MS: safeStartupScalar(start.FIRST_STREAM_STATE_INIT_WALL_MS),
+    FIRST_STREAM_INIT_RPC_OVERHEAD_MS: safeStartupScalar(start.FIRST_STREAM_INIT_RPC_OVERHEAD_MS),
+    model_id: typeof snapshot.model_id === "string" ? snapshot.model_id : null,
+    model_revision: typeof snapshot.model_revision === "string" ? snapshot.model_revision : null,
+    model_load_ms: workers.map((worker) => safeWorkerStartupMetric(worker, "model_load_ms")),
+    warmup_ms: workers.map((worker) => safeWorkerStartupMetric(worker, "warmup_ms")),
+    warmup_chunk_ms: workers.map((worker) => safeWorkerStartupMetric(worker, "warmup_chunk_ms")),
+    workers: Number.isInteger(snapshot.workers) ? snapshot.workers : null,
+    runtime_provenance: runtimeProvenance,
+  };
 }

@@ -7,6 +7,7 @@ must not be confused with model or GPU concurrency.
 from __future__ import annotations
 
 import asyncio
+import math
 import statistics
 import time
 from collections import deque
@@ -46,6 +47,7 @@ class StreamQueue:
     pending: deque[DecodeJob] = field(default_factory=deque)
     tail: bytearray = field(default_factory=bytearray)
     accepted_samples: int = 0
+    first_audio_at: float | None = None
     decoded_samples: int = 0
     next_revision: int = 0
     active_key: RequestKey | None = None
@@ -125,6 +127,7 @@ class QwenDecodeScheduler:
         self._decode_steps = 0
         self._overrun_total = 0
         self._decode_budget_overrun_total = 0
+        self._decode_slo_violation_total = 0
 
     async def start(self) -> None:
         if self._task is None:
@@ -141,7 +144,7 @@ class QwenDecodeScheduler:
             self.streams[identity] = StreamQueue(connection_id, stream_id, chunk_ms)
             self._observe_global_high_water_locked()
 
-    async def append_pcm(self, connection_id: str, stream_id: str, pcm16le: bytes) -> dict[str, Any]:
+    async def append_pcm(self, connection_id: str, stream_id: str, pcm16le: bytes, received_at: float | None = None) -> dict[str, Any]:
         if not pcm16le or len(pcm16le) % 2:
             raise SchedulerError("invalid_audio")
         identity = (connection_id, stream_id)
@@ -178,8 +181,10 @@ class QwenDecodeScheduler:
                 self._fence_locked(stream)
                 self._overrun_total += 1
             else:
-                cursor = stream.accepted_samples
-                now = time.perf_counter()
+                cursor = stream.accepted_samples - (len(stream.tail) // 2)
+                now = time.perf_counter() if received_at is None else received_at
+                if stream.first_audio_at is None:
+                    stream.first_audio_at = now
                 for index in range(window_count):
                     pcm = combined[index * window_bytes:(index + 1) * window_bytes]
                     cursor += window_samples
@@ -280,6 +285,9 @@ class QwenDecodeScheduler:
             "stream_id": stream_id,
             "scheduler_pending_jobs": len(stream.pending),
             "scheduler_pending_jobs_max": stream.max_pending_jobs,
+            "effective_max_backlog_ms": stream.chunk_ms * self.max_backlog_chunks,
+            "qwen_max_backlog_chunks": self.max_backlog_chunks,
+            "model_chunk_ms": stream.chunk_ms,
             "active_stream_count_max": stream.max_active_streams,
             "scheduler_backlog_audio_ms": round(backlog_samples * 1000.0 / 16_000, 3),
             "stream_lag_ms": round(max(0, stream.accepted_samples - stream.decoded_samples) * 1000.0 / 16_000, 3),
@@ -338,6 +346,9 @@ class QwenDecodeScheduler:
             "overrun_reason": fault.get("reason"),
             "overrun_limit_kind": limit_kind,
             "overrun_limit_value": limit_value,
+            "effective_max_backlog_ms": stream.chunk_ms * self.max_backlog_chunks,
+            "qwen_max_backlog_chunks": self.max_backlog_chunks,
+            "model_chunk_ms": stream.chunk_ms,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -363,6 +374,7 @@ class QwenDecodeScheduler:
             "qwen_decode_steps_delta_total": self._decode_steps,
             "qwen_scheduler_overrun_total": self._overrun_total,
             "qwen_decode_budget_overrun_total": self._decode_budget_overrun_total,
+            "qwen_decode_slo_violation_total": self._decode_slo_violation_total,
         }
 
     async def close(self) -> None:
@@ -419,11 +431,15 @@ class QwenDecodeScheduler:
                 stream.active_key = key
                 if stream.pending:
                     self._mark_ready_locked(stream)
-                wait_ms = max(0.0, (time.perf_counter() - job.ready_at) * 1000.0)
+                dispatch_at = time.perf_counter()
+                wait_ms = max(0.0, (dispatch_at - job.ready_at) * 1000.0)
                 backlog_ms = stream.queued_samples * 1000.0 / 16_000
                 lag_ms = max(0, stream.accepted_samples - stream.decoded_samples) * 1000.0 / 16_000
                 metrics = {
                     "qwen_scheduler_wait_ms": round(wait_ms, 3),
+                    "dispatch_at": dispatch_at,
+                    "job_ready_at": job.ready_at,
+                    "first_audio_at": stream.first_audio_at,
                     "qwen_scheduler_revision": key.scheduler_revision,
                     "qwen_decode_backlog_ms": round(backlog_ms, 3),
                     "stream_lag_ms": round(lag_ms, 3),
@@ -453,44 +469,58 @@ class QwenDecodeScheduler:
                 )
                 self._active_job = None
                 if error is None and current:
-                    wall_ms = max(0.0, float(reply.get("decode_wall_ms", 0.0)))
-                    steps = max(0, int(reply.get("decode_steps_delta", 0)))
-                    decode_overrun = wall_ms > stream.chunk_ms
-                    if decode_overrun:
-                        self._decode_budget_overrun_total += 1
-                    wait_ms = float(metrics["qwen_scheduler_wait_ms"])
-                    stream.waits_ms.append(wait_ms)
-                    stream.waits_ms = stream.waits_ms[-self.history_limit:]
-                    stream.decode_wall_ms.append(wall_ms)
-                    stream.decode_wall_ms = stream.decode_wall_ms[-self.history_limit:]
-                    stream.decode_steps += steps
-                    stream.dispatched_total_samples += len(job.pcm16le) // 2
-                    stream.decoded_samples = max(stream.decoded_samples, job.cursor_end_samples)
-                    stream.max_backlog_samples = max(stream.max_backlog_samples, stream.queued_samples)
-                    stream.max_stream_lag_samples = max(
-                        stream.max_stream_lag_samples,
-                        max(0, stream.accepted_samples - stream.decoded_samples),
-                    )
-                    self._waits_ms.append(wait_ms)
-                    self._decode_wall_ms.append(wall_ms)
-                    self._decode_steps += steps
-                    metrics.update({
-                        "qwen_decode_call_wall_ms": round(wall_ms, 3),
-                        "qwen_decode_steps_delta": steps,
-                        "stream_lag_ms": round(max(0, stream.accepted_samples - stream.decoded_samples) * 1000.0 / 16_000, 3),
-                        "accepted_audio_ms": round(stream.accepted_total_samples * 1000.0 / 16_000, 3),
-                        "dispatched_audio_ms": round(stream.dispatched_total_samples * 1000.0 / 16_000, 3),
-                        "decode_overrun": decode_overrun,
-                    })
+                    raw_wall = reply.get("decode_wall_ms", 0.0)
+                    raw_steps = reply.get("decode_steps_delta", 0)
+                    if (isinstance(raw_wall, bool) or not isinstance(raw_wall, (int, float))
+                            or not math.isfinite(float(raw_wall)) or raw_wall < 0 or isinstance(raw_steps, bool)
+                            or not isinstance(raw_steps, int) or raw_steps not in (0, 1)):
+                        error = SchedulerError("invalid_worker_response")
+                        self._fence_locked(stream)
+                    else:
+                        wall_ms = float(raw_wall)
+                        steps = raw_steps
+                        decode_overrun = steps > 0 and wall_ms > stream.chunk_ms
+                        wait_ms = float(metrics["qwen_scheduler_wait_ms"])
+                        stream.waits_ms.append(wait_ms)
+                        stream.waits_ms = stream.waits_ms[-self.history_limit:]
+                        stream.dispatched_total_samples += len(job.pcm16le) // 2
+                        stream.decoded_samples = max(stream.decoded_samples, job.cursor_end_samples)
+                        stream.max_backlog_samples = max(stream.max_backlog_samples, stream.queued_samples)
+                        stream.max_stream_lag_samples = max(
+                            stream.max_stream_lag_samples,
+                            max(0, stream.accepted_samples - stream.decoded_samples),
+                        )
+                        self._waits_ms.append(wait_ms)
+                        if steps > 0:
+                            stream.decode_wall_ms.append(wall_ms)
+                            stream.decode_wall_ms = stream.decode_wall_ms[-self.history_limit:]
+                            stream.decode_steps += steps
+                            self._decode_wall_ms.append(wall_ms)
+                            self._decode_steps += steps
+                            if decode_overrun:
+                                self._decode_budget_overrun_total += 1
+                            if wall_ms >= 100:
+                                self._decode_slo_violation_total += 1
+                        metrics.update({
+                            "qwen_decode_call_wall_ms": round(wall_ms, 3),
+                            "qwen_decode_steps_delta": steps,
+                            "stream_lag_ms": round(max(0, stream.accepted_samples - stream.decoded_samples) * 1000.0 / 16_000, 3),
+                            "accepted_audio_ms": round(stream.accepted_total_samples * 1000.0 / 16_000, 3),
+                            "dispatched_audio_ms": round(stream.dispatched_total_samples * 1000.0 / 16_000, 3),
+                            "decode_overrun": decode_overrun,
+                            "qwen_decode_slo_target_ms": 100,
+                            "qwen_decode_slo_violation": bool(steps > 0 and wall_ms >= 100),
+                        })
                 elif error is not None and current:
                     self._fence_locked(stream)
                 self._condition.notify_all()
 
             if error is not None:
+                failure_code = error.code if isinstance(error, SchedulerError) else "stream_worker_failed"
                 if job.future is not None and not job.future.done():
-                    job.future.set_exception(SchedulerError("stream_worker_failed"))
+                    job.future.set_exception(SchedulerError(failure_code))
                 if current:
-                    await self.on_fault(stream.connection_id, stream.stream_id, "stream_worker_failed", {})
+                    await self.on_fault(stream.connection_id, stream.stream_id, failure_code, {})
                 continue
             if not current:
                 if job.future is not None and not job.future.done():

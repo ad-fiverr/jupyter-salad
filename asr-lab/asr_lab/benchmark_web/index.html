@@ -41,8 +41,11 @@
               <option value="de">alemán</option><option value="it">italiano</option><option value="ru">ruso</option>
             </select>
           </label>
-          <label>QWEN_STREAM_CHUNK_MS
+          <label>QWEN_MODEL_CHUNK_MS
             <select id="qwen-chunk-size">
+              <option value="50">50 ms</option>
+              <option value="100">100 ms</option>
+              <option value="150">150 ms</option>
               <option value="250">250 ms</option><option value="500">500 ms</option>
               <option value="1000" selected>1000 ms</option><option value="2000">2000 ms</option>
             </select>
@@ -51,7 +54,7 @@
             <input id="qwen-context" type="text" maxlength="512" autocomplete="off" spellcheck="false">
             <small>Hasta 512 caracteres. Se usa sólo durante esta sesión y no se guarda.</small>
           </label>
-          <p class="fine-print wide">El navegador envía audio cada 100 ms; QWEN_STREAM_CHUNK_MS controla el umbral de decode, que puede ser mayor. Los parciales son hipótesis reemplazables, nunca confirmación de negocio.</p>
+          <p class="fine-print wide">El navegador envía audio cada 100 ms; QWEN_MODEL_CHUNK_MS controla el umbral de decode, que puede ser mayor. Los parciales son hipótesis reemplazables, nunca confirmación de negocio.</p>
         </div>
         <label class="wide">Texto esperado (opcional, para WER)
           <textarea id="reference-text" rows="2" placeholder="Escribe aquí el texto que vas a leer"></textarea>
@@ -121,6 +124,7 @@
         <div class="metric-card"><span>Decodes sobre presupuesto / fences</span><strong id="qwen-overruns">—</strong></div>
         <div class="metric-card"><span>GPU / VRAM / RAM · global</span><strong id="qwen-device-telemetry">—</strong></div>
       </div>
+      <p class="fine-print" id="qwen-cadence-latency">Esperando diagnósticos de inicialización, primer decode, bound y SLO absoluto de 100 ms.</p>
       <div class="table-wrap partial-timeline-wrap"><table><thead><tr><th>Audio cursor</th><th>Client elapsed</th><th>Revision</th><th>Partial completo (reemplaza el anterior)</th><th>Server chunk → partial</th><th>Revisión</th><th>Decode wall</th></tr></thead><tbody id="qwen-partials-body"><tr><td colspan="7" class="empty">Aún no hay parciales.</td></tr></tbody></table></div>
       <div class="charts-grid qwen-charts" aria-label="Métricas del scheduler Qwen">
         <article class="panel chart-card qwen-chart-card"><h3>Scheduler wait p95 · agregado móvil 1 Hz</h3><canvas id="chart-qwen-wait" aria-label="Percentil 95 del scheduler wait Qwen por sondeo"></canvas></article>
