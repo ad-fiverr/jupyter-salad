@@ -71,11 +71,14 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "client A": ["quiero reservar para cuatro", "quiero reservar para seis"],
                 "client B": ["cancelar mi cita"],
                 "zero partial": [""],
+                "short stream": ["short candidate"],
+                "empty stream": [""],
             },
             finals={
                 "client A": "quiero reservar para seis mañana",
                 "client B": "cancelar mi cita",
                 "zero partial": "final hypothesis only",
+                "empty stream": "",
             },
         )
         self.runtime = QwenStreamingRuntime(
@@ -169,6 +172,43 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["text"], "final hypothesis only")
         self.assertEqual(final["PARTIAL_COUNT"], 0)
         self.assertIsNone(final["FIRST_PARTIAL_MS"])
+
+    async def test_subwindow_speech_starts_worker_push_before_eos_without_turn_id(self):
+        await self.runtime.open_session(
+            connection_id="short", source="mic", context="short stream", model_chunk_ms=250,
+        )
+        pcm = b"\x17\x00" * 800
+        await self.runtime.push_audio(connection_id="short", source="mic", pcm16le=pcm)
+        partial = await self.runtime.receive_event(connection_id="short", source="mic")
+
+        self.assertEqual(partial["event"], "partial_candidate")
+        self.assertEqual(partial["text"], "short candidate")
+        self.assertEqual(partial["truth_status"], "candidate_only")
+        self.assertNotIn("turnId", partial)
+        self.assertNotIn("turn_id", partial)
+        operations_before_eos = [operation for operation, _ in self.worker.requests]
+        self.assertIn("push", operations_before_eos)
+        self.assertNotIn("finish", operations_before_eos)
+
+        await self.runtime.finish(connection_id="short", source="mic")
+        operations_after_eos = [operation for operation, _ in self.worker.requests]
+        self.assertLess(operations_after_eos.index("push"), operations_after_eos.index("finish"))
+
+    async def test_empty_stream_eos_finalizes_without_pcm_push_or_partial(self):
+        await self.runtime.open_session(
+            connection_id="empty", source="mic", context="empty stream", model_chunk_ms=250,
+        )
+
+        final = await self.runtime.finish(connection_id="empty", source="mic")
+
+        self.assertEqual(final["event"], "final_candidate")
+        self.assertEqual(final["PARTIAL_COUNT"], 0)
+        self.assertNotIn("turnId", final)
+        self.assertNotIn("turn_id", final)
+        self.assertEqual(
+            [operation for operation, _ in self.worker.requests if operation in {"push", "finish"}],
+            ["finish"],
+        )
 
     async def test_candidate_event_validator_rejects_transcript_truth_events(self):
         partial = {
@@ -399,8 +439,8 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.runtime.push_audio(connection_id="clocked", source="mic", pcm16le=b"\x01\x00" * 400)
             await self.runtime.push_audio(connection_id="clocked", source="mic", pcm16le=b"\x02\x00" * 400)
             partial = await self.runtime.receive_event(connection_id="clocked", source="mic")
-        self.assertEqual(partial["FIRST_AUDIO_TO_FIRST_DECODE_READY_MS"], 2.0)
-        self.assertEqual(partial["FIRST_SCHEDULER_WAIT_MS"], 3.0)
+        self.assertEqual(partial["FIRST_AUDIO_TO_FIRST_DECODE_READY_MS"], 0.0)
+        self.assertEqual(partial["FIRST_SCHEDULER_WAIT_MS"], 5.0)
         self.assertEqual(partial["FIRST_AUDIO_TO_FIRST_DECODE_START_MS"], 5.0)
         self.assertEqual(partial["FIRST_AUDIO_TO_FIRST_DECODE_READY_MS"] + partial["FIRST_SCHEDULER_WAIT_MS"], partial["FIRST_AUDIO_TO_FIRST_DECODE_START_MS"])
         self.assertEqual(partial["SERVER_FIRST_PARTIAL_MS"], partial["FIRST_PARTIAL_MS"])

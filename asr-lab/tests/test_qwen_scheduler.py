@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from asr_lab.qwen_scheduler import QwenDecodeScheduler, SchedulerError
+from asr_lab.qwen_scheduler import QwenDecodeScheduler, RequestKey, SchedulerError
 
 
 class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -66,16 +66,19 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await self.register("a", "stream-a")
         frame = b"\x01\x00" * 1600
         await self.scheduler.append_pcm("a", "stream-a", frame)
-        await self.scheduler.append_pcm("a", "stream-a", frame)
-        self.assertEqual(self.jobs, [])
-        await self.scheduler.append_pcm("a", "stream-a", frame)
         await asyncio.wait_for(self.started.wait(), 1)
         await self._wait_for(lambda: len(self.jobs) == 1)
-        self.assertEqual(len(self.jobs[0][2]), 4000 * 2)
+        self.assertEqual(len(self.jobs[0][2]) // 2, 1600)
+        self.assertEqual(self.jobs[0][2], frame)
+        for _ in range(3):
+            await self.scheduler.append_pcm("a", "stream-a", frame)
+        await self._wait_for(lambda: len(self.jobs) == 2)
+        self.assertEqual([len(job[2]) // 2 for job in self.jobs], [1600, 4000])
         stream = self.scheduler.streams[("a", "stream-a")]
         self.assertEqual(len(stream.tail) // 2, 800)
-        self.assertEqual(stream.accepted_total_samples, 4800)
-        self.assertEqual(stream.dispatched_total_samples, 4000)
+        self.assertEqual(stream.accepted_total_samples, 6400)
+        self.assertEqual(stream.dispatched_total_samples, 5600)
+        self.assertEqual(b"".join(job[2] for job in self.jobs) + bytes(stream.tail), frame * 4)
 
     async def test_500_and_1000ms_windows_match_100ms_pcm_frame_boundaries(self):
         self.release.set()
@@ -83,10 +86,13 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         for chunk_ms in (500, 1000):
             stream_name = f"stream-{chunk_ms}"
             await self.register(str(chunk_ms), stream_name, chunk_ms)
+            first_job_count = len(self.jobs)
+            await self.scheduler.append_pcm(str(chunk_ms), stream_name, frame)
+            await self._wait_for(lambda: len(self.jobs) >= first_job_count + 1)
+            self.assertEqual(len(self.jobs[-1][2]) // 2, 1600)
             for _ in range(chunk_ms // 100):
                 await self.scheduler.append_pcm(str(chunk_ms), stream_name, frame)
-            expected_jobs = len(self.jobs) + 1
-            await self._wait_for(lambda: len(self.jobs) >= expected_jobs)
+            await self._wait_for(lambda: len(self.jobs) >= first_job_count + 2)
             self.assertEqual(len(self.jobs[-1][2]), chunk_ms * 16 * 2)
 
     async def test_round_robin_services_each_ready_stream_before_hot_stream_repeats(self):
@@ -131,6 +137,28 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await self._wait_for(lambda: len([row for row in self.jobs if row[0].connection_id == "B"]) == 2)
         self.assertEqual(self.max_active, 1)
         self.assertEqual(self.faults[-1][2], "stream_scheduler_overrun")
+
+    async def test_wrong_scheduler_revision_is_not_current_on_same_active_stream(self):
+        await self.register("revision", "stream-revision", 50)
+        await self.scheduler.append_pcm(
+            "revision", "stream-revision", b"\x01\x00" * 800
+        )
+        await asyncio.wait_for(self.started.wait(), 1)
+
+        stream = self.scheduler.streams[("revision", "stream-revision")]
+        current_key = stream.active_key
+        self.assertIsNotNone(current_key)
+        self.assertTrue(self.scheduler.is_current(current_key))
+
+        mismatched_revision = RequestKey(
+            current_key.connection_id,
+            current_key.stream_id,
+            current_key.scheduler_revision + 1,
+        )
+        self.assertFalse(self.scheduler.is_current(mismatched_revision))
+
+        self.release.set()
+        await self._wait_for(lambda: len(self.jobs) == 1)
 
     async def test_pending_and_active_stream_high_water_marks_cover_the_six_stream_group(self):
         await self.register("A", "sa")
@@ -226,10 +254,28 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         finished = await self.scheduler.finish_stream("client", "stream")
         await self._wait_for(lambda: len(self.jobs) == 3)
         self.assertEqual([row[1] for row in self.jobs], ["push", "push", "finish"])
-        self.assertEqual([len(row[2]) // 2 for row in self.jobs], [4000, 800, 0])
+        self.assertEqual([len(row[2]) // 2 for row in self.jobs], [1600, 3200, 0])
         self.assertEqual(sum(len(row[2]) // 2 for row in self.jobs), 4800)
         self.assertEqual(self.jobs[-1][0].scheduler_revision, finished.key.scheduler_revision)
         self.assertEqual(self.max_active, 1)
+
+    async def test_first_subwindow_audio_is_pushed_before_eos_once_and_unpadded(self):
+        self.release.set()
+        await self.register("short", "stream", 250)
+        pcm = b"\x16\x00" * 800
+
+        await self.scheduler.append_pcm("short", "stream", pcm)
+        await self._wait_for(lambda: len(self.jobs) == 1)
+
+        self.assertEqual(self.jobs[0][1], "push")
+        self.assertEqual(self.jobs[0][2], pcm)
+        self.assertEqual(self.jobs[0][3], 800)
+        stream = self.scheduler.streams[("short", "stream")]
+        self.assertEqual(bytes(stream.tail), b"")
+
+        await self.scheduler.finish_stream("short", "stream")
+        await self._wait_for(lambda: len(self.jobs) == 2)
+        self.assertEqual([job[1] for job in self.jobs], ["push", "finish"])
 
     async def test_metrics_separate_backlog_wait_decode_and_steps(self):
         self.release.set()
@@ -281,22 +327,29 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row[3] for row in self.jobs], [800, 1600])
         await self.register("mid", "s150", 150)
         frame = struct.pack("<1600h", *[i - 800 for i in range(1600)])
+        start = len(self.jobs)
+        await self.scheduler.append_pcm("mid", "s150", frame)
+        await self._wait_for(lambda: len(self.jobs) == start + 1)
         await self.scheduler.append_pcm("mid", "s150", frame)
         await self.scheduler.append_pcm("mid", "s150", frame)
-        self.assertEqual(self.scheduler.streams[("mid", "s150")].pending[0].cursor_end_samples, 2400)
-        self.assertEqual(len(self.scheduler.streams[("mid", "s150")].tail) // 2, 800)
-        await self.scheduler.append_pcm("mid", "s150", frame)
-        await self._wait_for(lambda: len(self.jobs) == 4)
-        mid_jobs = [row for row in self.jobs if row[0].connection_id == "mid"]
-        self.assertEqual([len(row[2]) // 2 for row in mid_jobs], [2400, 2400])
-        self.assertEqual([row[3] for row in mid_jobs], [2400, 4800])
-        self.assertEqual(b"".join(row[2] for row in mid_jobs) + bytes(self.scheduler.streams[("mid", "s150")].tail), frame * 3)
+        await self._wait_for(lambda: len(self.jobs) == start + 2)
+        mid_jobs = self.jobs[start:]
+        stream = self.scheduler.streams[("mid", "s150")]
+        self.assertEqual([len(row[2]) // 2 for row in mid_jobs], [1600, 2400])
+        self.assertEqual([row[3] for row in mid_jobs], [1600, 4000])
+        self.assertEqual(len(stream.tail) // 2, 800)
+        self.assertEqual(b"".join(row[2] for row in mid_jobs) + bytes(stream.tail), frame * 3)
 
     async def test_100_150_200_250ms_windows_preserve_exact_pcm_through_eos(self):
         self.release.set()
         import struct
         frames = [struct.pack("<1600h", *[frame * 5000 + i for i in range(1600)]) for frame in range(3)]
-        expected_samples = {100: [1600, 1600, 1600], 150: [2400, 2400], 200: [3200, 1600], 250: [4000, 800]}
+        expected_samples = {
+            100: [1600, 1600, 1600],
+            150: [1600, 2400, 800],
+            200: [1600, 3200],
+            250: [1600, 3200],
+        }
         for chunk_ms, sample_counts in expected_samples.items():
             connection, stream = f"eos-{chunk_ms}", f"s-{chunk_ms}"
             before = len(self.jobs)
@@ -346,8 +399,8 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         ready_ms = (ready_at - first_audio) * 1000
         wait_ms = (dispatch_at - ready_at) * 1000
         start_ms = (dispatch_at - first_audio) * 1000
-        self.assertAlmostEqual(ready_ms, 2.0)
-        self.assertAlmostEqual(wait_ms, 3.0)
+        self.assertAlmostEqual(ready_ms, 0.0)
+        self.assertAlmostEqual(wait_ms, 5.0)
         self.assertAlmostEqual(start_ms, 5.0)
         self.assertAlmostEqual(ready_ms + wait_ms, start_ms)
 

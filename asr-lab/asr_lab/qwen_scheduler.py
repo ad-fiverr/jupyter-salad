@@ -159,6 +159,8 @@ class QwenDecodeScheduler:
             window_bytes = window_samples * 2
             window_count = len(combined) // window_bytes
             residual = combined[window_count * window_bytes:]
+            first_audio = stream.first_audio_at is None
+            scheduled_job_count = window_count + int(first_audio and window_count == 0)
             backlog_samples = stream.queued_samples + incoming_samples
             per_stream_limit = window_samples * self.max_backlog_chunks
             if backlog_samples > per_stream_limit:
@@ -168,7 +170,7 @@ class QwenDecodeScheduler:
                     "rejected_audio_ms": incoming_samples * 1000.0 / 16_000,
                     "backlog_limit_ms": per_stream_limit * 1000.0 / 16_000,
                 })
-            elif self.pending_jobs + window_count > self.max_pending_jobs:
+            elif self.pending_jobs + scheduled_job_count > self.max_pending_jobs:
                 fault = ("stream_scheduler_overrun", {
                     "reason": "global_pending_job_limit",
                     "accepted_audio_ms": stream.queued_samples * 1000.0 / 16_000,
@@ -189,6 +191,16 @@ class QwenDecodeScheduler:
                     pcm = combined[index * window_bytes:(index + 1) * window_bytes]
                     cursor += window_samples
                     stream.pending.append(DecodeJob("push", pcm, cursor, now))
+                if first_audio and window_count == 0:
+                    # Start the ASR stream from speech arrival, even when this
+                    # first transport payload is shorter than a model window.
+                    # This one-time unpadded priming push is consumed exactly
+                    # once; later pushes still follow configured model windows.
+                    priming_samples = len(combined) // 2
+                    stream.pending.append(DecodeJob(
+                        "push", combined, stream.accepted_samples + priming_samples, now,
+                    ))
+                    residual = b""
                 stream.tail = bytearray(residual)
                 stream.accepted_samples += incoming_samples
                 stream.accepted_total_samples += incoming_samples
