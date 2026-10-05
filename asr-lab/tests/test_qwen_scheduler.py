@@ -138,6 +138,28 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.max_active, 1)
         self.assertEqual(self.faults[-1][2], "stream_scheduler_overrun")
 
+    async def test_late_fenced_decode_reports_staleness_only_to_its_captured_owner(self):
+        stale_a = []
+        stale_b = []
+        await self.scheduler.register(
+            "A", "sa", 250,
+            local_stale_reject_observer=lambda stream_id, gate: stale_a.append((stream_id, gate)),
+        )
+        await self.scheduler.register(
+            "B", "sb", 250,
+            local_stale_reject_observer=lambda stream_id, gate: stale_b.append((stream_id, gate)),
+        )
+        await self.scheduler.append_pcm("A", "sa", b"\x11\x00" * 4000)
+        await asyncio.wait_for(self.started.wait(), 1)
+        await self.scheduler.fence_stream("A", "sa", "disconnect")
+        await self.scheduler.append_pcm("B", "sb", b"\x22\x00" * 4000)
+        self.release.set()
+        await self._wait_for(lambda: len(self.jobs) == 2)
+        await self._wait_for(lambda: len(self.results) == 1)
+        self.assertEqual(stale_a, [("sa", "scheduler_request_key_stale")])
+        self.assertEqual(stale_b, [])
+        self.assertEqual([item[0].connection_id for item in self.results], ["B"])
+
     async def test_wrong_scheduler_revision_is_not_current_on_same_active_stream(self):
         await self.register("revision", "stream-revision", 50)
         await self.scheduler.append_pcm(

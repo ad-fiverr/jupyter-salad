@@ -39,6 +39,11 @@ class WorkerRPC(Protocol):
     async def close(self) -> None: ...
 
 
+ProcessedAudioObserver = Callable[[str, int], None]
+CandidateResultFilter = Callable[[dict[str, Any]], dict[str, Any] | None]
+LocalStaleRejectObserver = Callable[[str, str], None]
+
+
 class StreamingError(RuntimeError):
     def __init__(self, code: str, details: dict[str, Any] | None = None):
         super().__init__(code)
@@ -75,6 +80,8 @@ class StreamSession:
     last_activity_at: float
     max_stream_seconds: float
     event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    candidate_result_filter: CandidateResultFilter | None = None
+    processed_audio_observer: ProcessedAudioObserver | None = None
     event_queue: asyncio.Queue[dict[str, Any]] = dataclass_field(default_factory=lambda: asyncio.Queue(maxsize=32))
     first_audio_at: float | None = None
     stream_init_ms: float | None = None
@@ -235,6 +242,9 @@ class QwenStreamingRuntime:
         chunk_size_ms: int | None = None,
         request_id: str | None = None,
         event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        candidate_result_filter: CandidateResultFilter | None = None,
+        processed_audio_observer: ProcessedAudioObserver | None = None,
+        local_stale_reject_observer: LocalStaleRejectObserver | None = None,
     ) -> dict[str, Any]:
         if not self.ready:
             raise StreamingError("backend_not_ready")
@@ -276,7 +286,12 @@ class QwenStreamingRuntime:
                 )
                 init_finished = time.perf_counter()
                 state_init_ms = init_reply.get("stream_state_init_wall_ms") if isinstance(init_reply, dict) else None
-                await self.scheduler.register(connection_id, stream_id, chunk_ms)
+                await self.scheduler.register(
+                    connection_id,
+                    stream_id,
+                    chunk_ms,
+                    local_stale_reject_observer=local_stale_reject_observer,
+                )
             except Exception:
                 try:
                     await self.worker.request("close", stream_id=stream_id)
@@ -295,6 +310,8 @@ class QwenStreamingRuntime:
                 last_activity_at=now,
                 max_stream_seconds=self.max_stream_seconds,
                 event_sink=event_sink,
+                candidate_result_filter=candidate_result_filter,
+                processed_audio_observer=processed_audio_observer,
                 stream_init_ms=(init_finished - init_started) * 1000.0,
                 stream_state_init_wall_ms=float(state_init_ms) if isinstance(state_init_ms, (int, float)) and not isinstance(state_init_ms, bool) else None,
             )
@@ -373,9 +390,11 @@ class QwenStreamingRuntime:
         self, key: RequestKey, job: DecodeJob, reply: dict[str, Any], metrics: dict[str, Any],
     ) -> None:
         if not self.scheduler.is_current(key):
+            self._observe_local_stale_reject(job, key, "runtime_scheduler_key_stale")
             return
         session = self.sessions_by_stream_id.get((key.connection_id, key.stream_id))
         if session is None or session.latest_scheduler_key != key:
+            self._observe_local_stale_reject(job, key, "runtime_session_key_stale")
             return
         ready = time.perf_counter()
         stream_queue = self.scheduler.streams.get((key.connection_id, key.stream_id))
@@ -400,6 +419,8 @@ class QwenStreamingRuntime:
         text = reply.get("text")
         if not isinstance(text, str):
             raise StreamingError("invalid_worker_response")
+        if job.kind == "push" and session.processed_audio_observer is not None:
+            session.processed_audio_observer(session.stream_id, job.cursor_end_samples)
         if not text.strip() or text == session.current_text:
             return None
 
@@ -472,6 +493,9 @@ class QwenStreamingRuntime:
             "ACTIVE_STREAM_COUNT": self.scheduler.active_stream_count,
             "DECODE_OVERRUN": bool(metrics.get("decode_overrun", False)),
         }
+        event = self._filter_candidate_result(session, event, "partial_candidate")
+        if event is None:
+            return None
         if session.event_sink is not None:
             await session.event_sink(event)
         else:
@@ -480,7 +504,7 @@ class QwenStreamingRuntime:
     async def finish(
         self, *, connection_id: str, source: str, server_eos_at: float | None = None,
         request_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         key = (connection_id, source)
         session = self.sessions.get(key)
         if session is None or session.owner_connection_id != connection_id:
@@ -593,8 +617,29 @@ class QwenStreamingRuntime:
             "ACTIVE_STREAM_COUNT_MAX": stream_metrics.get("active_stream_count_max"),
             "DECODE_OVERRUN": bool(dispatch.metrics.get("decode_overrun", False)),
         }
+        event = self._filter_candidate_result(session, event, "final_candidate")
         await self.close_session(connection_id=connection_id, source=source)
         return event
+
+    @staticmethod
+    def _filter_candidate_result(
+        session: StreamSession,
+        event: dict[str, Any],
+        expected_event: str,
+    ) -> dict[str, Any] | None:
+        """Apply an optional canonical gate after local freshness succeeds."""
+        result_filter = session.candidate_result_filter
+        if result_filter is None:
+            return event
+        try:
+            filtered = result_filter(event)
+            if filtered is None or not isinstance(filtered, dict):
+                return None
+            return validate_candidate_event(filtered, expected_event)
+        except Exception:
+            # A configured result gate is fail-closed: its failure cannot
+            # allow an unverified candidate to reach a sink or caller.
+            return None
 
     async def close_session(self, *, connection_id: str, source: str) -> None:
         key = (connection_id, source)
@@ -630,6 +675,17 @@ class QwenStreamingRuntime:
         except Exception:
             pass
         await self.close_session(connection_id=connection_id, source=session.source)
+
+    @staticmethod
+    def _observe_local_stale_reject(job: DecodeJob, key: RequestKey, reason: str) -> None:
+        observer = job.local_stale_reject_observer
+        if observer is None:
+            return
+        try:
+            observer(key.stream_id, reason)
+        except Exception:
+            # Observability must not alter stale-result fencing or delivery.
+            pass
 
     async def close_connection(self, connection_id: str) -> None:
         keys = [key for key in self.sessions if key[0] == connection_id]

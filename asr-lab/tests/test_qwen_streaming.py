@@ -294,7 +294,14 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 if operation == "push":
                     self.push_started.set()
                     await self.release_push.wait()
-                    return {"decoded": True, "decode_wall_ms": 3, "text": "stale result", "language": "Spanish"}
+                    return {
+                        "scheduler_key": payload.get("scheduler_key"),
+                        "decoded": True,
+                        "decode_wall_ms": 3,
+                        "decode_steps_delta": 1,
+                        "text": "stale result",
+                        "language": "Spanish",
+                    }
                 return await super().request(operation, **payload)
 
         worker = DelayedWorker()
@@ -318,7 +325,14 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         await runtime.start()
         try:
-            await runtime.open_session(connection_id="dead-connection", source="mic", chunk_size_ms=1000, event_sink=sink)
+            processed = []
+            stale_rejects = []
+            await runtime.open_session(
+                connection_id="dead-connection", source="mic", chunk_size_ms=1000,
+                event_sink=sink,
+                processed_audio_observer=lambda stream_id, cursor: processed.append((stream_id, cursor)),
+                local_stale_reject_observer=lambda stream_id, gate: stale_rejects.append((stream_id, gate)),
+            )
             pending = asyncio.create_task(runtime.push_audio(
                 connection_id="dead-connection", source="mic", pcm16le=b"\0\0" * 16000,
             ))
@@ -326,11 +340,90 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await runtime.close_connection("dead-connection")
             worker.release_push.set()
             self.assertIsNone(await pending)
-            await asyncio.sleep(0)
+            for _ in range(100):
+                if stale_rejects:
+                    break
+                await asyncio.sleep(0.001)
             self.assertEqual(runtime.active_sessions, 0)
             self.assertEqual(results, [])
+            self.assertEqual(processed, [])
+            self.assertEqual(len(stale_rejects), 1)
+            self.assertEqual(stale_rejects[0][1], "scheduler_request_key_stale")
         finally:
             worker.release_push.set()
+            await runtime.close()
+
+    async def test_runtime_secondary_freshness_gate_reports_once_without_delivering(self):
+        from asr_lab.qwen_scheduler import DecodeJob, RequestKey
+
+        stale_rejects = []
+        events = []
+        async def sink(payload):
+            events.append(payload)
+
+        started = await self.runtime.open_session(
+            connection_id="freshness", source="mic", event_sink=sink,
+            local_stale_reject_observer=lambda stream_id, gate: stale_rejects.append((stream_id, gate)),
+        )
+        stream_id = started["stream_id"]
+        session = self.runtime.sessions[("freshness", "mic")]
+        key = RequestKey("freshness", stream_id, 1)
+        session.latest_scheduler_key = RequestKey("freshness", stream_id, 2)
+        job = DecodeJob("push", b"\0\0", 1, 0.0, local_stale_reject_observer=lambda sid, gate: stale_rejects.append((sid, gate)))
+        with patch.object(self.runtime.scheduler, "is_current", return_value=True):
+            await self.runtime._scheduled_result(
+                key, job,
+                {"text": "must not deliver", "decode_wall_ms": 1.0, "decode_steps_delta": 1},
+                {},
+            )
+        self.assertEqual(stale_rejects, [(stream_id, "runtime_session_key_stale")])
+        self.assertEqual(events, [])
+        self.assertEqual(session.partial_count, 0)
+
+    async def test_processed_audio_observer_tracks_successful_pushes_including_blank_text_and_eos_residual(self):
+        worker = FakeWorker(
+            text_sequences={"blank observer": [""]},
+            finals={"blank observer": "final only"},
+        )
+        runtime = QwenStreamingRuntime(
+            worker=worker, model_id="Qwen/Qwen3-ASR-1.7B", model_revision="fixed",
+            gpu_memory_utilization=0.65, max_active_sessions=1, max_pending_jobs=12,
+            max_backlog_chunks=4, max_stream_seconds=2.0, session_idle_ttl_seconds=120.0,
+            max_context_chars=512, default_chunk_ms=250, default_language="auto",
+            unfixed_chunk_num=2, unfixed_token_num=5,
+        )
+        await runtime.start()
+        try:
+            observed = []
+            first_push_processed = asyncio.Event()
+
+            def observe(stream_id, cursor):
+                observed.append((stream_id, cursor))
+                first_push_processed.set()
+
+            opened = await runtime.open_session(
+                connection_id="observer", source="mic", context="blank observer",
+                chunk_size_ms=250, processed_audio_observer=observe,
+            )
+            await runtime.push_audio(
+                connection_id="observer", source="mic", pcm16le=b"\x01\x00" * 4000,
+            )
+            await asyncio.wait_for(first_push_processed.wait(), 1)
+            self.assertEqual(observed, [(opened["stream_id"], 4000)])
+
+            # Leave a sub-chunk tail so EOS must successfully push it before
+            # the finish RPC. The finish operation itself has no PCM progress.
+            await runtime.push_audio(
+                connection_id="observer", source="mic", pcm16le=b"\x02\x00" * 17,
+            )
+            final = await runtime.finish(connection_id="observer", source="mic")
+            self.assertEqual(final["text"], "final only")
+            self.assertEqual(observed, [(opened["stream_id"], 4000), (opened["stream_id"], 4017)])
+            self.assertEqual(
+                [operation for operation, _ in worker.requests if operation in {"push", "finish"}],
+                ["push", "push", "finish"],
+            )
+        finally:
             await runtime.close()
 
     async def test_active_session_limit_and_disconnect_cleanup_are_enforced(self):
@@ -520,6 +613,77 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(two["FIRST_DECODE_WALL_MS"], 10.0)
         self.assertEqual(two["SECOND_DECODE_WALL_MS"], 20.0)
         self.assertIsNone(two["STEADY_DECODE_WALL_P95_MS"])
+
+    async def test_optional_candidate_filter_enriches_only_after_local_partial_gate(self):
+        filtered = asyncio.Event()
+        delivered = []
+        filter_calls = []
+
+        def candidate_filter(event):
+            filter_calls.append(event["event"])
+            result = dict(event)
+            result.update({
+                "asr_job_id": "trusted-job",
+                "speech_segment_id": "trusted-segment",
+                "epoch_id": "trusted-epoch",
+                "epoch_seq": 9,
+            })
+            filtered.set()
+            return result
+
+        async def sink(event):
+            delivered.append(dict(event))
+
+        await self.runtime.open_session(
+            connection_id="filtered", source="mic", context="client A",
+            chunk_size_ms=250, event_sink=sink,
+            candidate_result_filter=candidate_filter,
+        )
+        await self.runtime.push_audio(
+            connection_id="filtered", source="mic", pcm16le=b"\x01\x00" * 4000,
+        )
+        await asyncio.wait_for(filtered.wait(), 1)
+        self.assertEqual(filter_calls, ["partial_candidate"])
+        self.assertEqual(len(delivered), 1)
+        candidate = delivered[0]
+        self.assertEqual(candidate["truth_status"], "candidate_only")
+        self.assertEqual(candidate["asr_job_id"], "trusted-job")
+        self.assertEqual(candidate["speech_segment_id"], "trusted-segment")
+        self.assertEqual(candidate["epoch_id"], "trusted-epoch")
+        self.assertEqual(candidate["epoch_seq"], 9)
+        self.assertIn("stream_id", candidate)
+        self.assertIn("QWEN_SCHEDULER_REVISION", candidate)
+
+    async def test_candidate_filter_rejection_suppresses_partial_and_final_and_closes(self):
+        filter_calls = []
+        filtered_partial = asyncio.Event()
+        delivered = []
+
+        def reject_candidate(event):
+            filter_calls.append(event["event"])
+            if event["event"] == "partial_candidate":
+                filtered_partial.set()
+            return None
+
+        async def sink(event):
+            delivered.append(dict(event))
+
+        await self.runtime.open_session(
+            connection_id="rejected", source="mic", context="client A",
+            chunk_size_ms=250, event_sink=sink,
+            candidate_result_filter=reject_candidate,
+        )
+        await self.runtime.push_audio(
+            connection_id="rejected", source="mic", pcm16le=b"\x02\x00" * 4000,
+        )
+        await asyncio.wait_for(filtered_partial.wait(), 1)
+        self.assertEqual(delivered, [])
+
+        final = await self.runtime.finish(connection_id="rejected", source="mic")
+        self.assertIsNone(final)
+        self.assertEqual(filter_calls, ["partial_candidate", "final_candidate"])
+        self.assertEqual(delivered, [])
+        self.assertEqual(self.runtime.active_sessions, 0)
 
 
 if __name__ == "__main__":

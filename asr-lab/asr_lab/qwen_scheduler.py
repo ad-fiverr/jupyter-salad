@@ -22,6 +22,9 @@ class RequestKey:
     scheduler_revision: int
 
 
+LocalStaleRejectObserver = Callable[[str, str], None]
+
+
 @dataclass
 class DecodeJob:
     kind: str
@@ -30,6 +33,7 @@ class DecodeJob:
     ready_at: float
     future: asyncio.Future["DispatchResult"] | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
+    local_stale_reject_observer: LocalStaleRejectObserver | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,7 @@ class StreamQueue:
     max_stream_lag_samples: int = 0
     max_pending_jobs: int = 0
     max_active_streams: int = 0
+    local_stale_reject_observer: LocalStaleRejectObserver | None = None
 
     @property
     def identity(self) -> tuple[str, str]:
@@ -133,7 +138,13 @@ class QwenDecodeScheduler:
         if self._task is None:
             self._task = asyncio.create_task(self._dispatch_loop(), name="qwen-fair-decode-scheduler")
 
-    async def register(self, connection_id: str, stream_id: str, chunk_ms: int) -> None:
+    async def register(
+        self,
+        connection_id: str,
+        stream_id: str,
+        chunk_ms: int,
+        local_stale_reject_observer: LocalStaleRejectObserver | None = None,
+    ) -> None:
         identity = (connection_id, stream_id)
         async with self._condition:
             if identity in self.streams:
@@ -141,7 +152,12 @@ class QwenDecodeScheduler:
             active = sum(not stream.fenced for stream in self.streams.values())
             if active >= self.max_active_streams:
                 raise SchedulerError("stream_capacity_exceeded")
-            self.streams[identity] = StreamQueue(connection_id, stream_id, chunk_ms)
+            self.streams[identity] = StreamQueue(
+                connection_id,
+                stream_id,
+                chunk_ms,
+                local_stale_reject_observer=local_stale_reject_observer,
+            )
             self._observe_global_high_water_locked()
 
     async def append_pcm(self, connection_id: str, stream_id: str, pcm16le: bytes, received_at: float | None = None) -> dict[str, Any]:
@@ -190,7 +206,10 @@ class QwenDecodeScheduler:
                 for index in range(window_count):
                     pcm = combined[index * window_bytes:(index + 1) * window_bytes]
                     cursor += window_samples
-                    stream.pending.append(DecodeJob("push", pcm, cursor, now))
+                    stream.pending.append(DecodeJob(
+                        "push", pcm, cursor, now,
+                        local_stale_reject_observer=stream.local_stale_reject_observer,
+                    ))
                 if first_audio and window_count == 0:
                     # Start the ASR stream from speech arrival, even when this
                     # first transport payload is shorter than a model window.
@@ -199,6 +218,7 @@ class QwenDecodeScheduler:
                     priming_samples = len(combined) // 2
                     stream.pending.append(DecodeJob(
                         "push", combined, stream.accepted_samples + priming_samples, now,
+                        local_stale_reject_observer=stream.local_stale_reject_observer,
                     ))
                     residual = b""
                 stream.tail = bytearray(residual)
@@ -248,11 +268,13 @@ class QwenDecodeScheduler:
                 if residual_samples:
                     stream.pending.append(DecodeJob(
                         "push", bytes(stream.tail), stream.accepted_samples, now,
+                        local_stale_reject_observer=stream.local_stale_reject_observer,
                     ))
                     stream.tail.clear()
                 future = asyncio.get_running_loop().create_future()
                 stream.pending.append(DecodeJob(
                     "finish", b"", stream.accepted_samples, now, future=future,
+                    local_stale_reject_observer=stream.local_stale_reject_observer,
                 ))
                 self._observe_global_high_water_locked()
                 self._mark_ready_locked(stream)
@@ -535,6 +557,14 @@ class QwenDecodeScheduler:
                     await self.on_fault(stream.connection_id, stream.stream_id, failure_code, {})
                 continue
             if not current:
+                if job.local_stale_reject_observer is not None:
+                    try:
+                        job.local_stale_reject_observer(
+                            key.stream_id,
+                            "scheduler_request_key_stale",
+                        )
+                    except Exception:
+                        pass
                 if job.future is not None and not job.future.done():
                     job.future.set_exception(SchedulerError("stream_fenced"))
                 continue
