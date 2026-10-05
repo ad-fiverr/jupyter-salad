@@ -21,6 +21,7 @@ from .config import QWEN_LANGUAGE_CODES, Settings
 from .protocol import AudioChunk, BenchmarkPing, FlushRequest, ProtocolError, StreamStart, parse_message
 from .qwen_process import QwenWorkerProcess
 from .qwen_streaming import QwenStreamingRuntime, StreamingError, validate_candidate_event
+from .asr_service_lifecycle import QwenServiceLifecycleRegistry
 from .security import token_matches
 from .telemetry import collect_telemetry, gpu_compute_state
 
@@ -402,12 +403,13 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
         await websocket.close(code=1013, reason="model_not_ready")
         return
     send_lock = asyncio.Lock()
-    opened_sources: set[str] = set()
     terminal_sources: set[str] = set()
     terminal_error_codes = {
         "stream_duration_limit", "stream_not_started", "stream_worker_failed",
         "stream_worker_timeout", "stream_scheduler_overrun", "stream_result_queue_full",
-        "invalid_worker_response", "stream_fenced",
+        "invalid_worker_response", "stream_fenced", "stream_handoff_incomplete",
+        "transition_capacity_exceeded", "retained_capacity_exceeded",
+        "source_after_rejected_gap",
     }
     outbound: asyncio.Queue[tuple[dict[str, Any], asyncio.Future[None] | None] | None] = asyncio.Queue(maxsize=128)
 
@@ -447,13 +449,17 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                     raise
 
     pump_task = asyncio.create_task(result_pump(), name=f"qwen-result-pump-{connection_id}")
+    lifecycle_registry = QwenServiceLifecycleRegistry(
+        runtime=runtime,
+        settings=settings,
+        connection_id=connection_id,
+        event_sink=enqueue_result,
+    )
 
     async def open_default_session(source: str) -> None:
-        payload = await runtime.open_session(
-            connection_id=connection_id, source=source, event_sink=enqueue_result,
-        )
-        opened_sources.add(source)
-        await send_json(payload)
+        payload = await lifecycle_registry.open_default_source(source)
+        if payload is not None:
+            await send_json(payload)
 
     await websocket.accept()
     try:
@@ -489,14 +495,12 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                     })
                     continue
                 try:
-                    result = await runtime.open_session(
-                        connection_id=connection_id,
+                    result = await lifecycle_registry.open_source(
                         source=message.source,
                         language=message.language,
                         context=message.context,
                         model_chunk_ms=message.model_chunk_ms,
                         request_id=message.request_id,
-                        event_sink=enqueue_result,
                     )
                 except StreamingError as exc:
                     await send_json({
@@ -507,28 +511,26 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                     })
                     continue
                 terminal_sources.discard(message.source)
-                opened_sources.add(message.source)
                 await send_json(result)
                 continue
 
             if isinstance(message, FlushRequest):
-                if message.source not in opened_sources:
+                if not lifecycle_registry.has_active_source(message.source):
                     await send_json({
                         "event": "flush_complete",
                         "request_id": message.request_id,
                     })
                     continue
                 try:
-                    result = await runtime.finish(
-                        connection_id=connection_id,
+                    result = await lifecycle_registry.finish(
                         source=message.source,
-                        server_eos_at=time.perf_counter(),
                         request_id=message.request_id,
                     )
-                    await enqueue_final(validate_candidate_event(result, "final_candidate"))
-                    opened_sources.discard(message.source)
+                    if result is not None:
+                        await enqueue_final(validate_candidate_event(result, "final_candidate"))
                 except StreamingError as exc:
-                    opened_sources.discard(message.source)
+                    with contextlib.suppress(Exception):
+                        await lifecycle_registry.abort_source(message.source)
                     if exc.code in terminal_error_codes:
                         terminal_sources.add(message.source)
                     error_payload: dict[str, Any] = {
@@ -556,21 +558,21 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                     "message": "This stream ended; send an explicit stream_start before sending more audio.",
                 })
                 continue
-            if message.source not in opened_sources:
+            if not lifecycle_registry.has_active_source(message.source):
                 try:
                     await open_default_session(message.source)
                 except StreamingError as exc:
                     await send_json({"event": "error", "code": exc.code, "message": "Streaming session capacity is unavailable."})
                     continue
             try:
-                result = await runtime.push_audio(
-                    connection_id=connection_id,
+                await lifecycle_registry.submit_pcm(
                     source=message.source,
                     pcm16le=message.pcm16le,
                 )
             except StreamingError as exc:
+                with contextlib.suppress(Exception):
+                    await lifecycle_registry.abort_source(message.source)
                 if exc.code in terminal_error_codes:
-                    opened_sources.discard(message.source)
                     terminal_sources.add(message.source)
                 error_payload = {
                     "event": "error", "code": exc.code,
@@ -583,9 +585,9 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                         error_payload["scheduler"] = scheduler_diagnostics
                 await send_json(error_payload)
     finally:
-        await runtime.close_connection(connection_id)
         pump_task.cancel()
         await asyncio.gather(pump_task, return_exceptions=True)
+        await lifecycle_registry.close_connection()
 
 
 async def _flush(

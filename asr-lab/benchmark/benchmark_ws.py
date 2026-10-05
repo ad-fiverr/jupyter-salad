@@ -91,6 +91,34 @@ def _valid_final_candidate(candidate: dict[str, object]) -> bool:
     )
 
 
+def _valid_qwen_epoch_observability_snapshot(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    current_epoch = value.get("current_epoch")
+    last_transition = value.get("last_transition")
+    logical_cumulative = value.get("logical_cumulative")
+    if (
+        not isinstance(current_epoch, dict)
+        or not isinstance(logical_cumulative, dict)
+        or "last_transition" not in value
+        or (last_transition is not None and not isinstance(last_transition, dict))
+    ):
+        return False
+    epoch_id = current_epoch.get("epoch_id")
+    epoch_seq = current_epoch.get("epoch_seq")
+    rollover_count = logical_cumulative.get("EPOCH_ROLLOVER_COUNT")
+    return (
+        isinstance(epoch_id, str)
+        and bool(epoch_id)
+        and isinstance(epoch_seq, int)
+        and not isinstance(epoch_seq, bool)
+        and epoch_seq >= 0
+        and isinstance(rollover_count, int)
+        and not isinstance(rollover_count, bool)
+        and rollover_count >= 0
+    )
+
+
 def read_fixture(path: Path) -> tuple[bytes, float]:
     with wave.open(str(path), "rb") as audio:
         if audio.getnchannels() != 1 or audio.getframerate() != SAMPLE_RATE:
@@ -162,7 +190,9 @@ async def receive_fixture_results(
         "stream_duration_limit", "stream_not_started", "stream_worker_failed",
         "stream_worker_timeout", "stream_scheduler_overrun", "stream_result_queue_full",
         "invalid_worker_response", "stream_fenced", "stream_terminal",
-        "unexpected_stream_restart",
+        "unexpected_stream_restart", "stream_handoff_incomplete",
+        "transition_capacity_exceeded", "retained_capacity_exceeded",
+        "source_after_rejected_gap",
     }
     while True:
         raw = await asyncio.wait_for(ws.recv(), timeout=120)
@@ -334,6 +364,10 @@ async def run_one(
     if is_qwen and partials:
         qwen_diag.update(partials[-1])
     qwen_diag.update(qwen_final)
+    rolling_epoch_snapshot = qwen_diag.get("qwen_epoch_observability")
+    has_epoch_lifecycle_evidence = (
+        is_qwen and _valid_qwen_epoch_observability_snapshot(rolling_epoch_snapshot)
+    )
     terminal_scheduler_metrics = next(
         (
             error.get("scheduler", {}).get("terminal_metrics", {})
@@ -518,6 +552,8 @@ async def run_one(
         "transcript_mode": "STREAMING_PARTIALS" if is_qwen else "FINAL_SEGMENT",
         "streaming": {
             "streaming_class": "accumulated-audio-pseudostreaming" if is_qwen else None,
+            "epoch_lifecycle": "QwenEpochLifecycle" if has_epoch_lifecycle_evidence else None,
+            "rolling_epoch": rolling_epoch_snapshot if has_epoch_lifecycle_evidence else None,
             "audio_push_interval_ms": 100 if is_qwen else None,
             "model_decode_chunk_ms": qwen_chunk_ms if is_qwen else None,
             "effective_max_backlog_ms": qwen_diag.get("EFFECTIVE_MAX_BACKLOG_MS", qwen_diag.get("effective_max_backlog_ms")) if is_qwen else None,

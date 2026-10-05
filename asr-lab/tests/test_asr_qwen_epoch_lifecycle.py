@@ -773,6 +773,35 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
             worker.release_second_init.set()
             await runtime.close()
 
+    async def test_dispose_closes_runtime_without_emitting_natural_eos(self):
+        worker = CandidateLifecycleWorker()
+        worker.release_old_push.set()
+        delivered = []
+
+        async def sink(event):
+            delivered.append(dict(event))
+
+        worker, _controller, _handoff, runtime, lifecycle = await self.make_lifecycle(
+            worker,
+            event_sink=sink,
+        )
+        try:
+            await lifecycle.initialize()
+            await lifecycle.submit_pcm(b"\x31\x00" * 4000)
+            await lifecycle.dispose()
+            await lifecycle.dispose()
+
+            self.assertEqual(lifecycle.state, QwenEpochLifecycleState.CLOSED)
+            self.assertEqual(runtime.sessions, {})
+            self.assertFalse(any(operation == "finish" for operation, _ in worker.requests))
+            self.assertEqual(sum(operation == "close" for operation, _ in worker.requests), 1)
+            self.assertFalse(any(item.get("event") == "final_candidate" for item in delivered))
+        finally:
+            worker.release_old_push.set()
+            worker.release_successor_push.set()
+            worker.release_second_init.set()
+            await runtime.close()
+
     async def test_candidate_text_stitches_and_base_advances_across_three_epochs(self):
         worker = CandidateLifecycleWorker()
         worker.release_old_push.set()

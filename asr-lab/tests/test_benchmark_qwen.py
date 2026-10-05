@@ -273,9 +273,10 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
 
     def test_overrun_without_final_candidate_keeps_wer_null_and_all_job_metrics(self):
         class FakeRunWebSocket:
-            def __init__(self):
+            def __init__(self, epoch_snapshot_mode="valid"):
                 self.messages = asyncio.Queue()
                 self.audio_sends = 0
+                self.epoch_snapshot_mode = epoch_snapshot_mode
 
             async def __aenter__(self):
                 return self
@@ -294,17 +295,20 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
             async def send(self, raw):
                 message = json.loads(raw)
                 if message.get("event") == "stream_start":
-                    await self.messages.put(json.dumps({
+                    started = {
                         "event": "stream_started", "stream_id": "stream-fixture",
                         "model_chunk_ms": 250, "audio_push_interval_ms": 100,
                         "effective_max_backlog_ms": 1000, "qwen_max_backlog_chunks": 4,
                         "FIRST_STREAM_INIT_MS": 7, "FIRST_STREAM_STATE_INIT_WALL_MS": 2,
                         "FIRST_STREAM_INIT_RPC_OVERHEAD_MS": 5,
-                    }))
+                    }
+                    if self.epoch_snapshot_mode != "missing":
+                        started["qwen_local_stream_id"] = "qwen-local-1"
+                    await self.messages.put(json.dumps(started))
                 elif "audio" in message:
                     self.audio_sends += 1
                     if self.audio_sends <= 2:
-                        await self.messages.put(json.dumps({
+                        partial = {
                             "event": "partial_candidate", "stream_id": "stream-fixture",
                             "text": f"partial-{self.audio_sends}", "candidate_only": True,
                             "truth_status": "candidate_only", "provisional": True, "final": False,
@@ -320,7 +324,18 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
                             "FIRST_PARTIAL_MS": 13,
                             "QWEN_CUMULATIVE_DECODE_WALL_MS": 90,
                             "QWEN_STREAM_RTF": 0.18,
-                        }))
+                        }
+                        if self.epoch_snapshot_mode == "valid":
+                            partial["qwen_epoch_observability"] = {
+                                "current_epoch": {"epoch_id": "epoch-1", "epoch_seq": 1},
+                                "last_transition": {"category": "hard_bound"},
+                                "logical_cumulative": {"EPOCH_ROLLOVER_COUNT": 1},
+                            }
+                        elif self.epoch_snapshot_mode == "invalid":
+                            partial["qwen_epoch_observability"] = {
+                                "current_epoch": {"epoch_seq": 1},
+                            }
+                        await self.messages.put(json.dumps(partial))
                     elif self.audio_sends == 3:
                         await self.messages.put(json.dumps({
                             "event": "error", "code": "stream_scheduler_overrun",
@@ -363,40 +378,39 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
                         "event": "flush_complete", "request_id": message["request_id"],
                     }))
 
-        ws = FakeRunWebSocket()
+        def run_fixture(epoch_snapshot_mode):
+            ws = FakeRunWebSocket(epoch_snapshot_mode)
+            fake_websockets = SimpleNamespace(connect=lambda *_args, **_kwargs: ws)
+            readiness_response = FakeHttpResponse({"ready": True})
+            health_response = FakeHttpResponse({
+                "backend": "qwen3_asr", "model_id": "Qwen/Qwen3-ASR-1.7B",
+                "model_revision": "revision-fixture", "runtime_provenance": {
+                    "qwen_asr_version": "0.0.6", "vllm_version": "0.14.0",
+                    "transformers_version": "fixture-transformers", "torch_version": "fixture-torch",
+                    "torch_cuda_version": "fixture-cuda", "experiment_config": {"warmup_chunk_ms": 1000},
+                },
+                "worker_metrics": [{
+                    "model_load_ms": 42, "warmup_ms": 5,
+                    "experiment_config": {"warmup_chunk_ms": 1000},
+                }],
+            })
 
-        class HttpResponse(FakeHttpResponse):
-            pass
+            with tempfile.TemporaryDirectory() as temp_dir:
+                fixture = Path(temp_dir) / "fixture.wav"
+                with wave.open(str(fixture), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(16_000)
+                    audio.writeframes(b"\x00\x00" * 6400)
+                fixture.with_suffix(".txt").write_text("hello world", encoding="utf-8")
 
-        fake_websockets = SimpleNamespace(connect=lambda *_args, **_kwargs: ws)
-        readiness_response = HttpResponse({"ready": True})
-        health_response = HttpResponse({
-            "backend": "qwen3_asr", "model_id": "Qwen/Qwen3-ASR-1.7B",
-            "model_revision": "revision-fixture", "runtime_provenance": {
-                "qwen_asr_version": "0.0.6", "vllm_version": "0.14.0",
-                "transformers_version": "fixture-transformers", "torch_version": "fixture-torch",
-                "torch_cuda_version": "fixture-cuda", "experiment_config": {"warmup_chunk_ms": 1000},
-            },
-            "worker_metrics": [{
-                "model_load_ms": 42, "warmup_ms": 5,
-                "experiment_config": {"warmup_chunk_ms": 1000},
-            }],
-        })
+                with (
+                    patch.dict(sys.modules, {"websockets": fake_websockets}),
+                    patch("urllib.request.urlopen", side_effect=[readiness_response, health_response]),
+                ):
+                    return asyncio.run(run_one("ws://localhost/asr/ws", "token", fixture, qwen_chunk_ms=250))
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            fixture = Path(temp_dir) / "fixture.wav"
-            with wave.open(str(fixture), "wb") as audio:
-                audio.setnchannels(1)
-                audio.setsampwidth(2)
-                audio.setframerate(16_000)
-                audio.writeframes(b"\x00\x00" * 6400)
-            fixture.with_suffix(".txt").write_text("hello world", encoding="utf-8")
-
-            with (
-                patch.dict(sys.modules, {"websockets": fake_websockets}),
-                patch("urllib.request.urlopen", side_effect=[readiness_response, health_response]),
-            ):
-                row = asyncio.run(run_one("ws://localhost/asr/ws", "token", fixture, qwen_chunk_ms=250))
+        row = run_fixture("valid")
 
         self.assertEqual(row["run_status"], "failed")
         self.assertIsNone(row["final_candidate"])
@@ -424,6 +438,11 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(row["streaming"]["FIRST_PARTIAL_MS"], 13)
         self.assertEqual(row["streaming"]["QWEN_CUMULATIVE_DECODE_WALL_MS"], 90)
         self.assertEqual(row["streaming"]["QWEN_STREAM_RTF"], 0.18)
+        self.assertEqual(row["streaming"]["epoch_lifecycle"], "QwenEpochLifecycle")
+        self.assertEqual(
+            row["streaming"]["rolling_epoch"]["logical_cumulative"]["EPOCH_ROLLOVER_COUNT"],
+            1,
+        )
         self.assertIsInstance(row["streaming"]["CLIENT_FIRST_PARTIAL_MS"], (int, float))
         self.assertGreaterEqual(row["streaming"]["CLIENT_FIRST_PARTIAL_MS"], 0)
         self.assertEqual(row["streaming"]["QWEN_SCHEDULER_WAIT_MS_P50"], 12)
@@ -464,6 +483,14 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
         self.assertEqual(wer_summary["FINAL_CANDIDATE_WER_P95"], 0.25)
         self.assertEqual(wer_summary["failed_runs"], 1)
         self.assertEqual(wer_summary["scheduler"]["scheduler_wait_job_sample_count_per_run"]["max"], 3)
+
+        legacy_row = run_fixture("missing")
+        self.assertIsNone(legacy_row["streaming"]["epoch_lifecycle"])
+        self.assertIsNone(legacy_row["streaming"]["rolling_epoch"])
+
+        malformed_row = run_fixture("invalid")
+        self.assertIsNone(malformed_row["streaming"]["epoch_lifecycle"])
+        self.assertIsNone(malformed_row["streaming"]["rolling_epoch"])
 
     def test_warmup_chunk_top_level_legacy_schema_remains_supported(self):
         self.assertEqual(_worker_warmup_chunk_ms({"warmup_chunk_ms": 750}), 750)

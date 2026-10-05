@@ -456,6 +456,28 @@ class QwenEpochLifecycle(PCMAdmissionSink):
             self._bound_stream_id = None
             return result
 
+    async def dispose(self) -> None:
+        """Close local runtime state without EOS or a fabricated final result.
+
+        Disconnects and service-side aborts are not natural end-of-speech.
+        Clearing the binding before awaiting the runtime also makes repeated
+        disposal idempotent and prevents lifecycle observers from advancing
+        after the owner has detached this source.
+        """
+        if self._state is QwenEpochLifecycleState.CLOSED and self._bound_stream_id is None:
+            return
+        self._closing = True
+        async with self._operation_lock:
+            stream_id = self._bound_stream_id
+            self._bound_fence = None
+            self._bound_stream_id = None
+            self._state = QwenEpochLifecycleState.CLOSED
+            if stream_id is not None:
+                await self.qwen_runtime.close_session(
+                    connection_id=self.connection_id,
+                    source=self.source,
+                )
+
     async def _rollover_locked(
         self,
         *,

@@ -402,43 +402,57 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             "QWEN_STREAMING_ENABLED": "1", "QWEN_STREAMING_RUNTIME_AVAILABLE": "1",
         })
 
-        class FakeQwenRuntime:
+        class FakeQwenRuntime(service.QwenStreamingRuntime):
             ready = True
+            max_stream_seconds = 60.0
+
+            def __init__(self):
+                self.active = None
 
             async def open_session(self, *, connection_id, source, event_sink, **kwargs):
                 self.connection_id = connection_id
                 self.source = source
                 self.event_sink = event_sink
+                self.candidate_result_filter = kwargs.get("candidate_result_filter")
                 self.stream_id = "owned-stream"
+                self.active = True
                 return {"event": "stream_started", "stream_id": self.stream_id, "request_id": kwargs.get("request_id")}
 
             async def push_audio(self, *, connection_id, source, pcm16le):
                 self.assert_owner(connection_id, source, pcm16le)
-                await self.event_sink({
+                candidate = {
                     "event": "partial_candidate", "stream_id": self.stream_id,
                     "text": "provisional", "final": False, "provisional": True,
                     "replace": True, "truth_status": "candidate_only", "revision": 1,
-                })
+                }
+                candidate = self.candidate_result_filter(candidate)
+                if candidate is not None:
+                    await self.event_sink(candidate)
 
             def assert_owner(self, connection_id, source, pcm16le):
                 assert connection_id == self.connection_id and source == self.source and pcm16le
 
             async def finish(self, *, connection_id, source, request_id, **kwargs):
                 self.assert_owner(connection_id, source, b"pcm")
-                return {
+                candidate = {
                     "event": "final_candidate", "stream_id": self.stream_id,
                     "text": "final candidate", "final": True, "provisional": True,
                     "candidate_only": True, "truth_status": "candidate_only",
                     "replace": True, "revision": 2, "request_id": request_id,
                 }
+                candidate = self.candidate_result_filter(candidate)
+                self.active = False
+                return candidate
+
+            async def close_session(self, *, connection_id, source):
+                self.assert_owner(connection_id, source, b"pcm")
+                self.active = False
 
             async def close_connection(self, _connection_id):
                 return None
 
         service.qwen_runtime = FakeQwenRuntime()
-        start = {"event": "stream_start", "source": "mic", "request_id": "start-1", "language": "auto", "chunk_size_ms": 250}
         socket = FakeWebSocket([
-            {"type": "websocket.receive", "text": json.dumps(start)},
             audio_frame(),
             flush_frame("flush-1"),
             {"type": "websocket.disconnect"},
@@ -449,7 +463,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(socket.sent[1]["stream_id"], "owned-stream")
         self.assertEqual(socket.sent[2]["request_id"], "flush-1")
 
-    async def test_six_qwen_websocket_clients_are_isolated_and_overrun_requires_explicit_restart(self):
+    async def test_six_qwen_websocket_clients_are_isolated_and_overrun_rolls_epoch_in_place(self):
         service = self.setup_service(max_connections=8)
         service.settings = Settings.from_env({
             "ASR_BACKEND": "parakeet", "ASR_API_TOKEN": TOKEN,
@@ -457,8 +471,9 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             "QWEN_MAX_ACTIVE_STREAMS": "6",
         })
 
-        class FakeQwenRuntime:
+        class FakeQwenRuntime(service.QwenStreamingRuntime):
             ready = True
+            max_stream_seconds = 60.0
 
             def __init__(self):
                 self.sessions = {}
@@ -472,6 +487,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
                 session = {
                     "connection_id": connection_id, "source": source, "stream_id": stream_id,
                     "context": context, "event_sink": event_sink,
+                    "candidate_result_filter": kwargs.get("candidate_result_filter"),
                 }
                 self.sessions[(connection_id, source)] = session
                 self.opened.append(session)
@@ -500,21 +516,30 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
                             "secret": "must-not-leak",
                         },
                     })
-                await session["event_sink"]({
+                candidate = {
                     "event": "partial_candidate", "stream_id": session["stream_id"],
                     "text": session["context"], "final": False, "provisional": True,
                     "replace": True, "truth_status": "candidate_only", "revision": 1,
-                })
+                }
+                candidate = session["candidate_result_filter"](candidate)
+                if candidate is not None:
+                    await session["event_sink"](candidate)
 
             async def finish(self, *, connection_id, source, request_id, **kwargs):
                 session = self.sessions[(connection_id, source)]
-                return {
+                candidate = {
                     "event": "final_candidate", "stream_id": session["stream_id"],
                     "text": session["context"] + " final", "final": True,
                     "provisional": True, "candidate_only": True,
                     "truth_status": "candidate_only", "replace": True,
                     "revision": 2, "request_id": request_id,
                 }
+                candidate = session["candidate_result_filter"](candidate)
+                self.sessions.pop((connection_id, source), None)
+                return candidate
+
+            async def close_session(self, *, connection_id, source):
+                self.sessions.pop((connection_id, source), None)
 
             async def close_connection(self, connection_id):
                 self.closed.append(connection_id)
@@ -535,13 +560,8 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
             if index == 0:
                 frames.extend([
                     audio_frame(),
-                    flush_frame("failed-stream-flush"),
-                    {"type": "websocket.receive", "text": json.dumps({
-                        "event": "stream_start", "source": "mic", "request_id": "restart-0",
-                        "language": "auto", "context": "cliente-0-reinicio", "chunk_size_ms": 250,
-                    })},
                     audio_frame(),
-                    flush_frame("restart-flush-0"),
+                    flush_frame("flush-0"),
                 ])
             else:
                 frames.append(flush_frame(f"flush-{index}"))
@@ -552,8 +572,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(runtime.opened), 7)
         self.assertEqual(len({item["connection_id"] for item in runtime.opened}), 6)
-        self.assertEqual(sum(item["context"] == "cliente-0-original" for item in runtime.opened), 1)
-        self.assertEqual(sum(item["context"] == "cliente-0-reinicio" for item in runtime.opened), 1)
+        self.assertEqual(sum(item["context"] == "cliente-0-original" for item in runtime.opened), 2)
         for index, socket in enumerate(sockets):
             candidates = [item for item in socket.sent if item.get("event") in {"partial_candidate", "final_candidate"}]
             payload = json.dumps(candidates, ensure_ascii=False)
@@ -561,18 +580,16 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
                 if index != other:
                     self.assertNotIn(f"cliente-{other}-", payload)
             if index == 0:
-                self.assertIn("stream_scheduler_overrun", [item.get("code") for item in socket.sent])
-                self.assertIn("stream_terminal", [item.get("code") for item in socket.sent])
-                overrun = next(item for item in socket.sent if item.get("code") == "stream_scheduler_overrun")
-                terminal_metrics = overrun["scheduler"]["terminal_metrics"]
-                self.assertEqual(terminal_metrics["scheduler_wait_sample_count"], 3)
-                self.assertEqual(terminal_metrics["decode_wall_p95_ms"], 95.0)
-                self.assertEqual(terminal_metrics["accepted_audio_total_ms"], 750.0)
-                self.assertFalse({"connection_id", "transcript", "secret"} & terminal_metrics.keys())
+                self.assertFalse({"stream_scheduler_overrun", "stream_terminal"} & {item.get("code") for item in socket.sent})
                 self.assertEqual([item["text"] for item in candidates], [
-                    "cliente-0-reinicio", "cliente-0-reinicio final",
+                    "cliente-0-original", "cliente-0-original final",
                 ])
-                self.assertEqual(len([item for item in socket.sent if item.get("event") == "stream_started"]), 2)
+                started = next(item for item in socket.sent if item.get("event") == "stream_started")
+                self.assertEqual(len([item for item in socket.sent if item.get("event") == "stream_started"]), 1)
+                self.assertEqual(len({item["stream_id"] for item in candidates}), 1)
+                self.assertEqual(len({item["qwen_local_stream_id"] for item in candidates}), 1)
+                self.assertNotEqual(candidates[-1]["qwen_local_stream_id"], started["qwen_local_stream_id"])
+                self.assertFalse(any("must-not-leak" in json.dumps(item) for item in socket.sent))
                 final_position = next(pos for pos, item in enumerate(socket.sent) if item.get("event") == "final_candidate")
                 barrier_position = max(pos for pos, item in enumerate(socket.sent) if item.get("event") == "flush_complete")
                 self.assertLess(final_position, barrier_position)
