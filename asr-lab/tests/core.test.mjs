@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import {
   AUDIO_PUSH_INTERVAL_MS,
   CHUNK_SAMPLES,
@@ -34,6 +35,30 @@ import {
 
 const appSource = readFileSync(new URL("../asr_lab/benchmark_web/app.mjs", import.meta.url), "utf8");
 const htmlSource = readFileSync(new URL("../asr_lab/benchmark_web/index.html", import.meta.url), "utf8");
+
+function renderQwenLifecycleWithFakeDom(stateOverrides = {}) {
+  const start = appSource.indexOf("function renderQwenLifecycle() {");
+  const next = appSource.indexOf("function onTranscript", start);
+  const end = appSource.lastIndexOf("}", next) + 1;
+  assert.ok(start >= 0 && next >= 0 && end > start, "renderer source boundary exists");
+  const renderer = appSource.slice(start, end);
+  const ids = [
+    "qwen-lifecycle-panel", "qwen-lifecycle-public-id", "qwen-lifecycle-current", "qwen-lifecycle-state",
+    "qwen-lifecycle-rollovers", "qwen-lifecycle-transition", "qwen-lifecycle-last-completed", "qwen-lifecycle-reason",
+    "qwen-lifecycle-failure", "qwen-lifecycle-latency", "qwen-lifecycle-pcm", "qwen-lifecycle-retained",
+    "qwen-lifecycle-stale", "qwen-lifecycle-audio-accum", "qwen-epoch-history-body", "qwen-transition-history-body",
+  ];
+  const elements = new Map(ids.map((id) => [id, { id, hidden: false, textContent: "", rows: [], replaceChildren() { this.rows = []; } }]));
+  const state = { backend: "qwen3_asr", qwenEpochObservability: null, lastQwenLifecycleError: null, qwenPublicStreamId: null, qwenLocalStreamId: null, ...stateOverrides };
+  const context = {
+    state,
+    $: (id) => elements.get(id),
+    fmtMs: formatMilliseconds,
+    appendLifecycleRow: (body, cells, style, span) => body.rows.push({ cells, style, span }),
+  };
+  runInNewContext(`${renderer}\nrenderQwenLifecycle();`, context);
+  return { elements, state };
+}
 
 function sine(rate, frequency, sampleCount, start = 0) {
   return Float32Array.from(
@@ -382,6 +407,48 @@ test("Qwen epoch snapshot is content-free, bounded, and preserves lifecycle evid
   }), null);
 });
 
+test("Qwen lifecycle renderer handles reset null and error-only states", () => {
+  const reset = renderQwenLifecycleWithFakeDom();
+  assert.equal(reset.state.backend, "qwen3_asr");
+  assert.equal(reset.state.qwenEpochObservability, null);
+  assert.equal(reset.state.lastQwenLifecycleError, null);
+  assert.equal(reset.elements.get("qwen-lifecycle-panel").hidden, true);
+  assert.equal(reset.elements.get("qwen-lifecycle-audio-accum").textContent, "null · no medible");
+  assert.match(reset.elements.get("qwen-epoch-history-body").rows[0].cells[0], /No hay historial/);
+
+  const errorOnly = renderQwenLifecycleWithFakeDom({
+    lastQwenLifecycleError: { code: "stream_scheduler_overrun", qwen_public_stream_id: "public-error-1" },
+  });
+  assert.equal(errorOnly.elements.get("qwen-lifecycle-panel").hidden, false);
+  assert.equal(errorOnly.elements.get("qwen-lifecycle-failure").textContent, "stream_scheduler_overrun");
+  assert.equal(errorOnly.elements.get("qwen-lifecycle-public-id").textContent, "public-error-1");
+  assert.equal(errorOnly.state.qwenEpochObservability, null);
+});
+
+test("Qwen lifecycle renderer preserves null audio accumulation as unmeasured", () => {
+  const snapshot = { QWEN_AUDIO_ACCUM_MS: null, current_epoch: {}, logical_cumulative: {}, last_transition: null, epoch_history: [], transition_history: [] };
+  const result = renderQwenLifecycleWithFakeDom({ qwenEpochObservability: snapshot });
+  assert.equal(result.elements.get("qwen-lifecycle-audio-accum").textContent, "null · no medible");
+  assert.equal(result.state.qwenEpochObservability.QWEN_AUDIO_ACCUM_MS, null);
+});
+
+test("Qwen lifecycle renderer preserves valid epoch and transition history rows", () => {
+  const snapshot = {
+    current_epoch: { epoch_seq: 7, epoch_id: "epoch-7", local_stream_id: "local-7", lifecycle_state: "ACTIVE" },
+    logical_cumulative: { rollover_success_count: 2, rollover_attempt_count: 2 },
+    last_transition: { state: "ACTIVE", stage: "ACTIVE", last_completed_stage: "ACTIVE", category: "soft", reason: "limit", latest_pcm_accounting: { explicit_source_rejected_samples: 0 } },
+    epoch_history: [{ epoch_seq: 7, epoch_id: "epoch-7", local_stream_id: "local-7", lifecycle_state: "ACTIVE", epoch_audio_ms: 120, replay_audio_ms: 30, replay_wall_ms: 4 }],
+    transition_history: [{ transition_seq: 3, predecessor_epoch_id: "epoch-6", predecessor_local_stream_id: "local-6", successor_epoch_id: "epoch-7", successor_local_stream_id: "local-7", state: "COMPLETE", stage: "ACTIVE", stage_events: [{ stage: "ACTIVE", elapsed_ms: 5 }], replay_admitted_samples: 480, transition_primary_samples: 1600, EPOCH_HANDOFF_WALL_MS: 3, EPOCH_FIRST_PARTIAL_AFTER_ROLLOVER_MS: 8, PCM_LOST: 0, PRIMARY_DUP: 0 }],
+  };
+  const result = renderQwenLifecycleWithFakeDom({ qwenEpochObservability: snapshot });
+  const epochRows = result.elements.get("qwen-epoch-history-body").rows;
+  const transitionRows = result.elements.get("qwen-transition-history-body").rows;
+  assert.equal(epochRows.length, 1);
+  assert.equal(epochRows[0].cells[1], "epoch-7");
+  assert.equal(transitionRows.length, 1);
+  assert.equal(transitionRows[0].cells[0], 3);
+  assert.match(transitionRows[0].cells[1], /epoch-6.*epoch-7/);
+});
 test("Qwen browser UI and JSON retain bounded epoch lineage through terminal errors", () => {
   assert.match(htmlSource, /id="qwen-lifecycle-panel"/);
   assert.match(htmlSource, /id="qwen-epoch-history-body"/);

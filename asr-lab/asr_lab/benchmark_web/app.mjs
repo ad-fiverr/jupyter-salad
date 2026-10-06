@@ -582,12 +582,12 @@ function renderQwenLifecycle() {
   $("qwen-lifecycle-pcm").textContent = `${fmtMs(transition?.transition_buffer_current_ms)} / ${fmtMs(transition?.transition_buffer_max_ms)} / ${pcm.explicit_source_rejected_samples ?? "—"}`;
   $("qwen-lifecycle-retained").textContent = `${fmtMs(transition?.retained_pcm_current_ms)} / ${fmtMs(transition?.retained_pcm_max_ms)}`;
   $("qwen-lifecycle-stale").textContent = String(transition?.stale_result_rejects_delta ?? "—");
-  $("qwen-lifecycle-audio-accum").textContent = snapshot.QWEN_AUDIO_ACCUM_MS == null
-    ? "null · no medible" : `${fmtMs(snapshot.QWEN_AUDIO_ACCUM_MS)} · version-coupled`;
+  $("qwen-lifecycle-audio-accum").textContent = snapshot?.QWEN_AUDIO_ACCUM_MS == null
+    ? "null · no medible" : `${fmtMs(snapshot?.QWEN_AUDIO_ACCUM_MS)} · version-coupled`;
 
   const epochBody = $("qwen-epoch-history-body");
   epochBody.replaceChildren();
-  const epochs = Array.isArray(snapshot.epoch_history) ? snapshot.epoch_history.slice(-8) : [];
+  const epochs = Array.isArray(snapshot?.epoch_history) ? snapshot?.epoch_history.slice(-8) : [];
   if (!epochs.length) appendLifecycleRow(epochBody, ["No hay historial de epochs."], "empty", 6);
   for (const epoch of epochs) {
     appendLifecycleRow(epochBody, [
@@ -598,7 +598,7 @@ function renderQwenLifecycle() {
 
   const transitionBody = $("qwen-transition-history-body");
   transitionBody.replaceChildren();
-  const transitions = Array.isArray(snapshot.transition_history) ? snapshot.transition_history.slice(-8) : [];
+  const transitions = Array.isArray(snapshot?.transition_history) ? snapshot?.transition_history.slice(-8) : [];
   if (!transitions.length) appendLifecycleRow(transitionBody, ["No hay historial de transitions."], "empty", 8);
   for (const item of transitions) {
     const stages = Array.isArray(item.stage_events)
