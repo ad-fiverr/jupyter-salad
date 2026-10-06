@@ -529,6 +529,7 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                     if result is not None:
                         await enqueue_final(validate_candidate_event(result, "final_candidate"))
                 except StreamingError as exc:
+                    lifecycle_diagnostics = lifecycle_registry.source_observability_snapshot(message.source)
                     with contextlib.suppress(Exception):
                         await lifecycle_registry.abort_source(message.source)
                     if exc.code in terminal_error_codes:
@@ -542,6 +543,8 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                         scheduler_diagnostics = _safe_scheduler_diagnostics(exc.details)
                         if scheduler_diagnostics:
                             error_payload["scheduler"] = scheduler_diagnostics
+                    if lifecycle_diagnostics is not None:
+                        error_payload.update(lifecycle_diagnostics)
                     await send_json(error_payload)
                 if message.request_id is not None:
                     await send_json({
@@ -570,6 +573,10 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                     pcm16le=message.pcm16le,
                 )
             except StreamingError as exc:
+                # Snapshot the lifecycle before abort_source detaches and
+                # disposes it; this is the only error-path chance to retain
+                # which epoch/stage owned the terminal failure.
+                lifecycle_diagnostics = lifecycle_registry.source_observability_snapshot(message.source)
                 with contextlib.suppress(Exception):
                     await lifecycle_registry.abort_source(message.source)
                 if exc.code in terminal_error_codes:
@@ -583,6 +590,8 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
                     scheduler_diagnostics = _safe_scheduler_diagnostics(exc.details)
                     if scheduler_diagnostics:
                         error_payload["scheduler"] = scheduler_diagnostics
+                if lifecycle_diagnostics is not None:
+                    error_payload.update(lifecycle_diagnostics)
                 await send_json(error_payload)
     finally:
         pump_task.cancel()

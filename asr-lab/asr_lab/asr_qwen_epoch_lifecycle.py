@@ -268,6 +268,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
 
     def observability_snapshot(self) -> dict[str, Any]:
         """Return bounded scalar epoch, transition, and logical totals."""
+        self._observe_operational_metrics()
         snapshot = self._observability.snapshot(now=self._clock())
         if self._soft_rollover is not None:
             snapshot["soft_rollover_policy"] = self._soft_rollover.snapshot(now=self._clock())
@@ -289,7 +290,19 @@ class QwenEpochLifecycle(PCMAdmissionSink):
             raise QwenEpochLifecycleError("lifecycle_not_accepting_pcm")
 
         source_fence = self.pcm_handoff.current_fence
-        span = self.pcm_handoff.receive_pcm(pcm16le)
+        try:
+            span = self.pcm_handoff.receive_pcm(pcm16le)
+        except PCMHandoffError as exc:
+            # Preserve the exact fail-closed admission stage before the service
+            # can clean up this source stream. This is observational only: the
+            # handoff coordinator remains the sole PCM owner and capacity policy.
+            if exc.code == "transition_capacity_exceeded":
+                self._observability.record_transition_blocked(
+                    failure_stage="transition_capacity",
+                    failure_reason=exc.code,
+                    pcm_snapshot=self.pcm_handoff.snapshot(),
+                )
+            raise
         primary_open_at_receive = self.pcm_handoff.primary_admission_open
         if not primary_open_at_receive:
             return None
@@ -420,12 +433,36 @@ class QwenEpochLifecycle(PCMAdmissionSink):
                 or self.epoch_controller.current != self._bound_fence
             ):
                 raise QwenEpochLifecycleError("handoff_not_ready_for_drain")
-            result = await self.pcm_handoff.drain_handoff(self)
+            failure_stage = "replay"
+
+            def observe_stage(stage: str) -> None:
+                nonlocal failure_stage
+                self._observability.record_transition_stage(stage, now=self._clock())
+                if stage.startswith("CATCHUP"):
+                    failure_stage = "catchup"
+                elif stage.startswith("REPLAY"):
+                    failure_stage = "replay"
+
+            try:
+                result = await self.pcm_handoff.drain_handoff(
+                    self, stage_observer=observe_stage,
+                )
+            except Exception as exc:
+                self._observability.record_transition_failure(
+                    failure_stage=failure_stage,
+                    failure_reason=self._error_code(exc),
+                )
+                raise
             if result.completed:
                 self._state = QwenEpochLifecycleState.ACTIVE
                 self._sync_processed()
                 self._complete_observed_transition(result)
             else:
+                self._observability.record_transition_blocked(
+                    failure_stage=result.failure_stage,
+                    failure_reason=result.blocked_reason,
+                    pcm_snapshot=self.pcm_handoff.snapshot(),
+                )
                 self._observe_operational_metrics()
             return result
 
@@ -452,6 +489,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
                 self._state = QwenEpochLifecycleState.FAILED
                 raise
             self._state = QwenEpochLifecycleState.CLOSED
+            self._observability.end_epoch(end_state="NATURAL_EOS", now=self._clock())
             self._bound_fence = None
             self._bound_stream_id = None
             return result
@@ -493,6 +531,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
         if self._bound_fence != old_fence or old_stream_id is None:
             raise QwenEpochLifecycleError("qwen_epoch_binding_mismatch")
 
+        failure_stage = "predecessor_fence"
         self._sync_processed()
         self._replay_started_at = None
         predecessor_metrics = self._stream_snapshot(old_stream_id)
@@ -521,15 +560,20 @@ class QwenEpochLifecycle(PCMAdmissionSink):
                 connection_id=self.connection_id,
                 source=self.source,
             )
+            self._observability.record_transition_stage("PREDECESSOR_FENCED", now=self._clock())
 
             # Preserve A6.5 candidate continuity and its established behavior.
             candidate_base = self._candidate_stitcher.freeze_for_successor(old_fence)
+            failure_stage = "successor_open"
+            self._observability.record_transition_stage("SUCCESSOR_OPENING", now=self._clock())
             opened, candidate_binding = await self._open_fresh_qwen_state(
                 forbidden_ids={old_fence.epoch_id, prepared_epoch_id, old_stream_id},
                 candidate_base=candidate_base,
             )
+            self._observability.record_transition_stage("SUCCESSOR_OPENED", now=self._clock())
             successor_stream_id = opened["stream_id"]
             try:
+                failure_stage = "successor_activation"
                 successor = self.pcm_handoff.activate_successor()
                 if (
                     successor.epoch_id != prepared_epoch_id
@@ -561,6 +605,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
                     replay_audio_samples=replay_samples,
                     now=self._clock(),
                 )
+                self._observability.record_transition_stage("SUCCESSOR_ACTIVATED", now=self._clock())
             except Exception:
                 self._bound_fence = None
                 self._bound_stream_id = None
@@ -570,17 +615,38 @@ class QwenEpochLifecycle(PCMAdmissionSink):
                 )
                 raise
 
-            result = await self.pcm_handoff.drain_handoff(self)
+            failure_stage = "replay"
+
+            def observe_stage(stage: str) -> None:
+                nonlocal failure_stage
+                self._observability.record_transition_stage(stage, now=self._clock())
+                if stage.startswith("CATCHUP"):
+                    failure_stage = "catchup"
+                elif stage.startswith("REPLAY"):
+                    failure_stage = "replay"
+
+            result = await self.pcm_handoff.drain_handoff(
+                self, stage_observer=observe_stage,
+            )
             if result.completed:
                 self._state = QwenEpochLifecycleState.ACTIVE
                 self._sync_processed()
                 self._complete_observed_transition(result)
             else:
+                self._observability.record_transition_blocked(
+                    failure_stage=result.failure_stage,
+                    failure_reason=result.blocked_reason,
+                    pcm_snapshot=self.pcm_handoff.snapshot(),
+                )
                 self._observe_operational_metrics()
             return result
         except BaseException as exc:
             # Retain a bounded timing/failure record while preserving the
             # existing lifecycle's fail-safe state and retry semantics.
+            self._observability.record_transition_failure(
+                failure_stage=failure_stage,
+                failure_reason=self._error_code(exc),
+            )
             if self._observability.snapshot(now=self._clock())["last_transition"].get("EPOCH_HANDOFF_WALL_MS") is None:
                 self._observability.complete_transition(
                     success=False,
@@ -604,6 +670,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
             pcm_snapshot=self.pcm_handoff.snapshot(),
             now=self._clock(),
         )
+        self._observability.record_transition_stage("ACTIVE", now=self._clock())
         if self._soft_rollover is not None:
             self._soft_rollover.mark_rollover_succeeded(now=self._clock())
 

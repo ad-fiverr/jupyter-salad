@@ -125,7 +125,29 @@
         <div class="metric-card"><span>GPU / VRAM / RAM · global</span><strong id="qwen-device-telemetry">—</strong></div>
       </div>
       <p class="fine-print" id="qwen-cadence-latency">Esperando diagnósticos de inicialización, primer decode, bound y SLO absoluto de 100 ms.</p>
-      <div class="table-wrap partial-timeline-wrap"><table><thead><tr><th>Audio cursor</th><th>Client elapsed</th><th>Revision</th><th>Partial completo (reemplaza el anterior)</th><th>Server chunk → partial</th><th>Revisión</th><th>Decode wall</th></tr></thead><tbody id="qwen-partials-body"><tr><td colspan="7" class="empty">Aún no hay parciales.</td></tr></tbody></table></div>
+      <section class="qwen-lifecycle-panel" id="qwen-lifecycle-panel" hidden aria-labelledby="qwen-lifecycle-title">
+        <div class="panel-heading"><div><p class="eyebrow">CONTINUIDAD DE EPOCH</p><h3 id="qwen-lifecycle-title">Linaje y handoff del stream</h3></div><p class="fine-print">TRANSITION y HANDOFF_PENDING no prueban rollover completado. Sólo ACTIVE después de replay y catch-up cuenta como éxito.</p></div>
+        <div class="summary-grid qwen-lifecycle-grid" aria-live="polite">
+          <div class="metric-card"><span>Public stream id</span><strong id="qwen-lifecycle-public-id">—</strong></div>
+          <div class="metric-card"><span>Epoch / local stream actual</span><strong id="qwen-lifecycle-current">—</strong></div>
+          <div class="metric-card"><span>Epoch state</span><strong id="qwen-lifecycle-state">—</strong></div>
+          <div class="metric-card"><span>Rollovers completos / intentos</span><strong id="qwen-lifecycle-rollovers">—</strong></div>
+          <div class="metric-card"><span>Último transition state / stage</span><strong id="qwen-lifecycle-transition">—</strong></div>
+          <div class="metric-card"><span>Última etapa completada</span><strong id="qwen-lifecycle-last-completed">—</strong></div>
+          <div class="metric-card"><span>Último rollover · categoría / razón</span><strong id="qwen-lifecycle-reason">—</strong></div>
+          <div class="metric-card"><span>Failure stage / reason</span><strong id="qwen-lifecycle-failure">—</strong></div>
+          <div class="metric-card"><span>Handoff / primer partial successor</span><strong id="qwen-lifecycle-latency">—</strong></div>
+          <div class="metric-card"><span>Transition buffer · actual / máximo / rechazado</span><strong id="qwen-lifecycle-pcm">—</strong></div>
+          <div class="metric-card"><span>PCM retained · actual / máximo</span><strong id="qwen-lifecycle-retained">—</strong></div>
+          <div class="metric-card"><span>Stale predecessor rejects</span><strong id="qwen-lifecycle-stale">—</strong></div>
+          <div class="metric-card"><span>QWEN_AUDIO_ACCUM_MS</span><strong id="qwen-lifecycle-audio-accum">null · no medible</strong></div>
+        </div>
+        <h4>Epochs recientes (máximo 8)</h4>
+        <div class="table-wrap qwen-lifecycle-table"><table><thead><tr><th>Seq</th><th>Epoch id</th><th>Qwen local id</th><th>State</th><th>Audio del epoch</th><th>Replay audio / wall</th></tr></thead><tbody id="qwen-epoch-history-body"><tr><td colspan="6" class="empty">No hay historial de epochs.</td></tr></tbody></table></div>
+        <h4>Transitions recientes (máximo 8)</h4>
+        <div class="table-wrap qwen-lifecycle-table"><table><thead><tr><th>#</th><th>Predecessor → successor</th><th>State / stage</th><th>Etapas observadas</th><th>Replay / catch-up samples</th><th>Handoff / primer partial</th><th>Failure</th><th>PCM_LOST / PRIMARY_DUP</th></tr></thead><tbody id="qwen-transition-history-body"><tr><td colspan="8" class="empty">No hay historial de transitions.</td></tr></tbody></table></div>
+      </section>
+      <div class="table-wrap partial-timeline-wrap"><table><thead><tr><th>Audio cursor</th><th>Client elapsed</th><th>Revision</th><th>Epoch id / seq</th><th>Qwen local stream id</th><th>Partial completo (reemplaza el anterior)</th><th>Server chunk → partial</th><th>Revisión</th><th>Decode wall</th><th>Audio nuevo</th><th>Audio aceptado en epoch</th></tr></thead><tbody id="qwen-partials-body"><tr><td colspan="11" class="empty">Aún no hay parciales.</td></tr></tbody></table></div>
       <div class="charts-grid qwen-charts" aria-label="Métricas del scheduler Qwen">
         <article class="panel chart-card qwen-chart-card"><h3>Scheduler wait p95 · agregado móvil 1 Hz</h3><canvas id="chart-qwen-wait" aria-label="Percentil 95 del scheduler wait Qwen por sondeo"></canvas></article>
         <article class="panel chart-card qwen-chart-card"><h3>Backlog de audio / decodes pending · 1 Hz</h3><canvas id="chart-qwen-backlog" aria-label="Backlog agregado y cantidad de decodes pendientes"></canvas></article>

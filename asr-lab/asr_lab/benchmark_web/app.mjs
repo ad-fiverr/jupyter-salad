@@ -1,7 +1,7 @@
 import {
   AUDIO_PUSH_INTERVAL_MS, METRIC_DEFINITIONS, ShadowVad, boundedPush, clientFirstPartialMs, canvasBackingSize, csvCell, decodeSloLabel, formatMilliseconds, gpuStatusLabel,
   isTerminalQwenError, median, percentile, qwenDeviceTelemetryLabel, rttPercentiles, wordErrorRate,
-  shouldDrawCanvas, safeQwenStartupEvidence,
+  shouldDrawCanvas, safeQwenStartupEvidence, safeQwenEpochObservabilitySnapshot,
 } from "/asr/benchmark/core.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -49,6 +49,10 @@ const state = {
   streamStartRequestId: null,
   streamStartResolver: null,
   streamEvents: [],
+  qwenPublicStreamId: null,
+  qwenLocalStreamId: null,
+  qwenEpochObservability: null,
+  lastQwenLifecycleError: null,
   lastPartialRevision: 0,
   lastPartialAt: null,
   clientEosAt: null,
@@ -214,7 +218,7 @@ function renderQwenPartials() {
   if (!state.streamEvents.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 7;
+    cell.colSpan = 11;
     cell.className = "empty";
     cell.textContent = "Aún no hay parciales.";
     row.append(cell);
@@ -228,10 +232,14 @@ function renderQwenPartials() {
       fmtMs(item.audio_cursor_ms),
       fmtMs(item.CLIENT_ELAPSED_MS),
       item.revision,
+      `${item.epoch_seq ?? "—"} · ${item.epoch_id ?? "—"}`,
+      item.qwen_local_stream_id,
       item.text,
       fmtMs(item.SERVER_CHUNK_TO_PARTIAL_MS),
       Number.isFinite(item.PARTIAL_REVISION_RATE) ? (item.PARTIAL_REVISION_RATE * 100).toFixed(1) + "%" : "—",
       fmtMs(item.QWEN_DECODE_CALL_WALL_MS),
+      fmtMs(item.QWEN_NEW_AUDIO_MS),
+      fmtMs(item.EPOCH_AUDIO_ACCUMULATED_MS),
     ];
     for (const value of values) {
       const cell = document.createElement("td");
@@ -419,6 +427,7 @@ function recordTelemetry(snapshot) {
   $("transcript-mode").textContent = snapshot.transcript_mode ?? (qwen ? "STREAMING_PARTIALS" : "FINAL_SEGMENT");
   $("qwen-stream-controls").hidden = !qwen;
   $("qwen-stream-panel").hidden = !qwen;
+  renderQwenLifecycle();
   $("offline-latency-groups").hidden = qwen;
   document.querySelectorAll(".offline-only").forEach((node) => { node.hidden = qwen; });
   updateQwenSummary();
@@ -433,6 +442,7 @@ async function pollTelemetry() {
     state.health = snapshot;
     recordTelemetry(snapshot);
     if (snapshot.backend) state.backend = snapshot.backend;
+    renderQwenLifecycle();
     if (snapshot.model_id) state.modelId = snapshot.model_id;
     if (snapshot.model_revision) state.modelRevision = snapshot.model_revision;
     if (snapshot.runtime_provenance && typeof snapshot.runtime_provenance === "object") {
@@ -457,6 +467,10 @@ function onPartialTranscript(message) {
   const item = {
     event: "partial_candidate",
     stream_id: message.stream_id,
+    public_stream_id: state.qwenPublicStreamId ?? message.stream_id ?? null,
+    qwen_local_stream_id: state.qwenLocalStreamId,
+    epoch_id: state.qwenEpochObservability?.current_epoch?.epoch_id ?? null,
+    epoch_seq: state.qwenEpochObservability?.current_epoch?.epoch_seq ?? null,
     revision: message.revision,
     text: String(message.text ?? ""),
     language: typeof message.language === "string" ? message.language : null,
@@ -495,6 +509,9 @@ function onPartialTranscript(message) {
     DECODE_OVERRUN: message.DECODE_OVERRUN === true,
     MODEL_DECODE_CHUNK_MS: message.MODEL_DECODE_CHUNK_MS,
     AUDIO_PUSH_INTERVAL_MS: message.AUDIO_PUSH_INTERVAL_MS,
+    QWEN_NEW_AUDIO_MS: message.QWEN_NEW_AUDIO_MS ?? null,
+    EPOCH_AUDIO_ACCUMULATED_MS: message.EPOCH_AUDIO_ACCUMULATED_MS ?? null,
+    QWEN_AUDIO_ACCUM_MS: message.QWEN_AUDIO_ACCUM_MS ?? null,
     client_received_at: receivedAt,
     candidate_only: true,
     provisional: true,
@@ -506,6 +523,98 @@ function onPartialTranscript(message) {
   state.lastPartialRevision = message.revision;
   state.lastPartialAt = receivedAt;
   renderQwenPartials();
+}
+
+function appendLifecycleRow(body, values, className = "", colSpan = 1) {
+  const row = document.createElement("tr");
+  if (className) row.className = className;
+  for (const value of values) {
+    const cell = document.createElement("td");
+    if (values.length === 1) cell.colSpan = colSpan;
+    cell.textContent = value == null ? "—" : String(value);
+    row.append(cell);
+  }
+  body.append(row);
+}
+
+function captureQwenEpochEvidence(message) {
+  const publicStreamId = message?.stream_id ?? message?.qwen_public_stream_id;
+  if (publicStreamId && state.streamId && publicStreamId !== state.streamId) return;
+  if (typeof publicStreamId === "string" && publicStreamId
+      && (!state.streamId || publicStreamId === state.streamId)) {
+    state.qwenPublicStreamId = publicStreamId;
+  }
+  if (typeof message?.qwen_local_stream_id === "string" && message.qwen_local_stream_id) {
+    state.qwenLocalStreamId = message.qwen_local_stream_id;
+  }
+  const snapshot = safeQwenEpochObservabilitySnapshot(message?.qwen_epoch_observability);
+  if (snapshot) {
+    state.qwenEpochObservability = snapshot;
+    const currentLocalId = snapshot.current_epoch?.local_stream_id;
+    if (typeof currentLocalId === "string" && currentLocalId) state.qwenLocalStreamId = currentLocalId;
+  }
+  renderQwenLifecycle();
+}
+
+function renderQwenLifecycle() {
+  const panel = $("qwen-lifecycle-panel");
+  if (!panel) return;
+  const snapshot = state.qwenEpochObservability;
+  const lastError = state.lastQwenLifecycleError;
+  panel.hidden = state.backend !== "qwen3_asr" || (!snapshot && !lastError);
+  const current = snapshot?.current_epoch ?? {};
+  const logical = snapshot?.logical_cumulative ?? {};
+  const transition = snapshot?.last_transition ?? null;
+  $("qwen-lifecycle-public-id").textContent = state.qwenPublicStreamId ?? lastError?.qwen_public_stream_id ?? "—";
+  $("qwen-lifecycle-current").textContent = `${current.epoch_seq ?? "—"} / ${current.epoch_id ?? "—"} · ${state.qwenLocalStreamId ?? current.local_stream_id ?? "—"}`;
+  $("qwen-lifecycle-state").textContent = current.lifecycle_state ?? "—";
+  $("qwen-lifecycle-rollovers").textContent = `${logical.rollover_success_count ?? 0} / ${logical.rollover_attempt_count ?? 0}`;
+  $("qwen-lifecycle-transition").textContent = transition ? `${transition.state ?? "—"} / ${transition.stage ?? "—"}` : "Sin transition";
+  $("qwen-lifecycle-last-completed").textContent = transition?.last_completed_stage ?? "—";
+  $("qwen-lifecycle-reason").textContent = transition
+    ? `${transition.category ?? "—"} / ${transition.reason ?? "—"}` : "—";
+  $("qwen-lifecycle-failure").textContent = transition?.failure_stage || transition?.failure_reason
+    ? `${transition.failure_stage ?? "—"} / ${transition.failure_reason ?? "—"}`
+    : lastError?.code ?? "—";
+  $("qwen-lifecycle-latency").textContent = transition
+    ? `${fmtMs(transition.EPOCH_HANDOFF_WALL_MS)} / ${fmtMs(transition.EPOCH_FIRST_PARTIAL_AFTER_ROLLOVER_MS)}` : "—";
+  const pcm = transition?.latest_pcm_accounting ?? {};
+  $("qwen-lifecycle-pcm").textContent = `${fmtMs(transition?.transition_buffer_current_ms)} / ${fmtMs(transition?.transition_buffer_max_ms)} / ${pcm.explicit_source_rejected_samples ?? "—"}`;
+  $("qwen-lifecycle-retained").textContent = `${fmtMs(transition?.retained_pcm_current_ms)} / ${fmtMs(transition?.retained_pcm_max_ms)}`;
+  $("qwen-lifecycle-stale").textContent = String(transition?.stale_result_rejects_delta ?? "—");
+  $("qwen-lifecycle-audio-accum").textContent = snapshot.QWEN_AUDIO_ACCUM_MS == null
+    ? "null · no medible" : `${fmtMs(snapshot.QWEN_AUDIO_ACCUM_MS)} · version-coupled`;
+
+  const epochBody = $("qwen-epoch-history-body");
+  epochBody.replaceChildren();
+  const epochs = Array.isArray(snapshot.epoch_history) ? snapshot.epoch_history.slice(-8) : [];
+  if (!epochs.length) appendLifecycleRow(epochBody, ["No hay historial de epochs."], "empty", 6);
+  for (const epoch of epochs) {
+    appendLifecycleRow(epochBody, [
+      epoch.epoch_seq, epoch.epoch_id, epoch.local_stream_id, epoch.lifecycle_state,
+      fmtMs(epoch.epoch_audio_ms), `${fmtMs(epoch.replay_audio_ms)} / ${fmtMs(epoch.replay_wall_ms)}`,
+    ]);
+  }
+
+  const transitionBody = $("qwen-transition-history-body");
+  transitionBody.replaceChildren();
+  const transitions = Array.isArray(snapshot.transition_history) ? snapshot.transition_history.slice(-8) : [];
+  if (!transitions.length) appendLifecycleRow(transitionBody, ["No hay historial de transitions."], "empty", 8);
+  for (const item of transitions) {
+    const stages = Array.isArray(item.stage_events)
+      ? item.stage_events.slice(-16).map((event) => `${event.stage ?? "?"} ${fmtMs(event.elapsed_ms)}`).join(" → ")
+      : "—";
+    appendLifecycleRow(transitionBody, [
+      item.transition_seq,
+      `${item.predecessor_epoch_id ?? "?"}/${item.predecessor_local_stream_id ?? "?"} → ${item.successor_epoch_id ?? "?"}/${item.successor_local_stream_id ?? "?"}`,
+      `${item.state ?? "?"} / ${item.stage ?? "?"}`,
+      stages,
+      `${item.replay_admitted_samples ?? 0} / ${item.transition_primary_samples ?? 0}`,
+      `${fmtMs(item.EPOCH_HANDOFF_WALL_MS)} / ${fmtMs(item.EPOCH_FIRST_PARTIAL_AFTER_ROLLOVER_MS)}`,
+      item.failure_stage || item.failure_reason ? `${item.failure_stage ?? "?"} / ${item.failure_reason ?? "?"}` : "—",
+      `${item.PCM_LOST ?? "unmeasured"} / ${item.PRIMARY_DUP ?? "unmeasured"}`,
+    ]);
+  }
 }
 
 function onTranscript(message, candidateOnly = false) {
@@ -614,6 +723,7 @@ function onTranscript(message, candidateOnly = false) {
 function onSocketMessage(raw) {
   let message;
   try { message = JSON.parse(raw); } catch { state.errors.push("invalid_server_message"); updateSummary(); return; }
+  captureQwenEpochEvidence(message);
   if (state.backend === "qwen3_asr" && (
     message.event === "partial_transcript" || message.event === "transcript" || message.type === "transcript"
   )) return;
@@ -676,6 +786,15 @@ function onSocketMessage(raw) {
   if (message.event === "error") {
     const code = /^[a-z0-9_]{1,64}$/i.test(message.code ?? "") ? message.code : "asr_error";
     state.errors.push(code);
+    if (state.backend === "qwen3_asr" || state.qwenEpochObservability) {
+      state.lastQwenLifecycleError = {
+        code,
+        qwen_public_stream_id: state.qwenPublicStreamId,
+        qwen_local_stream_id: state.qwenLocalStreamId,
+        lifecycle_snapshot_received: state.qwenEpochObservability !== null,
+      };
+      renderQwenLifecycle();
+    }
     if (state.streamStartResolver) {
       state.streamStartResolver.reject(new Error(code));
       state.streamStartResolver = null;
@@ -1088,6 +1207,10 @@ function resetRun() {
   state.modelRevision = null;
   state.workers = null;
   state.streamId = null;
+  state.qwenPublicStreamId = null;
+  state.qwenLocalStreamId = null;
+  state.qwenEpochObservability = null;
+  state.lastQwenLifecycleError = null;
   state.streamStartRequestId = null;
   state.streamEvents = [];
   state.lastPartialRevision = 0;
@@ -1103,6 +1226,7 @@ function resetRun() {
   state.qwenContext = "";
   state.finalised = false;
   $("transcript").textContent = "La transcripción aparecerá cuando el servidor cierre un segmento.";
+  renderQwenLifecycle();
   renderQwenPartials();
   $("export-json").disabled = true;
   $("export-csv").disabled = true;
@@ -1218,6 +1342,19 @@ function safeResult() {
     transcript_mode: state.backend === "qwen3_asr" ? "STREAMING_PARTIALS" : "FINAL_SEGMENT",
     streaming: state.backend === "qwen3_asr" ? {
       streaming_class: "accumulated-audio-pseudostreaming",
+      public_stream_id: state.qwenPublicStreamId ?? state.streamId,
+      qwen_local_stream_id: state.qwenLocalStreamId,
+      rolling_epoch: state.qwenEpochObservability ? {
+        current_epoch: state.qwenEpochObservability.current_epoch,
+        last_transition: state.qwenEpochObservability.last_transition,
+        logical_cumulative: state.qwenEpochObservability.logical_cumulative,
+        QWEN_AUDIO_ACCUM_MS: state.qwenEpochObservability.QWEN_AUDIO_ACCUM_MS ?? null,
+        soft_rollover_policy: state.qwenEpochObservability.soft_rollover_policy ?? null,
+      } : null,
+      epoch_history: state.qwenEpochObservability?.epoch_history ?? [],
+      transition_history: state.qwenEpochObservability?.transition_history ?? [],
+      lifecycle_error: state.lastQwenLifecycleError,
+      QWEN_AUDIO_ACCUM_MS: state.qwenEpochObservability?.QWEN_AUDIO_ACCUM_MS ?? null,
       audio_push_interval_ms: AUDIO_PUSH_INTERVAL_MS,
       model_chunk_ms: state.qwenChunkMs,
       model_decode_chunk_ms: state.qwenChunkMs,
@@ -1248,6 +1385,10 @@ function safeResult() {
         active_stream_count: state.health?.qwen_scheduler?.active_stream_count ?? null,
         decode_budget_overrun_count: state.health?.qwen_scheduler?.qwen_decode_budget_overrun_total ?? null,
         scheduler_fence_overrun_count: state.health?.qwen_scheduler?.qwen_scheduler_overrun_total ?? null,
+        QWEN_AUDIO_ACCUM_MS: state.qwenEpochObservability?.QWEN_AUDIO_ACCUM_MS ?? null,
+        EPOCH_HANDOFF_WALL_MS: state.qwenEpochObservability?.last_transition?.EPOCH_HANDOFF_WALL_MS ?? null,
+        EPOCH_FIRST_PARTIAL_AFTER_ROLLOVER_MS: state.qwenEpochObservability?.last_transition?.EPOCH_FIRST_PARTIAL_AFTER_ROLLOVER_MS ?? null,
+        EPOCH_ROLLOVER_COUNT: state.qwenEpochObservability?.logical_cumulative?.EPOCH_ROLLOVER_COUNT ?? null,
       },
       definitions: {
         PARTIAL_STABILITY: "Identical exact-prefix tokens in prior full text / prior token count; appended suffix tokens do not change this ratio.",
@@ -1337,6 +1478,9 @@ function safeResult() {
       GPU_TELEMETRY_SCOPE: "optional_nvml_or_torch_device_global_not_backend_attributed",
       SERVER_CLOCK: "time.perf_counter within ASR server process",
       CLIENT_CLOCK: "performance.now within browser only",
+      QWEN_AUDIO_ACCUM_MS: "Only exact read-only version-coupled Qwen state measurement is accepted; null means unavailable and is never inferred from cursor, backlog, or lag.",
+      EPOCH_HANDOFF_WALL_MS: "Server monotonic time from rollover begin until successor ACTIVE after required replay and transition catch-up admission.",
+      EPOCH_FIRST_PARTIAL_AFTER_ROLLOVER_MS: "Server monotonic time from rollover begin until the first non-empty successor partial after post-cut PRIMARY processing.",
     },
     visibility_transitions: [...state.visibility],
   };

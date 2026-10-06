@@ -423,8 +423,10 @@ class LocalPCMHandoffCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.code, "transition_capacity_exceeded")
         snapshot = coordinator.snapshot()
         self.assertEqual(snapshot.transition_queued_samples, 2)
+        self.assertEqual(snapshot.max_transition_queued_samples, 2)
         self.assertEqual(snapshot.explicit_source_rejected_samples, 1)
         self.assertLessEqual(snapshot.retained_source_samples, coordinator.max_retained_samples)
+        self.assertGreaterEqual(snapshot.max_retained_source_samples, snapshot.retained_source_samples)
 
     async def test_mixed_success_and_source_rejection_obeys_exact_accounting_balance(self):
         coordinator, controller = self.make_coordinator("epoch-a", retained=3, transition=3)
@@ -506,7 +508,9 @@ class LocalPCMHandoffCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             "replay_retained_samples",
             "replay_inflight_copy_samples",
             "transition_queued_samples",
+            "max_transition_queued_samples",
             "retained_source_samples",
+            "max_retained_source_samples",
             "released_source_samples",
             "downstream_admission_rejected_samples",
             "explicit_source_rejected_samples",

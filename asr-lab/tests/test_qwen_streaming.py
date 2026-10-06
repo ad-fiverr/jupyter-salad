@@ -194,6 +194,26 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         operations_after_eos = [operation for operation, _ in self.worker.requests]
         self.assertLess(operations_after_eos.index("push"), operations_after_eos.index("finish"))
 
+    async def test_decode_audio_increment_and_epoch_accumulation_are_separate(self):
+        await self.runtime.open_session(
+            connection_id="cadence", source="mic", context="short stream", model_chunk_ms=100,
+        )
+        pcm = b"\x18\x00" * 1_600
+        await self.runtime.push_audio(connection_id="cadence", source="mic", pcm16le=pcm)
+        partial = await asyncio.wait_for(
+            self.runtime.receive_event(connection_id="cadence", source="mic"), 2,
+        )
+        self.assertEqual(partial["QWEN_NEW_AUDIO_MS"], 100.0)
+        self.assertEqual(partial["EPOCH_AUDIO_ACCUMULATED_MS"], 100.0)
+        self.assertIsNone(partial["QWEN_AUDIO_ACCUM_MS"])
+
+        final = await asyncio.wait_for(
+            self.runtime.finish(connection_id="cadence", source="mic"), 2,
+        )
+        self.assertIsNone(final["QWEN_NEW_AUDIO_MS"])
+        self.assertEqual(final["EPOCH_AUDIO_ACCUMULATED_MS"], 100.0)
+        self.assertIsNone(final["QWEN_AUDIO_ACCUM_MS"])
+
     async def test_empty_stream_eos_finalizes_without_pcm_push_or_partial(self):
         await self.runtime.open_session(
             connection_id="empty", source="mic", context="empty stream", model_chunk_ms=250,

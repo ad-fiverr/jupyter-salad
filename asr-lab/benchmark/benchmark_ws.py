@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+from copy import deepcopy
 import json
 import math
 import os
@@ -47,6 +48,20 @@ _TERMINAL_SCHEDULER_NUMERIC_FIELDS = {
     "accepted_audio_total_ms", "dispatched_audio_total_ms", "overrun_limit_value",
     "effective_max_backlog_ms", "qwen_max_backlog_chunks", "model_chunk_ms",
     "scheduler_metric_history_limit",
+}
+_PCM_ACCOUNTING_FIELDS = frozenset({
+    "source_head_cursor", "unique_primary_admitted_cursor",
+    "current_epoch_admitted_cursor", "processed_cursor", "old_processed_cursor",
+    "cutover_cursor", "replay_start_cursor", "retained_range_floor",
+    "retained_range_head", "received_samples", "unique_primary_admitted_samples",
+    "replay_admitted_samples", "replay_retained_samples",
+    "replay_inflight_copy_samples", "transition_queued_samples",
+    "max_transition_queued_samples", "retained_source_samples",
+    "max_retained_source_samples", "released_source_samples",
+    "downstream_admission_rejected_samples", "explicit_source_rejected_samples",
+})
+_FORBIDDEN_EPOCH_SNAPSHOT_KEYS = {
+    "text", "transcript", "pcm16le", "pcm16le_base64", "audio", "secret", "token",
 }
 
 
@@ -107,7 +122,7 @@ def _valid_qwen_epoch_observability_snapshot(value: object) -> bool:
     epoch_id = current_epoch.get("epoch_id")
     epoch_seq = current_epoch.get("epoch_seq")
     rollover_count = logical_cumulative.get("EPOCH_ROLLOVER_COUNT")
-    return (
+    valid_identity = (
         isinstance(epoch_id, str)
         and bool(epoch_id)
         and isinstance(epoch_seq, int)
@@ -117,6 +132,87 @@ def _valid_qwen_epoch_observability_snapshot(value: object) -> bool:
         and not isinstance(rollover_count, bool)
         and rollover_count >= 0
     )
+    if not valid_identity:
+        return False
+    epoch_history = value.get("epoch_history", [])
+    transition_history = value.get("transition_history", [])
+    if (
+        not isinstance(epoch_history, list)
+        or len(epoch_history) > 8
+        or not isinstance(transition_history, list)
+        or len(transition_history) > 8
+    ):
+        return False
+    for transition in transition_history:
+        if not isinstance(transition, dict):
+            return False
+        events = transition.get("stage_events", [])
+        if not isinstance(events, list) or len(events) > 16:
+            return False
+    return _content_free_epoch_snapshot(value)
+
+
+def _content_free_epoch_snapshot(
+    value: object,
+    *,
+    depth: int = 0,
+    path: tuple[str, ...] = (),
+) -> bool:
+    if depth > 12:
+        return False
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key).casefold()
+            if normalized_key == "pcm":
+                if path not in {("current_epoch",), ("epoch_history", "[]")} or not _safe_pcm_accounting(item):
+                    return False
+                continue
+            if normalized_key in _FORBIDDEN_EPOCH_SNAPSHOT_KEYS:
+                return False
+            if not _content_free_epoch_snapshot(
+                item,
+                depth=depth + 1,
+                path=path + (normalized_key,),
+            ):
+                return False
+        return True
+    if isinstance(value, list):
+        return len(value) <= 16 and all(
+            _content_free_epoch_snapshot(item, depth=depth + 1, path=path + ("[]",))
+            for item in value
+        )
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _safe_pcm_accounting(value: object) -> bool:
+    """Allow only the bounded numeric accounting object emitted under current_epoch.pcm."""
+    if not isinstance(value, dict) or not value or len(value) > len(_PCM_ACCOUNTING_FIELDS):
+        return False
+    for key, item in value.items():
+        if str(key).casefold() not in _PCM_ACCOUNTING_FIELDS:
+            return False
+        if item is None:
+            continue
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return False
+        try:
+            if not math.isfinite(float(item)):
+                return False
+        except (OverflowError, ValueError):
+            return False
+    return True
+
+
+def _safe_qwen_epoch_observability_snapshot(value: object) -> dict[str, object] | None:
+    if not _valid_qwen_epoch_observability_snapshot(value):
+        return None
+    try:
+        encoded = json.dumps(value, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > 64_000:
+        return None
+    return deepcopy(value)
 
 
 def read_fixture(path: Path) -> tuple[bytes, float]:
@@ -205,6 +301,15 @@ async def receive_fixture_results(
             scheduler = _safe_scheduler_error(data.get("scheduler"))
             if scheduler:
                 error["scheduler"] = scheduler
+            epoch_snapshot = _safe_qwen_epoch_observability_snapshot(
+                data.get("qwen_epoch_observability"),
+            )
+            if epoch_snapshot is not None:
+                error["qwen_epoch_observability"] = epoch_snapshot
+                for key in ("qwen_public_stream_id", "qwen_local_stream_id"):
+                    value = data.get(key)
+                    if isinstance(value, str) and value and len(value) <= 160:
+                        error[key] = value
             errors.append(error)
             if code in terminal_codes:
                 terminal_stream = True
@@ -364,6 +469,25 @@ async def run_one(
     if is_qwen and partials:
         qwen_diag.update(partials[-1])
     qwen_diag.update(qwen_final)
+    if is_qwen:
+        latest_error_snapshot = next(
+            (
+                error.get("qwen_epoch_observability")
+                for error in reversed(errors)
+                if isinstance(error, dict)
+                and _valid_qwen_epoch_observability_snapshot(error.get("qwen_epoch_observability"))
+            ),
+            None,
+        )
+        if latest_error_snapshot is not None:
+            qwen_diag["qwen_epoch_observability"] = latest_error_snapshot
+            latest_error = next(
+                (error for error in reversed(errors) if error.get("qwen_epoch_observability") is latest_error_snapshot),
+                None,
+            )
+            if isinstance(latest_error, dict):
+                qwen_diag["qwen_local_stream_id"] = latest_error.get("qwen_local_stream_id")
+                qwen_diag["qwen_public_stream_id"] = latest_error.get("qwen_public_stream_id")
     rolling_epoch_snapshot = qwen_diag.get("qwen_epoch_observability")
     has_epoch_lifecycle_evidence = (
         is_qwen and _valid_qwen_epoch_observability_snapshot(rolling_epoch_snapshot)
@@ -392,7 +516,9 @@ async def run_one(
             "stream_duration_limit", "stream_not_started", "stream_worker_failed",
             "stream_worker_timeout", "stream_scheduler_overrun", "stream_result_queue_full",
             "invalid_worker_response", "stream_fenced", "stream_terminal",
-            "unexpected_stream_restart",
+            "unexpected_stream_restart", "stream_handoff_incomplete",
+            "transition_capacity_exceeded", "retained_capacity_exceeded",
+            "source_after_rejected_gap",
         }
         for error in errors if isinstance(error, dict)
     )
@@ -554,6 +680,11 @@ async def run_one(
             "streaming_class": "accumulated-audio-pseudostreaming" if is_qwen else None,
             "epoch_lifecycle": "QwenEpochLifecycle" if has_epoch_lifecycle_evidence else None,
             "rolling_epoch": rolling_epoch_snapshot if has_epoch_lifecycle_evidence else None,
+            "public_stream_id": qwen_diag.get("qwen_public_stream_id", qwen_diag.get("stream_id")) if is_qwen else None,
+            "qwen_local_stream_id": qwen_diag.get("qwen_local_stream_id") if is_qwen else None,
+            "epoch_history": rolling_epoch_snapshot.get("epoch_history", []) if has_epoch_lifecycle_evidence else [],
+            "transition_history": rolling_epoch_snapshot.get("transition_history", []) if has_epoch_lifecycle_evidence else [],
+            "QWEN_AUDIO_ACCUM_MS": rolling_epoch_snapshot.get("QWEN_AUDIO_ACCUM_MS") if has_epoch_lifecycle_evidence else None,
             "audio_push_interval_ms": 100 if is_qwen else None,
             "model_decode_chunk_ms": qwen_chunk_ms if is_qwen else None,
             "effective_max_backlog_ms": qwen_diag.get("EFFECTIVE_MAX_BACKLOG_MS", qwen_diag.get("effective_max_backlog_ms")) if is_qwen else None,

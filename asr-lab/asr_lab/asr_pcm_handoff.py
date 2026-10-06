@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol
+from typing import Callable, Protocol
 
 from .asr_epoch_controller import EpochControllerState, LocalAcousticEpochController
 from .asr_fencing import ExecutionFence, FenceOutcome
@@ -116,6 +116,7 @@ class HandoffDrainResult:
     replay_admitted_samples: int
     primary_admitted_samples: int
     blocked_reason: str | None = None
+    failure_stage: str | None = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +136,9 @@ class PCMHandoffSnapshot:
     replay_retained_samples: int
     replay_inflight_copy_samples: int
     transition_queued_samples: int
+    max_transition_queued_samples: int
     retained_source_samples: int
+    max_retained_source_samples: int
     released_source_samples: int
     downstream_admission_rejected_samples: int
     explicit_source_rejected_samples: int
@@ -220,6 +223,8 @@ class LocalPCMHandoffCoordinator:
         self._received_samples = 0
         self._unique_primary_admitted_samples = 0
         self._replay_admitted_samples = 0
+        self._max_transition_queued_samples = 0
+        self._max_retained_source_samples = 0
         self._released_source_samples = 0
         self._downstream_rejected_samples = 0
         self._explicit_source_rejected_samples = 0
@@ -266,6 +271,7 @@ class LocalPCMHandoffCoordinator:
             raise PCMCapacityRejected(capacity_error, span)
 
         self._records.append(_OwnedSpan(span=span, role=role))
+        self._observe_occupancy_high_water()
         return span
 
     async def admit_primary(self, span: PCMSpan, sink: PCMAdmissionSink) -> AdmissionAck:
@@ -306,6 +312,7 @@ class LocalPCMHandoffCoordinator:
                 raise PCMHandoffError("admission_unconfirmed") from exc
             finally:
                 self._admission_in_flight = False
+                self._observe_occupancy_high_water()
 
             if not self._valid_ack(ack, record.span.sample_count):
                 record.role = PCMRole.TRANSITION
@@ -344,6 +351,7 @@ class LocalPCMHandoffCoordinator:
         for record in self._records:
             if record.primary_epoch is None and record.role is PCMRole.UNADMITTED:
                 record.role = PCMRole.TRANSITION
+        self._observe_occupancy_high_water()
         transition_starts = [
             record.span.start_sample for record in self._records
             if record.primary_epoch is None
@@ -380,7 +388,12 @@ class LocalPCMHandoffCoordinator:
         self._current_epoch_admitted_cursor = replay_start
         return successor
 
-    async def drain_handoff(self, sink: PCMAdmissionSink) -> HandoffDrainResult:
+    async def drain_handoff(
+        self,
+        sink: PCMAdmissionSink,
+        *,
+        stage_observer: Callable[[str], None] | None = None,
+    ) -> HandoffDrainResult:
         """Submit all replay first, then transition PCM as unique PRIMARY.
 
         Known rejection is retryable only by a later explicit call. Ambiguous
@@ -395,13 +408,15 @@ class LocalPCMHandoffCoordinator:
                 raise PCMHandoffError("successor_fence_not_current")
             replay_this_call = 0
             primary_this_call = 0
+            if stage_observer is not None:
+                stage_observer("REPLAY_DRAINING")
 
             for start_sample, end_sample in self._replay_plan:
                 key = (successor.epoch_id, start_sample, end_sample)
                 if key in self._replay_acked:
                     continue
                 if key in self._ambiguous_replay:
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_replay_admission")
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_replay_admission", "replay")
                 span, is_copy = self._retained_primary_span(start_sample, end_sample)
                 if is_copy:
                     self._replay_inflight_copy_samples += span.sample_count
@@ -409,19 +424,19 @@ class LocalPCMHandoffCoordinator:
                     ack = await sink.submit(PCMAdmissionKind.REPLAY, successor, span)
                 except AdmissionRejected as exc:
                     self._downstream_rejected_samples += span.sample_count
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, exc.code)
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, exc.code, "replay")
                 except asyncio.CancelledError:
                     self._ambiguous_replay.add(key)
                     raise
                 except Exception:
                     self._ambiguous_replay.add(key)
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_replay_admission")
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_replay_admission", "replay")
                 finally:
                     if is_copy:
                         self._replay_inflight_copy_samples -= span.sample_count
                 if not self._valid_ack(ack, span.sample_count):
                     self._ambiguous_replay.add(key)
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_replay_ack")
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_replay_ack", "replay")
                 if span.start_sample != self._current_epoch_admitted_cursor:
                     raise PCMHandoffError("non_contiguous_replay_plan")
                 self._replay_acked.add(key)
@@ -432,14 +447,17 @@ class LocalPCMHandoffCoordinator:
             if self._current_epoch_admitted_cursor != self._unique_primary_cursor:
                 raise PCMHandoffError("replay_does_not_reach_primary_cursor")
 
+            if stage_observer is not None:
+                stage_observer("REPLAY_DRAINED")
+                stage_observer("CATCHUP_DRAINING")
             while True:
                 record = self._next_transition_record()
                 if record is None:
                     break
                 if record.admission_state is AdmissionState.AMBIGUOUS:
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_primary_admission")
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_primary_admission", "catchup")
                 if record.span.start_sample != self._unique_primary_cursor:
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "source_gap_before_transition")
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "source_gap_before_transition", "catchup")
                 record.admission_state = AdmissionState.IN_FLIGHT
                 self._admission_in_flight = True
                 try:
@@ -447,7 +465,7 @@ class LocalPCMHandoffCoordinator:
                 except AdmissionRejected as exc:
                     self._downstream_rejected_samples += record.span.sample_count
                     record.admission_state = AdmissionState.REJECTED
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, exc.code)
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, exc.code, "catchup")
                 except asyncio.CancelledError:
                     record.admission_state = AdmissionState.AMBIGUOUS
                     record.ambiguous_epoch = successor
@@ -455,21 +473,23 @@ class LocalPCMHandoffCoordinator:
                 except Exception:
                     record.admission_state = AdmissionState.AMBIGUOUS
                     record.ambiguous_epoch = successor
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_primary_admission")
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_primary_admission", "catchup")
                 finally:
                     self._admission_in_flight = False
 
                 if not self._valid_ack(ack, record.span.sample_count):
                     record.admission_state = AdmissionState.AMBIGUOUS
                     record.ambiguous_epoch = successor
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_primary_ack")
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "ambiguous_primary_ack", "catchup")
                 if self.epoch_controller.current != successor:
                     record.admission_state = AdmissionState.AMBIGUOUS
                     record.ambiguous_epoch = successor
-                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "primary_fence_changed")
+                    return HandoffDrainResult(False, replay_this_call, primary_this_call, "primary_fence_changed", "catchup")
                 self._admit_unique_primary(record, successor)
                 primary_this_call += record.span.sample_count
 
+            if stage_observer is not None:
+                stage_observer("CATCHUP_DRAINED")
             self._handoff_in_progress = False
             self._primary_open = True
             self._successor_fence = None
@@ -523,11 +543,21 @@ class LocalPCMHandoffCoordinator:
             ),
             replay_inflight_copy_samples=self._replay_inflight_copy_samples,
             transition_queued_samples=self._transition_queued_samples(),
+            max_transition_queued_samples=self._max_transition_queued_samples,
             retained_source_samples=self._retained_source_samples(),
+            max_retained_source_samples=self._max_retained_source_samples,
             released_source_samples=self._released_source_samples,
             downstream_admission_rejected_samples=self._downstream_rejected_samples,
             explicit_source_rejected_samples=self._explicit_source_rejected_samples,
             handoff_in_progress=self._handoff_in_progress,
+        )
+
+    def _observe_occupancy_high_water(self) -> None:
+        self._max_transition_queued_samples = max(
+            self._max_transition_queued_samples, self._transition_queued_samples(),
+        )
+        self._max_retained_source_samples = max(
+            self._max_retained_source_samples, self._retained_source_samples(),
         )
 
     def _admit_unique_primary(self, record: _OwnedSpan, fence: ExecutionFence) -> None:

@@ -51,6 +51,17 @@ class QwenServiceLifecycleRegistry:
         entry = self._sources.get(source)
         return bool(entry is not None and not entry.disposed)
 
+    def source_observability_snapshot(self, source: str) -> dict[str, Any] | None:
+        """Capture bounded lifecycle evidence before source cleanup detaches it."""
+        entry = self._sources.get(source)
+        if entry is None or entry.disposed or entry.lifecycle is None:
+            return None
+        return {
+            "qwen_public_stream_id": entry.public_stream_id,
+            "qwen_local_stream_id": entry.lifecycle.local_stream_id,
+            "qwen_epoch_observability": entry.lifecycle.observability_snapshot(),
+        }
+
     async def open_source(
         self,
         *,

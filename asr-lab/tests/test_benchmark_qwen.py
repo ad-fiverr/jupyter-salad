@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import io
 import json
 import sys
@@ -11,7 +12,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from asr_lab.asr_epoch_observability import ASREpochObservability
+from asr_lab.asr_fencing import ExecutionFence
 from benchmark.benchmark_ws import (
+    _safe_qwen_epoch_observability_snapshot,
     max_qwen_event_metric,
     receive_fixture_results,
     resolve_concurrency_levels,
@@ -41,6 +45,47 @@ class FakeHttpResponse:
 
     def read(self, *args):
         return self.body.read(*args)
+
+
+class QwenEpochSnapshotSanitizerTests(unittest.TestCase):
+    def test_real_lifecycle_pcm_accounting_is_retained_but_audio_payload_is_rejected(self):
+        recorder = ASREpochObservability(monotonic=lambda: 10.0)
+        recorder.start_epoch(
+            fence=ExecutionFence("job-1", "epoch-1", 1, "speech-1"),
+            stream_id="qwen-local-1",
+            stream_init_ms=1.0,
+            now=10.0,
+        )
+        recorder.observe(
+            stream_snapshot={"accepted_audio_ms": 100.0},
+            global_snapshot={},
+            pcm_snapshot={
+                "source_head_cursor": 1600,
+                "unique_primary_admitted_cursor": 1600,
+                "received_samples": 1600,
+                "unique_primary_admitted_samples": 1600,
+                "replay_admitted_samples": 0,
+                "transition_queued_samples": 0,
+            },
+            now=10.1,
+        )
+        snapshot = recorder.snapshot(now=10.1)
+
+        retained = _safe_qwen_epoch_observability_snapshot(snapshot)
+        self.assertIsNotNone(retained)
+        self.assertEqual(retained["current_epoch"]["pcm"]["received_samples"], 1600)
+        self.assertEqual(retained["current_epoch"]["pcm"]["transition_queued_samples"], 0)
+        self.assertEqual(retained["epoch_history"][0]["pcm"]["received_samples"], 1600)
+        self.assertIsNone(retained["current_epoch"]["pcm"]["cutover_cursor"])
+
+        for invalid_pcm in (b"\x00\x00", "base64-audio", [0, 1], {"raw_audio": "payload"}, {"received_samples": float("nan")}):
+            invalid = deepcopy(snapshot)
+            invalid["current_epoch"]["pcm"] = invalid_pcm
+            self.assertIsNone(_safe_qwen_epoch_observability_snapshot(invalid))
+
+        misplaced = deepcopy(snapshot)
+        misplaced["logical_cumulative"]["pcm"] = {"received_samples": 1600}
+        self.assertIsNone(_safe_qwen_epoch_observability_snapshot(misplaced))
 
 
 class QwenBenchmarkSummaryTests(unittest.TestCase):
@@ -337,7 +382,7 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
                             }
                         await self.messages.put(json.dumps(partial))
                     elif self.audio_sends == 3:
-                        await self.messages.put(json.dumps({
+                        error = {
                             "event": "error", "code": "stream_scheduler_overrun",
                             "scheduler": {
                                 "reason": "per_stream_backlog_limit",
@@ -372,7 +417,61 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
                                     "secret": "must-not-export",
                                 },
                             },
-                        }))
+                        }
+                        if self.epoch_snapshot_mode == "failure_timeline":
+                            error.update({
+                                "qwen_public_stream_id": "public-stream-1",
+                                "qwen_local_stream_id": "qwen-local-epoch-1",
+                                "qwen_epoch_observability": {
+                                    "current_epoch": {
+                                        "epoch_id": "epoch-1", "epoch_seq": 1,
+                                        "local_stream_id": "qwen-local-epoch-1",
+                                        "QWEN_AUDIO_ACCUM_MS": None,
+                                        "pcm": {
+                                            "source_head_cursor": 4800,
+                                            "unique_primary_admitted_cursor": 4800,
+                                            "received_samples": 4800,
+                                            "unique_primary_admitted_samples": 4800,
+                                            "replay_admitted_samples": 320,
+                                            "transition_queued_samples": 0,
+                                            "cutover_cursor": None,
+                                        },
+                                    },
+                                    "last_transition": {
+                                        "transition_seq": 1, "state": "HANDOFF_PENDING",
+                                        "stage": "CATCHUP_DRAINING", "failure_stage": "catchup",
+                                        "EPOCH_HANDOFF_WALL_MS": None,
+                                        "stage_events": [{
+                                            "stage": "SUCCESSOR_ACTIVATED", "elapsed_ms": 10,
+                                            "monotonic_at": 100.01,
+                                        }, {
+                                            "stage": "CATCHUP_DRAINING", "elapsed_ms": 12,
+                                            "monotonic_at": 100.012,
+                                        }],
+                                        "PCM_LOST": None, "PRIMARY_DUP": None,
+                                    },
+                                    "epoch_history": [
+                                        {
+                                            "epoch_id": "epoch-0", "epoch_seq": 0,
+                                            "local_stream_id": "qwen-local-epoch-0",
+                                            "pcm": {"received_samples": 4800, "transition_queued_samples": 0},
+                                        },
+                                        {
+                                            "epoch_id": "epoch-1", "epoch_seq": 1,
+                                            "local_stream_id": "qwen-local-epoch-1",
+                                            "pcm": {"received_samples": 4800, "transition_queued_samples": 0},
+                                        },
+                                    ],
+                                    "transition_history": [{
+                                        "transition_seq": 1, "state": "HANDOFF_PENDING",
+                                        "stage": "CATCHUP_DRAINING", "failure_stage": "catchup",
+                                        "stage_events": [{"stage": "CATCHUP_DRAINING", "elapsed_ms": 12}],
+                                    }],
+                                    "logical_cumulative": {"EPOCH_ROLLOVER_COUNT": 0},
+                                    "QWEN_AUDIO_ACCUM_MS": None,
+                                },
+                            })
+                        await self.messages.put(json.dumps(error))
                 elif message.get("event") == "flush":
                     await self.messages.put(json.dumps({
                         "event": "flush_complete", "request_id": message["request_id"],
@@ -491,6 +590,25 @@ class QwenBenchmarkSummaryTests(unittest.TestCase):
         malformed_row = run_fixture("invalid")
         self.assertIsNone(malformed_row["streaming"]["epoch_lifecycle"])
         self.assertIsNone(malformed_row["streaming"]["rolling_epoch"])
+
+        terminal_row = run_fixture("failure_timeline")
+        self.assertEqual(terminal_row["run_status"], "failed")
+        self.assertEqual(terminal_row["streaming"]["public_stream_id"], "public-stream-1")
+        self.assertEqual(terminal_row["streaming"]["qwen_local_stream_id"], "qwen-local-epoch-1")
+        self.assertEqual(len(terminal_row["streaming"]["epoch_history"]), 2)
+        self.assertEqual(len(terminal_row["streaming"]["transition_history"]), 1)
+        self.assertEqual(
+            terminal_row["streaming"]["rolling_epoch"]["current_epoch"]["pcm"]["received_samples"],
+            4800,
+        )
+        self.assertEqual(
+            terminal_row["streaming"]["rolling_epoch"]["current_epoch"]["pcm"]["replay_admitted_samples"],
+            320,
+        )
+        self.assertEqual(
+            terminal_row["streaming"]["transition_history"][0]["failure_stage"], "catchup",
+        )
+        self.assertIsNone(terminal_row["streaming"]["QWEN_AUDIO_ACCUM_MS"])
 
     def test_warmup_chunk_top_level_legacy_schema_remains_supported(self):
         self.assertEqual(_worker_warmup_chunk_ms({"warmup_chunk_ms": 750}), 750)

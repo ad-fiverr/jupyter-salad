@@ -360,3 +360,72 @@ export function safeQwenStartupEvidence({ readinessAtStart, qwenStartMetrics, he
     runtime_provenance: runtimeProvenance,
   };
 }
+
+const FORBIDDEN_EPOCH_SNAPSHOT_KEYS = new Set([
+  "text", "transcript", "pcm16le", "pcm16le_base64", "audio", "secret", "token",
+]);
+
+const PCM_ACCOUNTING_KEYS = new Set([
+  "source_head_cursor", "unique_primary_admitted_cursor",
+  "current_epoch_admitted_cursor", "processed_cursor", "old_processed_cursor",
+  "cutover_cursor", "replay_start_cursor", "retained_range_floor",
+  "retained_range_head", "received_samples", "unique_primary_admitted_samples",
+  "replay_admitted_samples", "replay_retained_samples",
+  "replay_inflight_copy_samples", "transition_queued_samples",
+  "max_transition_queued_samples", "retained_source_samples",
+  "max_retained_source_samples", "released_source_samples",
+  "downstream_admission_rejected_samples", "explicit_source_rejected_samples",
+]);
+
+function isSafePcmAccounting(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return false;
+  const entries = Object.entries(value);
+  return entries.length > 0 && entries.length <= PCM_ACCOUNTING_KEYS.size
+    && entries.every(([key, item]) => PCM_ACCOUNTING_KEYS.has(key.toLowerCase())
+      && (item === null || (typeof item === "number" && Number.isFinite(item))));
+}
+
+function isContentFreeEpochSnapshot(value, depth = 0, path = []) {
+  if (depth > 12) return false;
+  if (Array.isArray(value)) {
+    return value.length <= 16
+      && value.every((item) => isContentFreeEpochSnapshot(item, depth + 1, [...path, "[]"]));
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value).every(([key, item]) => {
+      const normalizedKey = key.toLowerCase();
+      if (normalizedKey === "pcm") {
+        const isCurrentEpochAccounting = path.length === 1 && path[0] === "current_epoch";
+        const isEpochHistoryAccounting = path.length === 2
+          && path[0] === "epoch_history" && path[1] === "[]";
+        return (isCurrentEpochAccounting || isEpochHistoryAccounting) && isSafePcmAccounting(item);
+      }
+      return !FORBIDDEN_EPOCH_SNAPSHOT_KEYS.has(normalizedKey)
+        && isContentFreeEpochSnapshot(item, depth + 1, [...path, normalizedKey]);
+    });
+  }
+  return value === null || ["string", "number", "boolean"].includes(typeof value);
+}
+
+export function safeQwenEpochObservabilitySnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const currentEpoch = value.current_epoch;
+  const logical = value.logical_cumulative;
+  if (!currentEpoch || typeof currentEpoch !== "object" || Array.isArray(currentEpoch)
+      || !logical || typeof logical !== "object" || Array.isArray(logical)
+      || !(value.last_transition === null || (value.last_transition && typeof value.last_transition === "object" && !Array.isArray(value.last_transition)))
+      || !Array.isArray(value.epoch_history) || value.epoch_history.length > 8
+      || !Array.isArray(value.transition_history) || value.transition_history.length > 8) return null;
+  if (typeof currentEpoch.epoch_id !== "string" || !currentEpoch.epoch_id || currentEpoch.epoch_id.length > 160
+      || !Number.isInteger(currentEpoch.epoch_seq) || currentEpoch.epoch_seq < 0
+      || !Number.isInteger(logical.EPOCH_ROLLOVER_COUNT) || logical.EPOCH_ROLLOVER_COUNT < 0) return null;
+  for (const transition of value.transition_history) {
+    if (!transition || typeof transition !== "object" || Array.isArray(transition)
+        || !Array.isArray(transition.stage_events) || transition.stage_events.length > 16) return null;
+  }
+  let encoded;
+  try { encoded = JSON.stringify(value); } catch { return null; }
+  if (encoded.length > 64_000 || !isContentFreeEpochSnapshot(value)) return null;
+  return JSON.parse(encoded);
+}

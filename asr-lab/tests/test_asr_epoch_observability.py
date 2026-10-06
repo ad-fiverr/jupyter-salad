@@ -309,6 +309,91 @@ class ASREpochObservabilityTests(unittest.TestCase):
             750.0,
         )
 
+    def test_transition_history_records_epoch_lineage_stages_and_monotonic_timestamps_bounded(self):
+        self.recorder.start_epoch(fence=self.fence, stream_id="local-0", stream_init_ms=1, now=0)
+        self.recorder.begin_transition(
+            category="hard_bound", reason="hard_bound", details={"transcript": "redact me"},
+            cutover_cursor=1600, predecessor_stream_id="local-0", stream_snapshot={},
+            pcm_snapshot={}, now=1.0,
+        )
+        self.recorder.record_transition_stage("PREDECESSOR_FENCED", now=1.05)
+        self.recorder.record_transition_stage("SUCCESSOR_OPENING", now=1.06)
+        self.recorder.record_transition_stage("SUCCESSOR_OPENED", now=1.08)
+        successor = ExecutionFence("job-1", "epoch-2", 2, "speech-1")
+        self.recorder.start_epoch(fence=successor, stream_id="local-1", stream_init_ms=2, now=1.1)
+        self.recorder.record_transition_stage("SUCCESSOR_ACTIVATED", now=1.1)
+        self.recorder.record_transition_stage("REPLAY_DRAINING", now=1.11)
+        self.recorder.record_transition_stage("REPLAY_DRAINED", now=1.12)
+        self.recorder.record_transition_stage("CATCHUP_DRAINING", now=1.13)
+        self.recorder.record_transition_stage("CATCHUP_DRAINED", now=1.14)
+        self.recorder.complete_transition(success=True, pcm_snapshot={}, now=1.15)
+        self.recorder.record_transition_stage("ACTIVE", now=1.15)
+
+        transition = self.recorder.snapshot(now=1.2)["transition_history"][-1]
+        self.assertEqual(transition["predecessor_epoch_id"], "epoch-1")
+        self.assertEqual(transition["predecessor_epoch_seq"], 1)
+        self.assertEqual(transition["predecessor_local_stream_id"], "local-0")
+        self.assertEqual(transition["successor_epoch_id"], "epoch-2")
+        self.assertEqual(transition["successor_epoch_seq"], 2)
+        self.assertEqual(transition["successor_local_stream_id"], "local-1")
+        self.assertEqual(transition["state"], "ACTIVE")
+        self.assertEqual(transition["stage"], "ACTIVE")
+        self.assertEqual(transition["last_completed_stage"], "ACTIVE")
+        self.assertEqual(transition["successor_open_started_at_monotonic"], 1.06)
+        self.assertEqual(transition["successor_open_completed_at_monotonic"], 1.08)
+        self.assertEqual(transition["successor_activated_at_monotonic"], 1.1)
+        self.assertEqual(transition["handoff_completed_at_monotonic"], 1.15)
+        self.assertIn("monotonic_at", transition["stage_events"][0])
+        self.assertNotIn("redact me", repr(transition))
+
+        for index in range(2, 11):
+            self.recorder.begin_transition(
+                category="manual_test", reason="manual_test", details={}, cutover_cursor=0,
+                stream_snapshot={}, pcm_snapshot={}, now=float(index),
+            )
+            next_fence = ExecutionFence("job-1", f"epoch-{index + 1}", index + 1, "speech-1")
+            self.recorder.start_epoch(
+                fence=next_fence, stream_id=f"local-{index}", stream_init_ms=1,
+                now=float(index) + 0.01,
+            )
+            self.recorder.record_transition_stage("SUCCESSOR_ACTIVATED", now=float(index) + 0.01)
+            self.recorder.complete_transition(success=True, pcm_snapshot={}, now=float(index) + 0.02)
+            self.recorder.record_transition_stage("ACTIVE", now=float(index) + 0.02)
+        bounded = self.recorder.snapshot(now=12)
+        self.assertLessEqual(len(bounded["epoch_history"]), 8)
+        self.assertLessEqual(len(bounded["transition_history"]), 8)
+        self.assertLessEqual(
+            max(len(item["stage_events"]) for item in bounded["transition_history"]), 16,
+        )
+
+    def test_transition_buffer_current_and_high_water_ms_are_explicit(self):
+        self.recorder.start_epoch(fence=self.fence, stream_id="local-0", stream_init_ms=1, now=0)
+        base_pcm = {
+            "transition_queued_samples": 100,
+            "max_transition_queued_samples": 100,
+            "retained_source_samples": 400,
+            "max_retained_source_samples": 400,
+        }
+        self.recorder.begin_transition(
+            category="manual_test", reason="manual_test", details={}, cutover_cursor=100,
+            predecessor_stream_id="local-0", stream_snapshot={}, pcm_snapshot=base_pcm, now=1,
+        )
+        current_pcm = {
+            **base_pcm,
+            "transition_queued_samples": 250,
+            "max_transition_queued_samples": 250,
+            "retained_source_samples": 600,
+            "max_retained_source_samples": 600,
+        }
+        self.recorder.record_transition_blocked(
+            failure_stage="catchup", failure_reason="bounded_rejection", pcm_snapshot=current_pcm,
+        )
+        transition = self.recorder.snapshot(now=1.1)["last_transition"]
+        self.assertEqual(transition["transition_buffer_current_ms"], 15.625)
+        self.assertEqual(transition["transition_buffer_max_ms"], 15.625)
+        self.assertEqual(transition["retained_pcm_current_ms"], 37.5)
+        self.assertEqual(transition["retained_pcm_max_ms"], 37.5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,7 +23,7 @@ class LifecycleWorker:
         stream_id = payload.get("stream_id")
         if operation == "init":
             assert isinstance(stream_id, str)
-            self.streams[stream_id] = {"text": "hola mundo"}
+            self.streams[stream_id] = {"text": f"candidate-{stream_id}"}
             return {"stream_id": stream_id, "stream_state_init_wall_ms": 1.0}
         if operation in {"push", "finish"}:
             assert isinstance(stream_id, str)
@@ -200,6 +200,80 @@ class QwenServiceLifecycleRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["qwen_epoch_observability"]["logical_cumulative"]["EPOCH_ROLLOVER_COUNT"], 2)
         self.assertEqual(sum(operation == "finish" for operation, _ in self.worker.requests), 1)
         self.assertFalse(self.registry.has_active_source("mic"))
+
+    async def test_100ms_ingress_crosses_three_rollovers_with_pcm_and_identity_continuity(self):
+        self.runtime.max_stream_seconds = 0.25
+        self.runtime.default_chunk_ms = 100
+        started = await self.registry.open_source(source="mic", model_chunk_ms=100)
+        public_stream_id = started["stream_id"]
+        lifecycle = self.registry._sources["mic"].lifecycle
+        self.assertIsNotNone(lifecycle)
+        # A small replay overlap is synthetic test data only. Production
+        # registry wiring remains unchanged at zero overlap.
+        lifecycle.pcm_handoff.replay_overlap_samples = 160
+
+        frame = b"\x21\x00" * 1_600  # exactly 100 ms of 16 kHz PCM16LE
+        next_frame_at = asyncio.get_running_loop().time()
+        ingress_tasks = []
+        for index in range(8):
+            await asyncio.sleep(max(0.0, next_frame_at - asyncio.get_running_loop().time()))
+            ingress_tasks.append(asyncio.create_task(
+                self.registry.submit_pcm(source="mic", pcm16le=frame),
+            ))
+            next_frame_at += 0.1
+        await asyncio.gather(*ingress_tasks)
+        await self.wait_until(
+            lambda: lifecycle.observability_snapshot()["current_epoch"]["scheduler_pending_jobs"] == 0,
+            "decode jobs did not drain after the fixed-cadence synthetic ingress ended",
+        )
+
+        before_eos = lifecycle.observability_snapshot()
+        transitions = before_eos["transition_history"]
+        epochs = before_eos["epoch_history"]
+        self.assertGreaterEqual(len(transitions), 3)
+        self.assertEqual(before_eos["logical_cumulative"]["rollover_success_count"], len(transitions))
+        self.assertEqual([epoch["epoch_seq"] for epoch in epochs], list(range(len(epochs))))
+        self.assertGreaterEqual(before_eos["logical_cumulative"]["replay_admitted_samples"], 3 * 160)
+        self.assertTrue(all(item["state"] == "ACTIVE" for item in transitions))
+        self.assertTrue(all(item["stage"] == "ACTIVE" for item in transitions))
+        self.assertTrue(all(item["PCM_LOST"] == 0 for item in transitions))
+        self.assertTrue(all(item["PRIMARY_DUP"] == 0 for item in transitions))
+        self.assertEqual(len({epoch["local_stream_id"] for epoch in epochs}), len(epochs))
+        self.assertEqual([epoch["epoch_seq"] for epoch in epochs], [0, 1, 2, 3])
+        self.assertEqual({event["stream_id"] for event in self.events}, {public_stream_id})
+        for event in self.events:
+            snapshot = event["qwen_epoch_observability"]
+            current = snapshot["current_epoch"]
+            self.assertEqual(event["qwen_local_stream_id"], current["local_stream_id"])
+            self.assertEqual(event["stream_id"], public_stream_id)
+            self.assertIn(current["epoch_seq"], range(4))
+        pcm_before_eos = lifecycle.pcm_handoff.snapshot()
+        self.assertEqual(pcm_before_eos.received_samples, 8 * 1_600)
+        self.assertEqual(pcm_before_eos.unique_primary_admitted_samples, 8 * 1_600)
+        self.assertEqual(pcm_before_eos.transition_queued_samples, 0)
+
+        final = await self.registry.finish(source="mic", request_id="100ms-eos")
+        self.assertIsNotNone(final)
+        assert final is not None
+        final_epochs = final["qwen_epoch_observability"]["epoch_history"]
+        self.assertEqual(final_epochs[-1]["lifecycle_state"], "NATURAL_EOS")
+        self.assertEqual(sum(operation == "finish" for operation, _ in self.worker.requests), 1)
+        self.assertEqual(sum(operation == "close" for operation, _ in self.worker.requests), len(epochs))
+        self.assertEqual(final["stream_id"], public_stream_id)
+        self.assertEqual(final["qwen_local_stream_id"], epochs[-1]["local_stream_id"])
+
+    async def test_error_snapshot_is_available_before_source_cleanup(self):
+        started = await self.registry.open_default_source("mic")
+        self.assertIsNotNone(started)
+        before_abort = self.registry.source_observability_snapshot("mic")
+        self.assertIsNotNone(before_abort)
+        assert before_abort is not None
+        await self.registry.abort_source("mic")
+        self.assertIsNone(self.registry.source_observability_snapshot("mic"))
+        self.assertEqual(before_abort["qwen_public_stream_id"], started["stream_id"])
+        self.assertEqual(
+            before_abort["qwen_epoch_observability"]["current_epoch"]["epoch_seq"], 0,
+        )
 
     async def test_disconnect_disposes_without_eos_and_suppresses_late_events(self):
         started = await self.registry.open_default_source("mic")

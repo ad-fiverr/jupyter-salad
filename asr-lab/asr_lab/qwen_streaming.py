@@ -457,6 +457,14 @@ class QwenStreamingRuntime:
             "speaker": "you" if session.source == "mic" else "them",
             "revision": session.revision,
             "audio_cursor_ms": round(cursor_ms, 2),
+            "QWEN_NEW_AUDIO_MS": (
+                round((len(job.pcm16le) // 2) * 1000.0 / 16_000, 3)
+                if job.kind == "push" else None
+            ),
+            "EPOCH_AUDIO_ACCUMULATED_MS": round(cursor_ms, 3),
+            # qwen-asr's internal accumulated tensor is not exposed through a
+            # version-stable read-only API, so do not infer it from the cursor.
+            "QWEN_AUDIO_ACCUM_MS": None,
             "request_id": session.request_id,
             "PARTIAL_COUNT": session.partial_count,
             "SERVER_FIRST_PARTIAL_MS": round(((session.first_partial_at if session.first_partial_at is not None else ready) - (session.first_audio_at if session.first_audio_at is not None else session.started_at)) * 1000, 2),
@@ -565,6 +573,9 @@ class QwenStreamingRuntime:
             "speaker": "you" if session.source == "mic" else "them",
             "revision": session.revision,
             "audio_cursor_ms": round(cursor_ms, 2),
+            "QWEN_NEW_AUDIO_MS": None,
+            "EPOCH_AUDIO_ACCUMULATED_MS": round(cursor_ms, 3),
+            "QWEN_AUDIO_ACCUM_MS": None,
             "request_id": request_id or session.request_id,
             "client_request_id": request_id,
             "AUDIO_DURATION_MS": round(cursor_ms, 2),

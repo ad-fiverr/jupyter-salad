@@ -7,7 +7,12 @@ import unittest
 from asr_lab.asr_epoch_controller import LocalAcousticEpochController
 from asr_lab.asr_epoch_controller import EpochControllerState
 from asr_lab.asr_fencing import ExecutionFence, FenceOutcome
-from asr_lab.asr_pcm_handoff import LocalPCMHandoffCoordinator
+from asr_lab.asr_pcm_handoff import (
+    AdmissionRejected,
+    LocalPCMHandoffCoordinator,
+    PCMHandoffError,
+    PCMAdmissionKind,
+)
 from asr_lab.asr_epoch_rollover_policy import (
     SignalClass,
     SoftRolloverPolicy,
@@ -1275,6 +1280,95 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(handoff.snapshot().unique_primary_admitted_samples, 20000)
             self.assertEqual(lifecycle.state, QwenEpochLifecycleState.HANDOFF_PENDING)
             self.assertEqual(len(worker.stream_ids), 2)
+        finally:
+            worker.release_old_push.set()
+            worker.release_successor_push.set()
+            worker.release_second_init.set()
+            await runtime.close()
+
+    async def test_deterministic_handoff_reproducer_identifies_catchup_rejection_stage(self):
+        """A successor may be active while a bounded handoff remains incomplete."""
+        worker = LifecycleWorker()
+        worker, controller, handoff, runtime, lifecycle = await self.make_lifecycle(worker)
+        original_pcm = b"\x61\x00" * 4000
+        transition_pcm = b"\x62\x00" * 4000
+        attempted_kinds: list[str] = []
+        try:
+            await lifecycle.initialize()
+            await lifecycle.submit_pcm(original_pcm)
+            await asyncio.wait_for(worker.old_push_started.wait(), 1)
+
+            original_submit = lifecycle.submit
+
+            async def reject_successor_catchup(kind, fence, span):
+                attempted_kinds.append(kind.name)
+                if kind is PCMAdmissionKind.PRIMARY:
+                    raise AdmissionRejected("injected_catchup_rejection")
+                return await original_submit(kind, fence, span)
+
+            lifecycle.submit = reject_successor_catchup
+            rollover_task = asyncio.create_task(lifecycle.rollover())
+            await asyncio.wait_for(worker.second_init.wait(), 1)
+            self.assertEqual(lifecycle.state, QwenEpochLifecycleState.HANDOFF_PENDING)
+            self.assertIsNone(await lifecycle.submit_pcm(transition_pcm))
+            self.assertEqual(handoff.snapshot().transition_queued_samples, 4000)
+
+            worker.release_old_push.set()
+            worker.release_second_init.set()
+            worker.release_successor_push.set()
+            result = await asyncio.wait_for(rollover_task, 1)
+
+            # Replay into the fresh successor succeeded; the first failure was
+            # the subsequent transition-PRIMARY catch-up admission.
+            self.assertEqual(attempted_kinds, ["REPLAY", "PRIMARY"])
+            self.assertEqual(result.blocked_reason, "injected_catchup_rejection")
+            self.assertEqual(result.replay_admitted_samples, 4000)
+            self.assertEqual(result.primary_admitted_samples, 0)
+            self.assertEqual(controller.current.epoch_seq, 18)
+            self.assertNotEqual(lifecycle.local_stream_id, worker.stream_ids[0])
+            self.assertEqual(lifecycle.state, QwenEpochLifecycleState.HANDOFF_PENDING)
+
+            snapshot = handoff.snapshot()
+            self.assertEqual(snapshot.received_samples, 8000)
+            self.assertEqual(snapshot.unique_primary_admitted_samples, 4000)
+            self.assertEqual(snapshot.replay_admitted_samples, 4000)
+            self.assertEqual(snapshot.transition_queued_samples, 4000)
+            self.assertTrue(snapshot.handoff_in_progress)
+            observed = lifecycle.observability_snapshot()
+            transition = observed["last_transition"]
+            self.assertEqual(transition["state"], "HANDOFF_PENDING")
+            self.assertEqual(transition["failure_stage"], "catchup")
+            self.assertEqual(transition["last_completed_stage"], "REPLAY_DRAINED")
+            self.assertEqual(transition["last_blocked_stage"], "catchup")
+            self.assertEqual(transition["stage"], "CATCHUP_DRAINING")
+            self.assertEqual(transition["predecessor_epoch_seq"], 17)
+            self.assertEqual(transition["successor_epoch_seq"], 18)
+            self.assertEqual(transition["successor_local_stream_id"], lifecycle.local_stream_id)
+            self.assertIsNone(transition["EPOCH_HANDOFF_WALL_MS"])
+
+            # Keep accepting transition-owned frames only up to the existing
+            # configured bound, then prove the exact fail-closed stage without
+            # increasing queue capacity or losing the retained PCM.
+            for index in range(4):
+                result = await lifecycle.submit_pcm(bytes([0x63 + index, 0]) * 4000)
+                self.assertIsNone(result)
+            self.assertEqual(handoff.snapshot().transition_queued_samples, 20_000)
+            with self.assertRaises(PCMHandoffError) as rejected:
+                await lifecycle.submit_pcm(b"\x70\x00")
+            self.assertEqual(rejected.exception.code, "transition_capacity_exceeded")
+            failed = lifecycle.observability_snapshot()["last_transition"]
+            self.assertEqual(failed["state"], "HANDOFF_PENDING")
+            self.assertEqual(failed["stage"], "CATCHUP_DRAINING")
+            self.assertEqual(failed["failure_stage"], "transition_capacity")
+            self.assertEqual(failed["failure_reason"], "transition_capacity_exceeded")
+            self.assertEqual(failed["last_blocked_stage"], "transition_capacity")
+            self.assertEqual(failed["last_completed_stage"], "REPLAY_DRAINED")
+            self.assertEqual(failed["latest_pcm_accounting"]["transition_queued_samples"], 20_000)
+            self.assertEqual(failed["latest_pcm_accounting"]["max_transition_queued_samples"], 20_000)
+            self.assertEqual(failed["latest_pcm_accounting"]["explicit_source_rejected_samples"], 1)
+            self.assertEqual(failed["transition_buffer_current_ms"], 1_250.0)
+            self.assertEqual(failed["transition_buffer_max_ms"], 1_250.0)
+            self.assertEqual(handoff.snapshot().explicit_source_rejected_samples, 1)
         finally:
             worker.release_old_push.set()
             worker.release_successor_push.set()

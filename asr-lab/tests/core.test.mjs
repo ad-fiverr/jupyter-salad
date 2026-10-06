@@ -27,6 +27,7 @@ import {
   rttPercentiles,
   qwenDeviceTelemetryLabel,
   safeQwenStartupEvidence,
+  safeQwenEpochObservabilitySnapshot,
   wordErrorRate,
   shouldDrawCanvas,
 } from "../asr_lab/benchmark_web/core.mjs";
@@ -326,6 +327,77 @@ test("benchmark CSS keeps base layout and bounds Qwen/mobile dashboard", () => {
   assert.match(styleSource, /\.qwen-scheduler-grid/);
   assert.match(styleSource, /max-width:560px/);
   assert.match(styleSource, /\.partial-timeline-wrap\{max-height:360px/);
+});
+
+test("Qwen epoch snapshot is content-free, bounded, and preserves lifecycle evidence", () => {
+  const snapshot = {
+    schema_version: 1,
+    current_epoch: {
+      epoch_id: "epoch-3", epoch_seq: 3, local_stream_id: "local-3", lifecycle_state: "ACTIVE",
+      pcm: {
+        source_head_cursor: 6400,
+        unique_primary_admitted_cursor: 6400,
+        received_samples: 6400,
+        unique_primary_admitted_samples: 6400,
+        replay_admitted_samples: 800,
+        transition_queued_samples: 0,
+        cutover_cursor: null,
+      },
+    },
+    last_transition: { transition_seq: 3, state: "ACTIVE", stage: "ACTIVE", stage_events: [] },
+    epoch_history: Array.from({ length: 4 }, (_, index) => ({
+      epoch_id: `epoch-${index}`, epoch_seq: index,
+      pcm: { received_samples: index === 3 ? 6400 : null, replay_admitted_samples: 800 },
+    })),
+    transition_history: [{ transition_seq: 3, stage_events: [{ stage: "ACTIVE" }] }],
+    logical_cumulative: { EPOCH_ROLLOVER_COUNT: 3 },
+    QWEN_AUDIO_ACCUM_MS: null,
+  };
+  const retained = safeQwenEpochObservabilitySnapshot(snapshot);
+  assert.deepEqual(retained, snapshot);
+  assert.notEqual(retained, snapshot);
+  assert.equal(retained.current_epoch.pcm.received_samples, 6400);
+  for (const unsafePcm of ["raw PCM", [1, 2, 3], new Uint8Array([1, 2]), { received_samples: Infinity }, { raw_audio: "payload" }]) {
+    assert.equal(safeQwenEpochObservabilitySnapshot({
+      ...snapshot,
+      current_epoch: { ...snapshot.current_epoch, pcm: unsafePcm },
+    }), null);
+  }
+  assert.equal(safeQwenEpochObservabilitySnapshot({
+    ...snapshot,
+    logical_cumulative: { ...snapshot.logical_cumulative, pcm: { received_samples: 6400 } },
+  }), null);
+  assert.equal(safeQwenEpochObservabilitySnapshot({ ...snapshot, audio: "must not be exported" }), null);
+  assert.equal(safeQwenEpochObservabilitySnapshot({
+    ...snapshot,
+    transition_history: Array.from({ length: 9 }, () => ({ stage_events: [] })),
+  }), null);
+  assert.equal(safeQwenEpochObservabilitySnapshot({
+    ...snapshot,
+    transition_history: [{ stage_events: Array.from({ length: 17 }, () => ({ stage: "ACTIVE" })) }],
+  }), null);
+  assert.equal(safeQwenEpochObservabilitySnapshot({
+    ...snapshot,
+    current_epoch: { epoch_id: "epoch-3", epoch_seq: 3, transcript: "not allowed" },
+  }), null);
+});
+
+test("Qwen browser UI and JSON retain bounded epoch lineage through terminal errors", () => {
+  assert.match(htmlSource, /id="qwen-lifecycle-panel"/);
+  assert.match(htmlSource, /id="qwen-epoch-history-body"/);
+  assert.match(htmlSource, /id="qwen-transition-history-body"/);
+  assert.match(htmlSource, /Qwen local stream id/);
+  assert.match(appSource, /captureQwenEpochEvidence\(message\)/);
+  assert.match(appSource, /safeQwenEpochObservabilitySnapshot/);
+  assert.match(appSource, /state\.lastQwenLifecycleError\s*=\s*\{/);
+  assert.match(appSource, /rolling_epoch:\s*state\.qwenEpochObservability\s*\?/);
+  assert.match(appSource, /epoch_history:\s*state\.qwenEpochObservability\?\.epoch_history/);
+  assert.match(appSource, /transition_history:\s*state\.qwenEpochObservability\?\.transition_history/);
+  assert.match(appSource, /QWEN_NEW_AUDIO_MS/);
+  assert.match(appSource, /EPOCH_AUDIO_ACCUMULATED_MS/);
+  assert.match(appSource, /QWEN_AUDIO_ACCUM_MS/);
+  assert.match(appSource, /transition\.failure_stage/);
+  assert.match(appSource, /transition\?\.last_completed_stage/);
 });
 
 test("Stop drains the last worklet PCM chunk before freezing capture and marking EOS", () => {

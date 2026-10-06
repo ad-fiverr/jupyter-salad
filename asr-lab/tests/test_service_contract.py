@@ -463,6 +463,77 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(socket.sent[1]["stream_id"], "owned-stream")
         self.assertEqual(socket.sent[2]["request_id"], "flush-1")
 
+    async def test_qwen_terminal_error_keeps_lifecycle_snapshot_before_cleanup(self):
+        service = self.setup_service()
+        service.settings = Settings.from_env({
+            "ASR_BACKEND": "parakeet", "ASR_API_TOKEN": TOKEN,
+            "QWEN_STREAMING_ENABLED": "1", "QWEN_STREAMING_RUNTIME_AVAILABLE": "1",
+        })
+
+        class Runtime:
+            ready = True
+
+            async def close_connection(self, _connection_id):
+                return None
+
+        diagnostics = {
+            "qwen_public_stream_id": "public-stream",
+            "qwen_local_stream_id": "qwen-local-epoch-2",
+            "qwen_epoch_observability": {
+                "current_epoch": {"epoch_id": "epoch-2", "epoch_seq": 2},
+                "last_transition": {
+                    "state": "HANDOFF_PENDING", "stage": "CATCHUP_DRAINING",
+                    "failure_stage": "catchup",
+                },
+                "logical_cumulative": {"EPOCH_ROLLOVER_COUNT": 1},
+                "epoch_history": [], "transition_history": [],
+            },
+        }
+        order = []
+
+        class Registry:
+            def __init__(self, **_kwargs):
+                self.active = False
+
+            async def open_source(self, **_kwargs):
+                self.active = True
+                return {"event": "stream_started", "stream_id": "public-stream"}
+
+            def has_active_source(self, _source):
+                return self.active
+
+            async def submit_pcm(self, **_kwargs):
+                raise service.StreamingError("transition_capacity_exceeded")
+
+            def source_observability_snapshot(self, _source):
+                order.append("snapshot")
+                return diagnostics
+
+            async def abort_source(self, _source):
+                order.append("cleanup")
+                self.active = False
+
+            async def close_connection(self):
+                self.active = False
+
+        service.qwen_runtime = Runtime()
+        socket = FakeWebSocket([
+            {"type": "websocket.receive", "text": json.dumps({
+                "event": "stream_start", "source": "mic", "request_id": "start-1",
+                "language": "auto", "context": "", "model_chunk_ms": 250,
+            })},
+            audio_frame(),
+            {"type": "websocket.disconnect"},
+        ])
+        with patch.object(service, "QwenServiceLifecycleRegistry", Registry):
+            await service.websocket_asr(socket, token=TOKEN)
+
+        error = next(item for item in socket.sent if item.get("event") == "error")
+        self.assertEqual(order, ["snapshot", "cleanup"])
+        self.assertEqual(error["qwen_public_stream_id"], "public-stream")
+        self.assertEqual(error["qwen_local_stream_id"], "qwen-local-epoch-2")
+        self.assertEqual(error["qwen_epoch_observability"]["last_transition"]["stage"], "CATCHUP_DRAINING")
+
     async def test_six_qwen_websocket_clients_are_isolated_and_overrun_rolls_epoch_in_place(self):
         service = self.setup_service(max_connections=8)
         service.settings = Settings.from_env({
