@@ -124,6 +124,7 @@ class QwenDecodeScheduler:
         self.ready: deque[tuple[str, str]] = deque()
         self._ready_set: set[tuple[str, str]] = set()
         self._condition = asyncio.Condition()
+        self._capacity_generation_counter = 0
         self._task: asyncio.Task[None] | None = None
         self._closing = False
         self._active_job: tuple[StreamQueue, RequestKey, DecodeJob] | None = None
@@ -137,6 +138,36 @@ class QwenDecodeScheduler:
     async def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._dispatch_loop(), name="qwen-fair-decode-scheduler")
+
+    @property
+    def _capacity_progress_generation(self) -> int:
+        """Monotonic internal generation for bounded waits on released queue capacity."""
+        return self._capacity_generation_counter
+
+    async def _wait_for_capacity_progress(self, after_generation: int, timeout_seconds: float) -> bool:
+        if (isinstance(after_generation, bool) or not isinstance(after_generation, int) or after_generation < 0
+                or isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(float(timeout_seconds)) or timeout_seconds < 0):
+            raise ValueError("invalid_capacity_progress_wait")
+        async with self._condition:
+            if self._capacity_generation_counter != after_generation:
+                return True
+            if self._closing or timeout_seconds == 0:
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._condition.wait_for(
+                        lambda: self._closing or self._capacity_generation_counter != after_generation,
+                    ),
+                    timeout=float(timeout_seconds),
+                )
+            except TimeoutError:
+                return False
+            return not self._closing and self._capacity_generation_counter != after_generation
+
+    def _signal_capacity_progress_locked(self) -> None:
+        self._capacity_generation_counter += 1
+        self._condition.notify_all()
 
     async def register(
         self,
@@ -462,6 +493,7 @@ class QwenDecodeScheduler:
 
     def _fence_locked(self, stream: StreamQueue) -> None:
         identity = stream.identity
+        released_pending_jobs = len(stream.pending)
         stream.fenced = True
         stream.accepting = False
         stream.active_key = None
@@ -473,6 +505,8 @@ class QwenDecodeScheduler:
         self.ready = deque(item for item in self.ready if item != identity)
         self._ready_set.discard(identity)
         self.streams.pop(identity, None)
+        if released_pending_jobs:
+            self._signal_capacity_progress_locked()
 
     async def _dispatch_loop(self) -> None:
         while True:
@@ -486,6 +520,7 @@ class QwenDecodeScheduler:
                 if stream is None or stream.fenced or not stream.pending:
                     continue
                 job = stream.pending.popleft()
+                self._signal_capacity_progress_locked()
                 stream.next_revision += 1
                 key = RequestKey(stream.connection_id, stream.stream_id, stream.next_revision)
                 stream.active_key = key

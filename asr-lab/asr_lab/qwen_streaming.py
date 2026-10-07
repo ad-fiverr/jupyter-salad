@@ -214,6 +214,13 @@ class QwenStreamingRuntime:
         return self.scheduler.pending_jobs
 
     @property
+    def _capacity_progress_generation(self) -> int:
+        return self.scheduler._capacity_progress_generation
+
+    async def _wait_for_capacity_progress(self, after_generation: int, timeout_seconds: float) -> bool:
+        return await self.scheduler._wait_for_capacity_progress(after_generation, timeout_seconds)
+
+    @property
     def active_sessions(self) -> int:
         return len(self.sessions)
 

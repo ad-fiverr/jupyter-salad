@@ -53,6 +53,7 @@ const state = {
   qwenLocalStreamId: null,
   qwenEpochObservability: null,
   lastQwenLifecycleError: null,
+  lastPartialProducerKey: null,
   lastPartialRevision: 0,
   lastPartialAt: null,
   clientEosAt: null,
@@ -459,6 +460,33 @@ async function pollTelemetry() {
 
 function onPartialTranscript(message) {
   if (message.stream_id !== state.streamId || message.final !== false || message.replace !== true) return;
+  const currentEpoch = state.qwenEpochObservability?.current_epoch ?? null;
+  const producerLocalId = typeof message.qwen_local_stream_id === "string"
+    ? message.qwen_local_stream_id
+    : null;
+  const currentLocalId = state.qwenLocalStreamId ?? currentEpoch?.local_stream_id ?? null;
+  if (!producerLocalId || !currentLocalId || producerLocalId !== currentLocalId) return;
+  const producerEpoch = message.qwen_epoch_observability?.current_epoch ?? null;
+  const producerEpochSeq = Number.isInteger(message.epoch_seq)
+    ? message.epoch_seq
+    : producerEpoch?.epoch_seq;
+  const producerEpochId = typeof message.epoch_id === "string"
+    ? message.epoch_id
+    : producerEpoch?.epoch_id;
+  if (currentEpoch && (
+    (Number.isInteger(producerEpochSeq) && producerEpochSeq !== currentEpoch.epoch_seq)
+    || (typeof producerEpochId === "string" && producerEpochId !== currentEpoch.epoch_id)
+  )) return;
+  const producerKey = [
+    state.qwenPublicStreamId ?? message.stream_id,
+    producerLocalId,
+    producerEpochId ?? currentEpoch?.epoch_id ?? "",
+    producerEpochSeq ?? currentEpoch?.epoch_seq ?? "",
+  ].join("\u0000");
+  if (state.lastPartialProducerKey !== producerKey) {
+    state.lastPartialProducerKey = producerKey;
+    state.lastPartialRevision = 0;
+  }
   if (!Number.isInteger(message.revision) || message.revision <= state.lastPartialRevision) return;
   const receivedAt = performance.now();
   const previousAt = state.lastPartialAt;
@@ -540,14 +568,35 @@ function appendLifecycleRow(body, values, className = "", colSpan = 1) {
 function captureQwenEpochEvidence(message) {
   const publicStreamId = message?.stream_id ?? message?.qwen_public_stream_id;
   if (publicStreamId && state.streamId && publicStreamId !== state.streamId) return;
+  const snapshot = safeQwenEpochObservabilitySnapshot(message?.qwen_epoch_observability);
+  const incomingEpoch = snapshot?.current_epoch ?? null;
+  const currentEpoch = state.qwenEpochObservability?.current_epoch ?? null;
+  const messageLocalId = typeof message?.qwen_local_stream_id === "string"
+    ? message.qwen_local_stream_id
+    : null;
+  const snapshotLocalId = typeof incomingEpoch?.local_stream_id === "string"
+    ? incomingEpoch.local_stream_id
+    : null;
+  if (messageLocalId && snapshotLocalId && messageLocalId !== snapshotLocalId) return;
+  if (incomingEpoch && currentEpoch) {
+    if (incomingEpoch.epoch_seq < currentEpoch.epoch_seq) return;
+    if (incomingEpoch.epoch_seq === currentEpoch.epoch_seq && (
+      incomingEpoch.epoch_id !== currentEpoch.epoch_id
+      || (snapshotLocalId && currentEpoch.local_stream_id && snapshotLocalId !== currentEpoch.local_stream_id)
+    )) return;
+  } else if (!incomingEpoch && messageLocalId && state.qwenLocalStreamId
+      && messageLocalId !== state.qwenLocalStreamId) {
+    return;
+  }
   if (typeof publicStreamId === "string" && publicStreamId
       && (!state.streamId || publicStreamId === state.streamId)) {
     state.qwenPublicStreamId = publicStreamId;
   }
-  if (typeof message?.qwen_local_stream_id === "string" && message.qwen_local_stream_id) {
-    state.qwenLocalStreamId = message.qwen_local_stream_id;
+  if (snapshotLocalId) {
+    state.qwenLocalStreamId = snapshotLocalId;
+  } else if (messageLocalId) {
+    state.qwenLocalStreamId = messageLocalId;
   }
-  const snapshot = safeQwenEpochObservabilitySnapshot(message?.qwen_epoch_observability);
   if (snapshot) {
     state.qwenEpochObservability = snapshot;
     const currentLocalId = snapshot.current_epoch?.local_stream_id;
@@ -1213,6 +1262,7 @@ function resetRun() {
   state.lastQwenLifecycleError = null;
   state.streamStartRequestId = null;
   state.streamEvents = [];
+  state.lastPartialProducerKey = null;
   state.lastPartialRevision = 0;
   state.lastPartialAt = null;
   state.clientEosAt = null;

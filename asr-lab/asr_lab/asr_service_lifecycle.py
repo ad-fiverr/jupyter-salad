@@ -1,7 +1,9 @@
 """Per-WebSocket ownership for Qwen's local rolling acoustic lifecycle."""
 from __future__ import annotations
 
+import asyncio
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
@@ -18,6 +20,7 @@ from .qwen_streaming import QwenStreamingRuntime, StreamingError, validate_candi
 
 
 ASR_LAB_LOCAL_INITIAL_EPOCH_SEQ = 0
+_HANDOFF_FLUSH_DRAIN_DEADLINE_SECONDS = 120.0
 CandidateEventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -188,11 +191,38 @@ class QwenServiceLifecycleRegistry:
         lifecycle = entry.lifecycle
         local_stream_id = lifecycle.local_stream_id
         if lifecycle.state is QwenEpochLifecycleState.HANDOFF_PENDING:
-            try:
-                drained = await lifecycle.drain_pending_handoff()
-            except Exception as exc:
-                raise self._as_streaming_error(exc) from exc
-            if not drained.completed:
+            deadline = time.monotonic() + _HANDOFF_FLUSH_DRAIN_DEADLINE_SECONDS
+            while lifecycle.state is QwenEpochLifecycleState.HANDOFF_PENDING:
+                # Capture before the drain so a release racing with the failed
+                # admission is observed immediately instead of being lost.
+                progress_generation = self.runtime._capacity_progress_generation
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise StreamingError("stream_handoff_incomplete")
+                try:
+                    drained = await asyncio.wait_for(
+                        lifecycle.drain_pending_handoff(), timeout=remaining,
+                    )
+                except TimeoutError as exc:
+                    raise StreamingError("stream_handoff_incomplete") from exc
+                except Exception as exc:
+                    raise self._as_streaming_error(exc) from exc
+                if drained.completed:
+                    break
+                if drained.blocked_reason != "stream_scheduler_capacity_wait":
+                    raise StreamingError("stream_handoff_incomplete")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise StreamingError("stream_handoff_incomplete")
+                try:
+                    progressed = await self.runtime._wait_for_capacity_progress(
+                        progress_generation, remaining,
+                    )
+                except Exception as exc:
+                    raise self._as_streaming_error(exc) from exc
+                if not progressed:
+                    raise StreamingError("stream_handoff_incomplete")
+            if lifecycle.state is not QwenEpochLifecycleState.ACTIVE:
                 raise StreamingError("stream_handoff_incomplete")
         try:
             result = await lifecycle.finish()

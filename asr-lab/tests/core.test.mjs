@@ -344,6 +344,143 @@ test("Qwen live UI exposes replaceable partial revisions, chunk experiments and 
   assert.doesNotMatch(appSource, /localStorage|sessionStorage/);
 });
 
+test("real WebSocket handler accepts successor revision reset and fences late predecessor partials", () => {
+  const slices = [
+    ["function renderQwenPartials() {", "function renderSegments()"],
+    ["function onPartialTranscript(message) {", "function appendLifecycleRow"],
+    ["function captureQwenEpochEvidence(message) {", "function renderQwenLifecycle()"],
+    ["function onSocketMessage(raw) {", "function recordRttFailure"],
+    ["function safeResult() {", "function download("],
+  ].map(([startMarker, endMarker]) => {
+    const start = appSource.indexOf(startMarker);
+    const end = appSource.indexOf(endMarker, start + startMarker.length);
+    assert.ok(start >= 0 && end > start, "real handler source boundary exists: " + startMarker);
+    return appSource.slice(start, end);
+  });
+  const element = (id) => ({
+    id,
+    textContent: "",
+    hidden: false,
+    children: [],
+    replaceChildren() { this.children = []; },
+    append(...items) { this.children.push(...items); },
+  });
+  const elements = new Map([
+    "qwen-partials-body", "qwen-current-partial", "qwen-stream-meta",
+  ].map((id) => [id, element(id)]));
+  const state = {
+    backend: "qwen3_asr",
+    streamId: "public-stream-1",
+    qwenPublicStreamId: "public-stream-1",
+    qwenLocalStreamId: null,
+    qwenEpochObservability: null,
+    lastQwenLifecycleError: null,
+    lastPartialRevision: 0,
+    lastPartialAt: null,
+    streamEvents: [],
+    startedAt: 0,
+    firstAudioSentAt: 0,
+    qwenLanguage: "auto",
+    qwenChunkMs: 100,
+    effectiveMaxBacklogMs: 400,
+    qwenContext: "",
+    reference: "",
+    errors: [],
+    telemetry: [],
+    rttSamples: [],
+    visibility: [],
+    runTimestamp: "fixture",
+    workers: 1,
+    capturedSamples: 0,
+    sentBytes: 0,
+    micSettings: null,
+    health: null,
+    readinessAtStart: null,
+    qwenStartMetrics: null,
+    modelId: null,
+    modelRevision: null,
+    runtimeProvenance: null,
+  };
+  let now = 0;
+  const context = {
+    state,
+    $: (id) => elements.get(id),
+    document: { createElement: (tag) => ({ tag, children: [], append(...items) { this.children.push(...items); } }) },
+    performance: { now: () => ++now },
+    fmtMs: formatMilliseconds,
+    clientFirstPartialMs,
+    AUDIO_PUSH_INTERVAL_MS,
+    safeQwenEpochObservabilitySnapshot,
+    safeQwenStartupEvidence,
+    METRIC_DEFINITIONS,
+    wordErrorRate,
+    median,
+    percentile,
+    rttPercentiles,
+    renderQwenLifecycle() {},
+    updateQwenSummary() {},
+    sortedSegments: () => [],
+    transcriptText: () => state.streamEvents.at(-1)?.text ?? "",
+  };
+  runInNewContext(slices.join("\n"), context);
+
+  const epochSnapshot = (localId, epochSeq) => ({
+    current_epoch: {
+      epoch_id: "epoch-" + epochSeq,
+      epoch_seq: epochSeq,
+      local_stream_id: localId,
+      lifecycle_state: "ACTIVE",
+    },
+    logical_cumulative: { EPOCH_ROLLOVER_COUNT: epochSeq },
+    last_transition: null,
+    epoch_history: [],
+    transition_history: [],
+  });
+  const lifecycleMessage = (localId, epochSeq) => context.onSocketMessage(JSON.stringify({
+    event: "epoch_observation",
+    stream_id: "public-stream-1",
+    qwen_local_stream_id: localId,
+    qwen_epoch_observability: epochSnapshot(localId, epochSeq),
+  }));
+  const partialMessage = (localId, epochSeq, revision, text) => context.onSocketMessage(JSON.stringify({
+    event: "partial_candidate",
+    stream_id: "public-stream-1",
+    qwen_local_stream_id: localId,
+    qwen_epoch_observability: epochSnapshot(localId, epochSeq),
+    truth_status: "candidate_only",
+    final: false,
+    replace: true,
+    revision,
+    text,
+  }));
+
+  partialMessage("local-predecessor", 0, 1, "predecessor-one");
+  partialMessage("local-predecessor", 0, 2, "predecessor-two");
+  lifecycleMessage("local-successor", 1);
+  partialMessage("local-successor", 1, 1, "successor-one");
+  partialMessage("local-successor", 1, 1, "successor-duplicate");
+  partialMessage("local-successor", 1, 0, "successor-old");
+  partialMessage("local-predecessor", 0, 99, "late-predecessor");
+  partialMessage("local-successor", 1, 2, "successor-two");
+
+  assert.deepEqual(state.streamEvents.map((item) => [item.epoch_seq, item.revision, item.text]), [
+    [0, 1, "predecessor-one"],
+    [0, 2, "predecessor-two"],
+    [1, 1, "successor-one"],
+    [1, 2, "successor-two"],
+  ]);
+  assert.equal(state.streamId, "public-stream-1");
+  assert.equal(state.qwenLocalStreamId, "local-successor");
+  assert.equal(state.qwenEpochObservability.current_epoch.epoch_seq, 1);
+  assert.equal(elements.get("qwen-current-partial").textContent, "successor-two");
+
+  const exported = context.safeResult();
+  assert.deepEqual(Array.from(exported.streaming.partials).map((item) => item.text), [
+    "predecessor-one", "predecessor-two", "successor-one", "successor-two",
+  ]);
+  assert.deepEqual(new Set(exported.streaming.partials.map((item) => item.public_stream_id)), new Set(["public-stream-1"]));
+});
+
 test("benchmark CSS keeps base layout and bounds Qwen/mobile dashboard", () => {
   const styleSource = readFileSync(new URL("../asr_lab/benchmark_web/style.css", import.meta.url), "utf8");
   assert.match(styleSource, /--/);

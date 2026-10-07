@@ -6,11 +6,13 @@ import json
 import logging
 import sys
 import types
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from asr_lab.config import Settings
+from asr_lab.qwen_streaming import QwenStreamingRuntime
 
 
 TOKEN = "t" * 32
@@ -150,6 +152,126 @@ def flush_frame(request_id=None):
     return {"type": "websocket.receive", "text": json.dumps(payload)}
 
 
+def qwen_audio_frame(duration_ms=100, source="mic"):
+    import base64
+    import struct
+
+    samples = int(16_000 * duration_ms / 1000)
+    pcm = struct.pack("<h", 8000) * samples
+    payload = {
+        "source": source,
+        "speaker": "you" if source == "mic" else "them",
+        "encoding": "pcm_int16",
+        "sample_rate": 16000,
+        "audio": base64.b64encode(pcm).decode("ascii"),
+    }
+    return {"type": "websocket.receive", "text": json.dumps(payload)}
+
+
+class FlushHandoffWorker:
+    """Deterministically hold one worker RPC while the real lifecycle rolls over."""
+
+    def __init__(self):
+        self.ready = False
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.block_at_push = 46
+        self.push_count = 0
+        self.requests = []
+
+    async def start(self, **_options):
+        self.ready = True
+        return {"model_load_ms": 1.0, "vram_after_warmup": {"available": False}}
+
+    async def request(self, operation, **payload):
+        self.requests.append((operation, dict(payload)))
+        stream_id = payload.get("stream_id")
+        if operation == "init":
+            return {"stream_id": stream_id, "stream_state_init_wall_ms": 1.0}
+        if operation == "close":
+            return {"closed": True}
+        if operation in {"push", "finish"}:
+            if operation == "push":
+                self.push_count += 1
+                if self.push_count == self.block_at_push:
+                    self.started.set()
+                    await self.release.wait()
+            return {
+                "scheduler_key": payload.get("scheduler_key"),
+                "decoded": True,
+                "decode_wall_ms": 2.0,
+                "decode_steps_delta": 1,
+                "text": "candidate-" + str(stream_id),
+                "language": "Spanish",
+            }
+        raise AssertionError(operation)
+
+    async def close(self):
+        self.ready = False
+
+
+class CapacityWaitWebSocket(FakeWebSocket):
+    def __init__(self, worker, registry_instances, *, release_delay=0.05):
+        super().__init__()
+        self.worker = worker
+        self.registry_instances = registry_instances
+        self.release_delay = release_delay
+        self.step = 0
+        self.blocked_reason = None
+        self.handoff_state = None
+        self.flush_received_before_capacity_release = False
+        self.flush_received_at = None
+        self.service_completed_at = None
+        self.lifecycle = None
+        self.error_before_capacity_release = False
+
+    async def wait_until(self, predicate, message):
+        for _ in range(2_000):
+            if predicate():
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError(message)
+
+    async def receive(self):
+        await asyncio.sleep(0)
+        self.step += 1
+        if self.step == 1:
+            return {"type": "websocket.receive", "text": json.dumps({
+                "event": "stream_start", "source": "mic", "language": "auto",
+                "model_chunk_ms": 100, "request_id": "start-c4",
+            })}
+        audio_index = self.step - 1
+        if 1 <= audio_index <= 51:
+            registry = self.registry_instances[-1]
+            lifecycle = registry._sources["mic"].lifecycle
+            if 2 <= audio_index <= 46:
+                await self.wait_until(
+                    lambda: lifecycle._observed_local_processed_cursor >= (audio_index - 1) * 1_600,
+                    "controlled worker did not drain the preceding 100 ms audio window",
+                )
+            elif audio_index == 47:
+                await asyncio.wait_for(self.worker.started.wait(), timeout=2)
+            return qwen_audio_frame(100)
+        if self.step == 53:
+            registry = self.registry_instances[-1]
+            self.lifecycle = registry._sources["mic"].lifecycle
+            observability = self.lifecycle.observability_snapshot()
+            transition = observability["last_transition"]
+            self.handoff_state = transition["state"]
+            self.blocked_reason = transition["failure_reason"]
+            self.flush_received_before_capacity_release = not self.worker.release.is_set()
+            self.flush_received_at = time.monotonic()
+            if self.release_delay is not None:
+                asyncio.get_running_loop().call_later(self.release_delay, self.worker.release.set)
+            return flush_frame("flush-c4")
+        return {"type": "websocket.disconnect"}
+
+    async def send_json(self, payload):
+        if payload.get("code") == "stream_handoff_incomplete":
+            self.error_before_capacity_release = not self.worker.release.is_set()
+        await super().send_json(payload)
+
+
 class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
     def setup_service(self, *, max_connections=8, max_pending=2, ready=True, block=False):
         service = load_service_module()
@@ -158,6 +280,57 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         service.connection_slots = asyncio.Semaphore(max_connections)
         service.broker = FakeBroker(ready=ready, block=block)
         return service
+
+    async def run_capacity_wait_service_case(self, *, release_delay, deadline_seconds=None):
+        service = self.setup_service()
+        service.settings = Settings.from_env({
+            "ASR_BACKEND": "parakeet", "ASR_API_TOKEN": TOKEN,
+            "QWEN_STREAMING_ENABLED": "1", "QWEN_STREAMING_RUNTIME_AVAILABLE": "1",
+        })
+        worker = FlushHandoffWorker()
+        runtime = QwenStreamingRuntime(
+            worker=worker,
+            model_id="Qwen/Qwen3-ASR-1.7B",
+            model_revision="fixed",
+            gpu_memory_utilization=0.65,
+            max_active_sessions=6,
+            max_pending_jobs=24,
+            max_backlog_chunks=4,
+            max_stream_seconds=5.0,
+            session_idle_ttl_seconds=120.0,
+            max_context_chars=512,
+            default_chunk_ms=100,
+            default_language="auto",
+            unfixed_chunk_num=2,
+            unfixed_token_num=5,
+        )
+        await runtime.start()
+        service.qwen_runtime = runtime
+        registry_instances = []
+        real_registry = service.QwenServiceLifecycleRegistry
+
+        class CapturingRegistry(real_registry):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                registry_instances.append(self)
+
+        service.QwenServiceLifecycleRegistry = CapturingRegistry
+        socket = CapacityWaitWebSocket(worker, registry_instances, release_delay=release_delay)
+        started_at = time.monotonic()
+        try:
+            if deadline_seconds is None:
+                await asyncio.wait_for(service.websocket_asr(socket, token=TOKEN), timeout=8)
+            else:
+                with patch.dict(real_registry.finish.__globals__, {
+                    "_HANDOFF_FLUSH_DRAIN_DEADLINE_SECONDS": deadline_seconds,
+                }):
+                    await asyncio.wait_for(service.websocket_asr(socket, token=TOKEN), timeout=8)
+            socket.service_completed_at = time.monotonic()
+            elapsed = time.monotonic() - started_at
+            return socket, worker, elapsed
+        finally:
+            worker.release.set()
+            await runtime.close()
 
     async def test_missing_and_wrong_tokens_close_before_acceptance(self):
         service = self.setup_service()
@@ -462,6 +635,49 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["stream_started", "partial_candidate", "final_candidate", "flush_complete"])
         self.assertEqual(socket.sent[1]["stream_id"], "owned-stream")
         self.assertEqual(socket.sent[2]["request_id"], "flush-1")
+
+    async def test_qwen_websocket_flush_waits_for_capacity_during_pending_handoff(self):
+        socket, worker, _elapsed = await self.run_capacity_wait_service_case(release_delay=0.05)
+        self.assertEqual(socket.handoff_state, "HANDOFF_PENDING")
+        self.assertEqual(socket.blocked_reason, "stream_scheduler_capacity_wait")
+        self.assertTrue(socket.flush_received_before_capacity_release)
+        self.assertFalse(socket.error_before_capacity_release)
+
+        events = [item.get("event") for item in socket.sent]
+        self.assertEqual(events.count("final_candidate"), 1)
+        self.assertNotIn("stream_handoff_incomplete", [item.get("code") for item in socket.sent])
+        self.assertLess(events.index("final_candidate"), events.index("flush_complete"))
+        final = next(item for item in socket.sent if item.get("event") == "final_candidate")
+        self.assertTrue(final["final"])
+        self.assertEqual(final["truth_status"], "candidate_only")
+        self.assertEqual(sum(operation == "finish" for operation, _ in worker.requests), 1)
+
+        pcm = socket.lifecycle.pcm_handoff.snapshot()
+        self.assertEqual(pcm.received_samples, 81_600)
+        self.assertEqual(pcm.unique_primary_admitted_samples, 81_600)
+        self.assertEqual(pcm.replay_admitted_samples, 8_000)
+        # Known scheduler capacity rejections are retained for explicit drain;
+        # only the admitted replay total proves whether any PCM was duplicated.
+        self.assertGreater(pcm.downstream_admission_rejected_samples, 0)
+        self.assertFalse(pcm.handoff_in_progress)
+
+    async def test_qwen_websocket_flush_capacity_wait_times_out_fail_closed(self):
+        socket, worker, _elapsed = await self.run_capacity_wait_service_case(
+            release_delay=None,
+            deadline_seconds=0.05,
+        )
+        self.assertEqual(socket.handoff_state, "HANDOFF_PENDING")
+        self.assertEqual(socket.blocked_reason, "stream_scheduler_capacity_wait")
+        self.assertTrue(socket.error_before_capacity_release)
+        flush_wait = socket.service_completed_at - socket.flush_received_at
+        self.assertGreaterEqual(flush_wait, 0.04)
+        self.assertLessEqual(flush_wait, 0.5)
+        events = [item.get("event") for item in socket.sent]
+        codes = [item.get("code") for item in socket.sent]
+        self.assertIn("stream_handoff_incomplete", codes)
+        self.assertNotIn("final_candidate", events)
+        self.assertLess(events.index("error"), events.index("flush_complete"))
+        self.assertEqual(sum(operation == "finish" for operation, _ in worker.requests), 0)
 
     async def test_qwen_terminal_error_keeps_lifecycle_snapshot_before_cleanup(self):
         service = self.setup_service()
