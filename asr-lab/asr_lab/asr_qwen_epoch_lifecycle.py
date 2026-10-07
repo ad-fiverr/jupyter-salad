@@ -150,6 +150,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
         "stream_not_started",
         "stream_duration_limit",
         "stream_scheduler_overrun",
+        "stream_scheduler_capacity_wait",
     })
 
     def __init__(
@@ -403,10 +404,15 @@ class QwenEpochLifecycle(PCMAdmissionSink):
             self._finish_replay_wall()
 
         try:
+            push_args: dict[str, Any] = {
+                "connection_id": self.connection_id,
+                "source": self.source,
+                "pcm16le": span.pcm16le,
+            }
+            if self._state is QwenEpochLifecycleState.HANDOFF_PENDING:
+                push_args["allow_capacity_wait"] = True
             await self.qwen_runtime.push_audio(
-                connection_id=self.connection_id,
-                source=self.source,
-                pcm16le=span.pcm16le,
+                **push_args,
             )
         except StreamingError as exc:
             if exc.code in self._KNOWN_ADMISSION_REJECTIONS:

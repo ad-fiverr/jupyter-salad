@@ -227,6 +227,75 @@ class QwenSchedulerTests(unittest.IsolatedAsyncioTestCase):
         await self._wait_for(lambda: len(self.jobs) == 1)
         self.assertEqual(self.jobs[0][0].connection_id, "B")
 
+    async def test_handoff_capacity_wait_is_nonterminal_and_does_not_admit_pcm(self):
+        await self.register("handoff", "successor", 100)
+        frame = b"\x21\x00" * 1600
+        await self.scheduler.append_pcm("handoff", "successor", frame)
+        await asyncio.wait_for(self.started.wait(), 1)
+        for _ in range(4):
+            await self.scheduler.append_pcm("handoff", "successor", frame)
+
+        stream = self.scheduler.streams[("handoff", "successor")]
+        before = (
+            stream.queued_samples,
+            stream.accepted_samples,
+            stream.accepted_total_samples,
+            self.scheduler.pending_jobs,
+        )
+        self.assertEqual(before[0], 4 * 1600)
+        with self.assertRaisesRegex(SchedulerError, "stream_scheduler_capacity_wait") as raised:
+            await self.scheduler.append_pcm(
+                "handoff", "successor", frame, allow_capacity_wait=True,
+            )
+
+        self.assertEqual(raised.exception.code, "stream_scheduler_capacity_wait")
+        self.assertIn(("handoff", "successor"), self.scheduler.streams)
+        self.assertFalse(stream.fenced)
+        self.assertEqual(
+            (
+                stream.queued_samples,
+                stream.accepted_samples,
+                stream.accepted_total_samples,
+                self.scheduler.pending_jobs,
+            ),
+            before,
+        )
+        self.assertEqual(self.faults, [])
+        self.assertEqual(self.scheduler.snapshot()["qwen_scheduler_overrun_total"], 0)
+
+    async def test_capacity_wait_opt_in_keeps_individually_oversized_pcm_terminal(self):
+        await self.register("oversized", "stream", 100)
+        with self.assertRaisesRegex(SchedulerError, "stream_scheduler_overrun"):
+            await self.scheduler.append_pcm(
+                "oversized", "stream", b"\x31\x00" * (1600 * 5),
+                allow_capacity_wait=True,
+            )
+
+        self.assertNotIn(("oversized", "stream"), self.scheduler.streams)
+        self.assertEqual(self.faults[-1][2], "stream_scheduler_overrun")
+
+    async def test_handoff_capacity_wait_covers_a_full_global_pending_queue(self):
+        self.scheduler.max_pending_jobs = 1
+        await self.register("active", "active-stream", 100)
+        await self.register("queued", "queued-stream", 100)
+        await self.register("handoff", "successor", 100)
+        frame = b"\x32\x00" * 1600
+
+        await self.scheduler.append_pcm("active", "active-stream", frame)
+        await asyncio.wait_for(self.started.wait(), 1)
+        await self.scheduler.append_pcm("queued", "queued-stream", frame)
+        before = self.scheduler.streams[("handoff", "successor")].accepted_total_samples
+        with self.assertRaisesRegex(SchedulerError, "stream_scheduler_capacity_wait"):
+            await self.scheduler.append_pcm(
+                "handoff", "successor", frame, allow_capacity_wait=True,
+            )
+
+        stream = self.scheduler.streams[("handoff", "successor")]
+        self.assertEqual(stream.accepted_total_samples, before)
+        self.assertFalse(stream.fenced)
+        self.assertEqual(self.scheduler.pending_jobs, 1)
+        self.assertEqual(self.faults, [])
+
     async def test_overrun_fault_captures_bounded_metrics_before_stream_fence(self):
         self.release.set()
         await self.register("private-connection", "private-stream")

@@ -214,6 +214,61 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["EPOCH_AUDIO_ACCUMULATED_MS"], 100.0)
         self.assertIsNone(final["QWEN_AUDIO_ACCUM_MS"])
 
+    async def test_explicit_capacity_wait_preserves_only_the_opted_in_session(self):
+        class BlockingWorker(FakeWorker):
+            def __init__(self):
+                super().__init__()
+                self.push_started = asyncio.Event()
+                self.release_push = asyncio.Event()
+
+            async def request(self, operation, **payload):
+                if operation == "push":
+                    self.push_started.set()
+                    await self.release_push.wait()
+                return await super().request(operation, **payload)
+
+        worker = BlockingWorker()
+        worker.ready = True
+        self.runtime.worker = worker
+        started = await self.runtime.open_session(
+            connection_id="handoff", source="mic", model_chunk_ms=100,
+        )
+        stream_id = started["stream_id"]
+        frame = b"\x41\x00" * 1600
+        try:
+            await self.runtime.push_audio(connection_id="handoff", source="mic", pcm16le=frame)
+            await asyncio.wait_for(worker.push_started.wait(), 1)
+            for _ in range(4):
+                await self.runtime.push_audio(connection_id="handoff", source="mic", pcm16le=frame)
+
+            with self.assertRaisesRegex(StreamingError, "stream_scheduler_capacity_wait"):
+                await self.runtime.push_audio(
+                    connection_id="handoff", source="mic", pcm16le=frame,
+                    allow_capacity_wait=True,
+                )
+
+            self.assertIn(("handoff", "mic"), self.runtime.sessions)
+            self.assertIn(("handoff", stream_id), self.runtime.scheduler.streams)
+            self.assertFalse(self.runtime.scheduler.streams[("handoff", stream_id)].fenced)
+            self.assertFalse(any(
+                operation == "close" and payload.get("stream_id") == stream_id
+                for operation, payload in worker.requests
+            ))
+
+            # ACTIVE/default admission remains terminal for the same full queue.
+            with self.assertRaisesRegex(StreamingError, "stream_scheduler_overrun"):
+                await self.runtime.push_audio(
+                    connection_id="handoff", source="mic", pcm16le=frame,
+                )
+            self.assertNotIn(("handoff", "mic"), self.runtime.sessions)
+            self.assertNotIn(("handoff", stream_id), self.runtime.scheduler.streams)
+            self.assertTrue(any(
+                operation == "close" and payload.get("stream_id") == stream_id
+                for operation, payload in worker.requests
+            ))
+        finally:
+            worker.release_push.set()
+
     async def test_empty_stream_eos_finalizes_without_pcm_push_or_partial(self):
         await self.runtime.open_session(
             connection_id="empty", source="mic", context="empty stream", model_chunk_ms=250,

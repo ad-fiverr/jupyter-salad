@@ -1286,6 +1286,123 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
             worker.release_second_init.set()
             await runtime.close()
 
+    async def test_temporary_successor_capacity_wait_explicitly_drains_n4_and_n6(self):
+        for backlog_chunks in (4, 6):
+            with self.subTest(backlog_chunks=backlog_chunks):
+                worker = LifecycleWorker()
+                worker.release_successor_push = asyncio.Event()
+                worker, controller, handoff, runtime, lifecycle = await self.make_lifecycle(worker)
+                runtime.scheduler.max_backlog_chunks = backlog_chunks
+                lifecycle.chunk_size_ms = 100
+                replay_frames = [
+                    bytes([0x51 + index, 0]) * 1600
+                    for index in range(backlog_chunks + 1)
+                ]
+                transition_frame = b"\x70\x00" * 1600
+                transition_during_replay = b"\x71\x00" * 1600
+                live_frame = b"\x72\x00" * 1600
+                try:
+                    await lifecycle.initialize()
+                    predecessor_fence = lifecycle.current_fence
+                    predecessor_stream = lifecycle.local_stream_id
+                    await lifecycle.submit_pcm(replay_frames[0])
+                    await asyncio.wait_for(worker.old_push_started.wait(), 1)
+                    for frame in replay_frames[1:]:
+                        await lifecycle.submit_pcm(frame)
+
+                    predecessor_snapshot = runtime.scheduler.stream_snapshot(
+                        "connection-stable", predecessor_stream,
+                    )
+                    self.assertEqual(
+                        predecessor_snapshot["scheduler_backlog_audio_ms"],
+                        float(backlog_chunks * 100),
+                    )
+                    triggering = asyncio.create_task(lifecycle.submit_pcm(transition_frame))
+                    await asyncio.wait_for(worker.second_init.wait(), 1)
+                    self.assertEqual(lifecycle.state, QwenEpochLifecycleState.HANDOFF_PENDING)
+                    worker.release_old_push.set()
+                    worker.release_second_init.set()
+                    await asyncio.wait_for(triggering, 1)
+
+                    successor_stream = lifecycle.local_stream_id
+                    self.assertIsNotNone(successor_stream)
+                    await asyncio.wait_for(worker.successor_push_started.wait(), 1)
+                    blocked = lifecycle.observability_snapshot()["last_transition"]
+                    self.assertEqual(blocked["failure_stage"], "replay")
+                    self.assertEqual(blocked["failure_reason"], "stream_scheduler_capacity_wait")
+                    self.assertEqual(lifecycle.state, QwenEpochLifecycleState.HANDOFF_PENDING)
+                    self.assertIn(("connection-stable", "mic"), runtime.sessions)
+                    self.assertIn(("connection-stable", successor_stream), runtime.scheduler.streams)
+                    self.assertFalse(runtime.scheduler.streams[("connection-stable", successor_stream)].fenced)
+                    self.assertEqual(runtime.scheduler.snapshot()["qwen_scheduler_overrun_total"], 1)
+                    pending = handoff.snapshot()
+                    self.assertEqual(pending.replay_admitted_samples, backlog_chunks * 1600)
+                    self.assertEqual(pending.transition_queued_samples, 1600)
+                    self.assertEqual(pending.downstream_admission_rejected_samples, 2 * 1600)
+
+                    self.assertIsNone(await lifecycle.submit_pcm(transition_during_replay))
+                    self.assertEqual(handoff.snapshot().transition_queued_samples, 3200)
+                    self.assertLessEqual(handoff.snapshot().max_transition_queued_samples, 20_000)
+
+                    # Only this explicit drain continues after the worker releases capacity.
+                    worker.release_successor_push.set()
+                    await self.wait_until(
+                        lambda: runtime.scheduler.pending_jobs == 0 and runtime.scheduler.active_jobs == 0,
+                        "successor scheduler did not drain its bounded replay backlog",
+                    )
+                    drained = await asyncio.wait_for(lifecycle.drain_pending_handoff(), 1)
+                    self.assertTrue(drained.completed)
+                    self.assertEqual(drained.replay_admitted_samples, 1600)
+                    self.assertEqual(drained.primary_admitted_samples, 3200)
+                    self.assertEqual(lifecycle.state, QwenEpochLifecycleState.ACTIVE)
+
+                    successor_fence = lifecycle.current_fence
+                    self.assertEqual(successor_fence.asr_job_id, predecessor_fence.asr_job_id)
+                    self.assertEqual(successor_fence.speech_segment_id, predecessor_fence.speech_segment_id)
+                    self.assertEqual(successor_fence.epoch_seq, predecessor_fence.epoch_seq + 1)
+                    self.assertNotEqual(successor_stream, predecessor_stream)
+                    await lifecycle.submit_pcm(live_frame)
+                    final = await lifecycle.finish()
+                    self.assertIsNotNone(final)
+                    self.assertEqual(lifecycle.state, QwenEpochLifecycleState.CLOSED)
+
+                    successor_pushes = [
+                        base64.b64decode(payload["pcm16le_base64"])
+                        for operation, payload in worker.requests
+                        if operation == "push" and payload.get("stream_id") == successor_stream
+                    ]
+                    self.assertEqual(
+                        successor_pushes,
+                        replay_frames + [transition_frame, transition_during_replay, live_frame],
+                    )
+                    completed = lifecycle.observability_snapshot()
+                    logical = completed["logical_cumulative"]
+                    transition = completed["last_transition"]
+                    expected_source_samples = (backlog_chunks + 4) * 1600
+                    self.assertEqual(logical["rollover_attempt_count"], 1)
+                    self.assertEqual(logical["rollover_success_count"], 1)
+                    self.assertEqual(logical["EPOCH_ROLLOVER_COUNT"], 1)
+                    self.assertEqual(logical["source_received_samples"], expected_source_samples)
+                    self.assertEqual(logical["unique_primary_samples"], expected_source_samples)
+                    self.assertEqual(logical["replay_admitted_samples"], (backlog_chunks + 1) * 1600)
+                    self.assertEqual(transition["state"], "ACTIVE")
+                    self.assertIsNone(transition["failure_reason"])
+                    self.assertEqual(transition["PCM_LOST"], 0)
+                    self.assertEqual(transition["PRIMARY_DUP"], 0)
+                    self.assertEqual(transition["completed_pcm_accounting"]["transition_queued_samples"], 0)
+                    self.assertEqual(handoff.snapshot().transition_queued_samples, 0)
+                    self.assertEqual(runtime.scheduler.snapshot()["qwen_scheduler_overrun_total"], 1)
+                    self.assertFalse({
+                        "stream_scheduler_overrun",
+                        "stream_scheduler_capacity_wait",
+                        "stream_handoff_incomplete",
+                    } & {payload.get("code") for operation, payload in worker.requests if operation == "error"})
+                finally:
+                    worker.release_old_push.set()
+                    worker.release_successor_push.set()
+                    worker.release_second_init.set()
+                    await runtime.close()
+
     async def test_deterministic_handoff_reproducer_identifies_catchup_rejection_stage(self):
         """A successor may be active while a bounded handoff remains incomplete."""
         worker = LifecycleWorker()

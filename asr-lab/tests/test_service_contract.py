@@ -418,7 +418,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
                 self.active = True
                 return {"event": "stream_started", "stream_id": self.stream_id, "request_id": kwargs.get("request_id")}
 
-            async def push_audio(self, *, connection_id, source, pcm16le):
+            async def push_audio(self, *, connection_id, source, pcm16le, allow_capacity_wait=False):
                 self.assert_owner(connection_id, source, pcm16le)
                 candidate = {
                     "event": "partial_candidate", "stream_id": self.stream_id,
@@ -564,7 +564,7 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
                 self.opened.append(session)
                 return {"event": "stream_started", "stream_id": stream_id, "request_id": request_id}
 
-            async def push_audio(self, *, connection_id, source, pcm16le):
+            async def push_audio(self, *, connection_id, source, pcm16le, allow_capacity_wait=False):
                 session = self.sessions[(connection_id, source)]
                 assert pcm16le
                 if session["context"] == "cliente-0-original" and not self.overrun_raised:

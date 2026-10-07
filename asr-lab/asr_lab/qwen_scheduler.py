@@ -160,11 +160,20 @@ class QwenDecodeScheduler:
             )
             self._observe_global_high_water_locked()
 
-    async def append_pcm(self, connection_id: str, stream_id: str, pcm16le: bytes, received_at: float | None = None) -> dict[str, Any]:
+    async def append_pcm(
+        self,
+        connection_id: str,
+        stream_id: str,
+        pcm16le: bytes,
+        received_at: float | None = None,
+        *,
+        allow_capacity_wait: bool = False,
+    ) -> dict[str, Any]:
         if not pcm16le or len(pcm16le) % 2:
             raise SchedulerError("invalid_audio")
         identity = (connection_id, stream_id)
         fault: tuple[str, dict[str, Any]] | None = None
+        capacity_wait: dict[str, Any] | None = None
         async with self._condition:
             stream = self.streams.get(identity)
             if stream is None or stream.fenced or not stream.accepting:
@@ -180,24 +189,39 @@ class QwenDecodeScheduler:
             backlog_samples = stream.queued_samples + incoming_samples
             per_stream_limit = window_samples * self.max_backlog_chunks
             if backlog_samples > per_stream_limit:
-                fault = ("stream_scheduler_overrun", {
+                details = {
                     "reason": "per_stream_backlog_limit",
                     "accepted_audio_ms": stream.queued_samples * 1000.0 / 16_000,
                     "rejected_audio_ms": incoming_samples * 1000.0 / 16_000,
                     "backlog_limit_ms": per_stream_limit * 1000.0 / 16_000,
-                })
+                }
+                # Handoff may defer an individually admissible span until
+                # already queued work drains. An oversized span is still a
+                # terminal overflow even when the caller opts in.
+                if allow_capacity_wait and len(stream.tail) // 2 + incoming_samples <= per_stream_limit:
+                    capacity_wait = details
+                else:
+                    fault = ("stream_scheduler_overrun", details)
             elif self.pending_jobs + scheduled_job_count > self.max_pending_jobs:
-                fault = ("stream_scheduler_overrun", {
+                details = {
                     "reason": "global_pending_job_limit",
                     "accepted_audio_ms": stream.queued_samples * 1000.0 / 16_000,
                     "rejected_audio_ms": incoming_samples * 1000.0 / 16_000,
                     "pending_jobs": self.pending_jobs,
                     "pending_job_limit": self.max_pending_jobs,
-                })
+                }
+                if allow_capacity_wait and scheduled_job_count <= self.max_pending_jobs:
+                    capacity_wait = details
+                else:
+                    fault = ("stream_scheduler_overrun", details)
             if fault is not None:
                 fault[1]["terminal_metrics"] = self._terminal_metrics_locked(stream, fault[1])
                 self._fence_locked(stream)
                 self._overrun_total += 1
+            elif capacity_wait is not None:
+                # Do not change accepted cursors, queue state, fences or
+                # terminal accounting: A6.2 retains this rejected span.
+                pass
             else:
                 cursor = stream.accepted_samples - (len(stream.tail) // 2)
                 now = time.perf_counter() if received_at is None else received_at
@@ -240,6 +264,8 @@ class QwenDecodeScheduler:
         if fault is not None:
             await self.on_fault(connection_id, stream_id, fault[0], fault[1])
             raise SchedulerError(fault[0], fault[1])
+        if capacity_wait is not None:
+            raise SchedulerError("stream_scheduler_capacity_wait", capacity_wait)
         raise SchedulerError("scheduler_admission_failed")
 
     async def finish_stream(self, connection_id: str, stream_id: str) -> DispatchResult:

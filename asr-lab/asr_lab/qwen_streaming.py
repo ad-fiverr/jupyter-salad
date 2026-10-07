@@ -337,6 +337,7 @@ class QwenStreamingRuntime:
 
     async def push_audio(
         self, *, connection_id: str, source: str, pcm16le: bytes,
+        allow_capacity_wait: bool = False,
     ) -> dict[str, Any] | None:
         key = (connection_id, source)
         session = self.sessions.get(key)
@@ -351,10 +352,15 @@ class QwenStreamingRuntime:
         received_at = time.perf_counter()
         try:
             await self.scheduler.append_pcm(
-                connection_id, session.stream_id, pcm16le, received_at=received_at,
+                connection_id,
+                session.stream_id,
+                pcm16le,
+                received_at=received_at,
+                allow_capacity_wait=allow_capacity_wait,
             )
         except SchedulerError as exc:
-            await self.close_session(connection_id=connection_id, source=source)
+            if not (allow_capacity_wait and exc.code == "stream_scheduler_capacity_wait"):
+                await self.close_session(connection_id=connection_id, source=source)
             raise StreamingError(exc.code, exc.details) from exc
         session.audio_samples += samples
         session.last_activity_at = received_at
