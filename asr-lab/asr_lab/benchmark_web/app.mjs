@@ -1,7 +1,7 @@
 import {
-  AUDIO_PUSH_INTERVAL_MS, METRIC_DEFINITIONS, ShadowVad, boundedPush, clientFirstPartialMs, canvasBackingSize, csvCell, decodeSloLabel, formatMilliseconds, gpuStatusLabel,
+  AUDIO_PUSH_INTERVAL_MS, CANDIDATE_STITCH_PROVENANCE_FIELDS, METRIC_DEFINITIONS, ShadowVad, boundedPush, clientFirstPartialMs, canvasBackingSize, csvCell, decodeSloLabel, formatMilliseconds, gpuStatusLabel,
   isTerminalQwenError, median, percentile, qwenDeviceTelemetryLabel, rttPercentiles, wordErrorRate,
-  shouldDrawCanvas, safeQwenStartupEvidence, safeQwenEpochObservabilitySnapshot,
+  shouldDrawCanvas, safeCandidateStitchProvenance, safeQwenStartupEvidence, safeQwenEpochObservabilitySnapshot,
 } from "/asr/benchmark/core.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -499,6 +499,7 @@ function onPartialTranscript(message) {
     qwen_local_stream_id: state.qwenLocalStreamId,
     epoch_id: state.qwenEpochObservability?.current_epoch?.epoch_id ?? null,
     epoch_seq: state.qwenEpochObservability?.current_epoch?.epoch_seq ?? null,
+    ...safeCandidateStitchProvenance(message),
     revision: message.revision,
     text: String(message.text ?? ""),
     language: typeof message.language === "string" ? message.language : null,
@@ -689,6 +690,7 @@ function onTranscript(message, candidateOnly = false) {
         ? message.SERVER_AUDIO_END_TO_TRANSCRIPT_MS : null;
   state.segments.push({
     event: candidateOnly ? "final_candidate" : "transcript",
+    ...safeCandidateStitchProvenance(message),
     candidate_only: candidateOnly,
     text: String(message.text ?? ""),
     start: Number.isFinite(message.start) ? message.start : null,
@@ -1294,6 +1296,7 @@ function safeResult() {
   const productionWer = !isQwen && reference ? wordErrorRate(reference, candidateText) : null;
   const finalCandidateSource = [...orderedRows].reverse().find((row) => row.candidate_only) ?? null;
   const segments = orderedRows.map((row) => ({
+    ...safeCandidateStitchProvenance(row),
     event: row.event, candidate_only: row.candidate_only, truth_status: row.truth_status, provisional: row.provisional,
     text: row.text, start: row.start, end: row.end, speaker: row.speaker, backend: row.backend,
     stream_id: row.stream_id, revision: row.revision, audio_cursor_ms: row.audio_cursor_ms,
@@ -1459,7 +1462,8 @@ function safeResult() {
       segment_count: segments.length,
       error_count: state.errors.length,
       errors: [...state.errors],
-      transcribed_audio_ms: audioMs,
+      transcribed_audio_ms: isQwen ? null : audioMs,
+      QWEN_LOCAL_SESSION_AUDIO_DURATION_MS: isQwen ? finalCandidate?.AUDIO_DURATION_MS ?? null : null,
       MODEL_INFERENCE_RTF: state.backend === "qwen3_asr" || audioMs <= 0 ? null : inferenceMs / audioMs,
       SERVER_MODEL_INFERENCE_MS_P50: median(inference),
       SERVER_MODEL_INFERENCE_MS_P95: percentile(inference, 0.95),
@@ -1562,6 +1566,7 @@ function exportCsv() {
     "PROXY_WS_RTT_MS", "MODEL_INFERENCE_MS", "SEGMENT_WAIT_MS", "SERVER_TO_TRANSCRIPT_MS",
     "SERVER_RECEIVE_TO_TRANSCRIPT_MS", "SERVER_AUDIO_END_TO_TRANSCRIPT_MS",
     "CLIENT_AUDIO_END_TO_TRANSCRIPT_MS", "queue_wait_ms", "audio_duration_ms",
+    ...CANDIDATE_STITCH_PROVENANCE_FIELDS, "QWEN_LOCAL_SESSION_AUDIO_DURATION_MS",
     "stream_id", "revision", "audio_cursor_ms", "CLIENT_ELAPSED_MS",
     "CLIENT_FIRST_PARTIAL_MS", "CLIENT_PARTIAL_UPDATE_INTERVAL_MS", "FIRST_PARTIAL_MS",
     "SERVER_CHUNK_TO_PARTIAL_MS", "PARTIAL_COUNT", "PARTIAL_REVISION_RATE", "PARTIAL_STABILITY",
@@ -1593,6 +1598,8 @@ function exportCsv() {
       PROXY_WS_RTT_MS_P95: result.summary.PROXY_WS_RTT_MS_P95,
       start: row.start, end: row.end, text: row.text,
       AUDIO_DURATION_MS: row.AUDIO_DURATION_MS,
+      QWEN_LOCAL_SESSION_AUDIO_DURATION_MS: result.backend === "qwen3_asr" && row.candidate_only ? row.AUDIO_DURATION_MS : null,
+      ...safeCandidateStitchProvenance(row),
       SERVER_ENDPOINTING_MS: row.SERVER_ENDPOINTING_MS,
       SERVER_QUEUE_WAIT_MS: row.SERVER_QUEUE_WAIT_MS,
       SERVER_MODEL_INFERENCE_MS: row.SERVER_MODEL_INFERENCE_MS,
@@ -1642,6 +1649,7 @@ function exportCsv() {
   for (const partial of result.streaming?.partials ?? []) {
     lines.push(toCsvRow({
       record_type: partial.event ?? "partial_candidate", timestamp: result.timestamp, backend: result.backend,
+      ...safeCandidateStitchProvenance(partial),
       model_id: result.model_id, gpu: result.gpu, workers: result.workers,
       stream_id: partial.stream_id, revision: partial.revision, text: partial.text,
       audio_cursor_ms: partial.audio_cursor_ms, CLIENT_ELAPSED_MS: partial.CLIENT_ELAPSED_MS,

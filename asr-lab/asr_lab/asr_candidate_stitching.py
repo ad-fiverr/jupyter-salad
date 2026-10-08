@@ -15,15 +15,17 @@ from typing import Any
 from .asr_fencing import ExecutionFence
 
 
-STITCH_POLICY_VERSION = "a6.5-exact-boundary-v1"
+STITCH_POLICY_VERSION = "a6.5-exact-boundary-v2"
 
 
 @dataclass(frozen=True)
 class CandidateBase:
-    """A previously emitted logical candidate and its trusted producer fence."""
+    """A logical candidate anchor plus private, lifecycle-verified empty lineage."""
 
     text: str
     fence: ExecutionFence
+    lineage_tail_fence: ExecutionFence | None = None
+    empty_epoch_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,9 @@ class ASRCandidateStitcher:
     def __init__(self) -> None:
         self._current_fence: ExecutionFence | None = None
         self._base: CandidateBase | None = None
+        self._lineage_tail_fence: ExecutionFence | None = None
+        self._empty_epoch_count: int | None = None
+        self._base_continuity_valid = False
         self._latest: CandidateBase | None = None
         self._latest_revision: int | None = None
         self._highest_revision: int | None = None
@@ -96,6 +101,14 @@ class ASRCandidateStitcher:
             raise TypeError("candidate_stitcher_base_invalid")
         self._current_fence = fence
         self._base = base
+        continuity = self._validated_base_continuity(fence, base)
+        if continuity is None:
+            self._lineage_tail_fence = None
+            self._empty_epoch_count = None
+            self._base_continuity_valid = False
+        else:
+            self._lineage_tail_fence, self._empty_epoch_count = continuity
+            self._base_continuity_valid = True
         self._latest = None
         self._latest_revision = None
         self._highest_revision = None
@@ -105,14 +118,40 @@ class ASRCandidateStitcher:
         self._last_rejection_reason = None
 
     def freeze_for_successor(self, fence: ExecutionFence) -> CandidateBase | None:
-        """Freeze this epoch's latest candidate for a successor.
+        """Freeze an accepted candidate or advance a verified empty lineage.
 
-        If this epoch emitted no accepted logical candidate, its successor
-        starts without a stitching base. Do not carry a base across the gap.
+        The anchor's producer fence remains unchanged while ``lineage_tail``
+        advances over contiguous epochs that emitted no accepted candidate.
+        The next activation revalidates the complete fence relationship.
         """
         if self._current_fence != fence:
             raise ValueError("candidate_stitcher_freeze_fence_mismatch")
-        return self._latest
+        if self._latest is not None:
+            if self._latest.fence != fence or self._last_final is True:
+                return None
+            return CandidateBase(
+                text=self._latest.text,
+                fence=self._latest.fence,
+                lineage_tail_fence=fence,
+                empty_epoch_count=0,
+            )
+        if (
+            self._base is None
+            or not self._base.text.strip()
+            or not self._base_continuity_valid
+            or self._lineage_tail_fence is None
+            or self._empty_epoch_count is None
+            or self._last_rejection_reason is not None
+            or self._last_final is True
+            or not self._is_next_in_lineage(self._lineage_tail_fence, fence)
+        ):
+            return None
+        return CandidateBase(
+            text=self._base.text,
+            fence=self._base.fence,
+            lineage_tail_fence=fence,
+            empty_epoch_count=self._empty_epoch_count + 1,
+        )
 
     def reconcile(
         self,
@@ -175,6 +214,19 @@ class ASRCandidateStitcher:
             "epoch_seq": trusted_fence.epoch_seq,
         })
         base = self._base
+        if self._base_continuity_valid and base is not None:
+            assert self._empty_epoch_count is not None
+            continuity = (
+                "immediate_predecessor"
+                if self._empty_epoch_count == 0
+                else "verified_empty_epochs"
+            )
+            distance: int | None = trusted_fence.epoch_seq - base.fence.epoch_seq
+            empty_count: int | None = self._empty_epoch_count
+        else:
+            continuity = "none"
+            distance = None
+            empty_count = None
         result.update({
             "stitch_policy_version": STITCH_POLICY_VERSION,
             "stitch_mode": mode,
@@ -183,6 +235,9 @@ class ASRCandidateStitcher:
             "stitch_raw_current_text": raw_text,
             "stitch_base_epoch_id": base.fence.epoch_id if base is not None else None,
             "stitch_base_epoch_seq": base.fence.epoch_seq if base is not None else None,
+            "stitch_anchor_continuity": continuity,
+            "stitch_anchor_epoch_distance": distance,
+            "stitch_empty_epoch_count": empty_count,
         })
 
         self._highest_revision = revision
@@ -203,6 +258,51 @@ class ASRCandidateStitcher:
             last_rejection_reason=self._last_rejection_reason,
         )
 
+    @classmethod
+    def _validated_base_continuity(
+        cls,
+        current_fence: ExecutionFence,
+        base: CandidateBase | None,
+    ) -> tuple[ExecutionFence, int] | None:
+        if base is None:
+            return None
+        tail = base.lineage_tail_fence
+        empty_count = base.empty_epoch_count
+        if tail is None:
+            # Preserve direct A6.5 callers that provide only an immediate,
+            # trusted predecessor. A non-immediate base needs lifecycle proof.
+            tail = base.fence
+            empty_count = 0
+        if (
+            not cls._same_lineage(base.fence, tail)
+            or not cls._same_lineage(tail, current_fence)
+            or not isinstance(empty_count, int)
+            or isinstance(empty_count, bool)
+            or empty_count < 0
+            or base.fence.epoch_seq + empty_count != tail.epoch_seq
+            or current_fence.epoch_seq != tail.epoch_seq + 1
+            or (empty_count == 0 and tail != base.fence)
+        ):
+            return None
+        return tail, empty_count
+
+    @staticmethod
+    def _same_lineage(left: ExecutionFence, right: ExecutionFence) -> bool:
+        return bool(
+            left.asr_job_id
+            and left.speech_segment_id
+            and left.asr_job_id == right.asr_job_id
+            and left.speech_segment_id == right.speech_segment_id
+        )
+
+    @classmethod
+    def _is_next_in_lineage(
+        cls,
+        previous: ExecutionFence,
+        current: ExecutionFence,
+    ) -> bool:
+        return cls._same_lineage(previous, current) and current.epoch_seq == previous.epoch_seq + 1
+
     def _stitch_text(
         self,
         raw_text: str,
@@ -214,11 +314,7 @@ class ASRCandidateStitcher:
         if not base.text.strip():
             return raw_text, "current_only", "empty_base", 0
         if (
-            not current_fence.asr_job_id
-            or not current_fence.speech_segment_id
-            or current_fence.asr_job_id != base.fence.asr_job_id
-            or current_fence.speech_segment_id != base.fence.speech_segment_id
-            or current_fence.epoch_seq != base.fence.epoch_seq + 1
+            not self._base_continuity_valid
         ):
             return raw_text, "current_only", "lineage_gap", 0
         if not raw_text.strip():

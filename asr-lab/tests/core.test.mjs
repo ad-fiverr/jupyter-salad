@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import {
   AUDIO_PUSH_INTERVAL_MS,
+  CANDIDATE_STITCH_PROVENANCE_FIELDS,
   CHUNK_SAMPLES,
   clientFirstPartialMs,
   decodeSloLabel,
@@ -27,6 +28,7 @@ import {
   percentile,
   rttPercentiles,
   qwenDeviceTelemetryLabel,
+  safeCandidateStitchProvenance,
   safeQwenStartupEvidence,
   safeQwenEpochObservabilitySnapshot,
   wordErrorRate,
@@ -141,6 +143,25 @@ test("shadow VAD mirrors the server thresholds and flush boundary", () => {
   assert.equal(state.canTranscribe, true);
   assert.equal(state.lastVoiceAt, 400);
   assert.equal(vad.speaking, false);
+});
+
+test("candidate stitch provenance allowlists the eleven v1 and three v2 scalar fields", () => {
+  const source = {
+    asr_job_id: "job-1", speech_segment_id: "segment-1", epoch_id: "epoch-2", epoch_seq: 2,
+    stitch_policy_version: "a6.5-exact-boundary-v2", stitch_mode: "exact_overlap",
+    stitch_reason: "exact_token_overlap", stitch_overlap_token_count: 2,
+    stitch_raw_current_text: "want to book", stitch_base_epoch_id: "epoch-0", stitch_base_epoch_seq: 0,
+    stitch_anchor_continuity: "verified_empty_epochs", stitch_anchor_epoch_distance: 3,
+    stitch_empty_epoch_count: 2, private_field: "must-not-export",
+  };
+  const safe = safeCandidateStitchProvenance(source);
+  assert.deepEqual(Object.keys(safe), [...CANDIDATE_STITCH_PROVENANCE_FIELDS]);
+  assert.equal(safe.stitch_raw_current_text, "want to book");
+  assert.equal(safe.stitch_base_epoch_seq, 0);
+  assert.equal(safe.stitch_empty_epoch_count, 2);
+  assert.equal("private_field" in safe, false);
+  assert.equal(safeCandidateStitchProvenance({ epoch_seq: "2", stitch_reason: 7 }).epoch_seq, null);
+  assert.equal(safeCandidateStitchProvenance({ epoch_seq: "2", stitch_reason: 7 }).stitch_reason, null);
 });
 
 test("safe startup evidence retains real nested warmup provenance and readiness", () => {
@@ -348,6 +369,7 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
   const slices = [
     ["function renderQwenPartials() {", "function renderSegments()"],
     ["function onPartialTranscript(message) {", "function appendLifecycleRow"],
+    ["function onTranscript(message, candidateOnly = false) {", "function onSocketMessage(raw) {"],
     ["function captureQwenEpochEvidence(message) {", "function renderQwenLifecycle()"],
     ["function onSocketMessage(raw) {", "function recordRttFailure"],
     ["function safeResult() {", "function download("],
@@ -378,6 +400,9 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     lastPartialRevision: 0,
     lastPartialAt: null,
     streamEvents: [],
+    segments: [],
+    requestTimes: new Map(),
+    clientEosAt: null,
     startedAt: 0,
     firstAudioSentAt: 0,
     qwenLanguage: "auto",
@@ -408,8 +433,11 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     document: { createElement: (tag) => ({ tag, children: [], append(...items) { this.children.push(...items); } }) },
     performance: { now: () => ++now },
     fmtMs: formatMilliseconds,
+    csvCell,
     clientFirstPartialMs,
     AUDIO_PUSH_INTERVAL_MS,
+    safeCandidateStitchProvenance,
+    CANDIDATE_STITCH_PROVENANCE_FIELDS,
     safeQwenEpochObservabilitySnapshot,
     safeQwenStartupEvidence,
     METRIC_DEFINITIONS,
@@ -418,9 +446,13 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     percentile,
     rttPercentiles,
     renderQwenLifecycle() {},
+    renderSegments() {},
+    updateTranscript() {},
+    updateSummary() {},
     updateQwenSummary() {},
-    sortedSegments: () => [],
-    transcriptText: () => state.streamEvents.at(-1)?.text ?? "",
+    sortedSegments: () => state.segments,
+    transcriptText: () => state.segments.at(-1)?.text ?? state.streamEvents.at(-1)?.text ?? "",
+    download: (...args) => { context.downloaded = args; },
   };
   runInNewContext(slices.join("\n"), context);
 
@@ -450,6 +482,20 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     truth_status: "candidate_only",
     final: false,
     replace: true,
+    asr_job_id: "job-1",
+    speech_segment_id: "segment-1",
+    epoch_id: "epoch-" + epochSeq,
+    epoch_seq: epochSeq,
+    stitch_policy_version: "a6.5-exact-boundary-v2",
+    stitch_mode: "exact_overlap",
+    stitch_reason: "exact_token_overlap",
+    stitch_overlap_token_count: 2,
+    stitch_raw_current_text: text,
+    stitch_base_epoch_id: epochSeq > 0 ? "epoch-0" : null,
+    stitch_base_epoch_seq: epochSeq > 0 ? 0 : null,
+    stitch_anchor_continuity: epochSeq > 0 ? "verified_empty_epochs" : "none",
+    stitch_anchor_epoch_distance: epochSeq > 0 ? epochSeq + 1 : null,
+    stitch_empty_epoch_count: epochSeq > 0 ? epochSeq : null,
     revision,
     text,
   }));
@@ -462,6 +508,17 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
   partialMessage("local-successor", 1, 0, "successor-old");
   partialMessage("local-predecessor", 0, 99, "late-predecessor");
   partialMessage("local-successor", 1, 2, "successor-two");
+  context.onSocketMessage(JSON.stringify({
+    event: "final_candidate", stream_id: "public-stream-1", qwen_local_stream_id: "local-successor",
+    qwen_epoch_observability: epochSnapshot("local-successor", 1), truth_status: "candidate_only",
+    candidate_only: true, final: true, revision: 3, text: "final successor", audio_cursor_ms: 1250,
+    AUDIO_DURATION_MS: 1250, asr_job_id: "job-1", speech_segment_id: "segment-1",
+    epoch_id: "epoch-1", epoch_seq: 1, stitch_policy_version: "a6.5-exact-boundary-v2",
+    stitch_mode: "exact_overlap", stitch_reason: "exact_token_overlap", stitch_overlap_token_count: 2,
+    stitch_raw_current_text: "to book", stitch_base_epoch_id: "epoch-0", stitch_base_epoch_seq: 0,
+    stitch_anchor_continuity: "verified_empty_epochs", stitch_anchor_epoch_distance: 2,
+    stitch_empty_epoch_count: 1,
+  }));
 
   assert.deepEqual(state.streamEvents.map((item) => [item.epoch_seq, item.revision, item.text]), [
     [0, 1, "predecessor-one"],
@@ -479,6 +536,42 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     "predecessor-one", "predecessor-two", "successor-one", "successor-two",
   ]);
   assert.deepEqual(new Set(exported.streaming.partials.map((item) => item.public_stream_id)), new Set(["public-stream-1"]));
+  const successorPartial = exported.streaming.partials.find((item) => item.text === "successor-two");
+  assert.equal(successorPartial.asr_job_id, "job-1");
+  assert.equal(successorPartial.stitch_base_epoch_id, "epoch-0");
+  assert.equal(successorPartial.stitch_anchor_continuity, "verified_empty_epochs");
+  assert.equal(successorPartial.stitch_anchor_epoch_distance, 2);
+  assert.equal(successorPartial.stitch_empty_epoch_count, 1);
+  const finalRow = exported.segments.find((item) => item.event === "final_candidate");
+  assert.equal(finalRow.text, "final successor");
+  assert.equal(finalRow.stitch_raw_current_text, "to book");
+  assert.equal(finalRow.stitch_anchor_epoch_distance, 2);
+  assert.equal(exported.summary.transcribed_audio_ms, null);
+  assert.equal(exported.summary.QWEN_LOCAL_SESSION_AUDIO_DURATION_MS, 1250);
+  assert.equal(finalRow.AUDIO_DURATION_MS, 1250);
+
+  const csvStart = appSource.indexOf("function exportCsv() {");
+  const csvEnd = appSource.indexOf('$("start-button")', csvStart);
+  assert.ok(csvStart >= 0 && csvEnd > csvStart, "CSV exporter source boundary exists");
+  runInNewContext(`${appSource.slice(csvStart, csvEnd)}\nexportCsv();`, context);
+  const csv = context.downloaded[1];
+  const csvLines = csv.split("\r\n");
+  const headerCells = csvLines[0].split(",");
+  const finalCsvRow = csvLines.find((line) => line.startsWith("final_candidate,"));
+  assert.ok(finalCsvRow);
+  const finalCells = finalCsvRow.split(",");
+  for (const field of CANDIDATE_STITCH_PROVENANCE_FIELDS) assert.ok(headerCells.includes(field), field);
+  assert.equal(finalCells[headerCells.indexOf("stitch_raw_current_text")], "to book");
+  assert.equal(finalCells[headerCells.indexOf("stitch_anchor_continuity")], "verified_empty_epochs");
+  assert.equal(finalCells[headerCells.indexOf("QWEN_LOCAL_SESSION_AUDIO_DURATION_MS")], "1250");
+
+  state.backend = "faster_whisper";
+  const nonQwen = context.safeResult();
+  assert.equal(nonQwen.summary.transcribed_audio_ms, 1250);
+  assert.equal(nonQwen.summary.QWEN_LOCAL_SESSION_AUDIO_DURATION_MS, null);
+  state.backend = "qwen3_asr";
+  state.segments = state.segments.map((row) => ({ ...row, audio_duration_ms: null }));
+  assert.equal(context.safeResult().summary.QWEN_LOCAL_SESSION_AUDIO_DURATION_MS, null);
 });
 
 test("benchmark CSS keeps base layout and bounds Qwen/mobile dashboard", () => {

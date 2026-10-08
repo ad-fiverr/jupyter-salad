@@ -107,6 +107,7 @@ class CandidateLifecycleWorker(LifecycleWorker):
         self.completed_push_streams: list[str] = []
         self.push_counts: dict[str, int] = {}
         self.push_texts_by_stream_ordinal: list[list[str]] = []
+        self.finish_text_by_stream_ordinal: dict[int, str] = {}
         self.blocked_push: tuple[int, int] | None = None
         self.blocked_push_started = asyncio.Event()
         self.release_blocked_push = asyncio.Event()
@@ -126,6 +127,11 @@ class CandidateLifecycleWorker(LifecycleWorker):
                 self.blocked_push_started.set()
                 await self.release_blocked_push.wait()
         response = await super().request(operation, **payload)
+        if operation == "finish" and isinstance(stream_id, str):
+            stream_ordinal = self.stream_ids.index(stream_id)
+            final_text = self.finish_text_by_stream_ordinal.get(stream_ordinal)
+            if final_text is not None:
+                response["text"] = final_text
         if operation == "push":
             response["text"] = "partial candidate"
             if push_ordinal is not None and push_number is not None:
@@ -148,18 +154,19 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
         max_stream_seconds: float = 60.0,
         soft_rollover_policy: SoftRolloverPolicy | None = None,
         monotonic=None,
+        epoch_ids: tuple[str, ...] | None = None,
     ):
         worker = worker or LifecycleWorker()
         controller = LocalAcousticEpochController(
             asr_job_id="job-stable",
             speech_segment_id="segment-stable",
             initial_epoch_seq=17,
-            epoch_id_allocator=SequenceAllocator(
+            epoch_id_allocator=SequenceAllocator(*(epoch_ids or (
                 "canonical-epoch-17",
                 "canonical-epoch-18",
                 "canonical-epoch-19",
                 "canonical-epoch-20",
-            ),
+            ))),
         )
         handoff = LocalPCMHandoffCoordinator(
             epoch_controller=controller,
@@ -197,6 +204,312 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.sleep(0.001)
         self.fail(message)
+
+    async def _run_verified_empty_epoch_stitch_case(self, empty_epoch_count: int) -> None:
+        worker = CandidateLifecycleWorker()
+        worker.release_old_push.set()
+        worker.release_successor_push.set()
+        worker.release_second_init.set()
+        worker.push_texts_by_stream_ordinal = [
+            ["we want to"],
+            ["want to book"],
+            *([[""]] * empty_epoch_count),
+            ["to book a room"],
+        ]
+        delivered = []
+
+        async def sink(event):
+            delivered.append(dict(event))
+
+        worker, controller, handoff, runtime, lifecycle = await self.make_lifecycle(
+            worker,
+            event_sink=sink,
+            epoch_ids=tuple(
+                f"canonical-epoch-{seq}"
+                for seq in range(17, 17 + empty_epoch_count + 3)
+            ),
+        )
+        try:
+            await lifecycle.initialize()
+            fences = [controller.current]
+            empty_epoch_snapshots = []
+            raw_successor_events = []
+            total_epochs = empty_epoch_count + 3
+
+            for ordinal in range(total_epochs):
+                stream_id = lifecycle.local_stream_id
+                fence = lifecycle.current_fence
+                if ordinal == total_epochs - 1:
+                    session = runtime.sessions[("connection-stable", "mic")]
+                    original_filter = session.candidate_result_filter
+                    assert original_filter is not None
+
+                    def observe_raw_candidate(event):
+                        raw_successor_events.append(dict(event))
+                        return original_filter(event)
+
+                    session.candidate_result_filter = observe_raw_candidate
+
+                ack = await lifecycle.submit_pcm(b"\x41\x00" * 4000)
+                assert ack is not None
+                self.assertEqual(ack.accepted_samples, 4000)
+                await self.wait_until(
+                    lambda: stream_id in worker.completed_push_streams
+                    and lifecycle.snapshot().observed_local_processed_cursor == 4000,
+                    f"epoch {fence.epoch_seq} PCM did not finish processing",
+                )
+                lifecycle._sync_processed()
+
+                if ordinal == 0:
+                    await self.wait_until(lambda: len(delivered) == 1, "anchor candidate missing")
+                    self.assertEqual(delivered[0]["text"], "we want to")
+                elif ordinal == 1:
+                    await self.wait_until(lambda: len(delivered) == 2, "advanced anchor candidate missing")
+                    self.assertEqual(delivered[1]["text"], "we want to book")
+                    self.assertEqual(delivered[1]["stitch_raw_current_text"], "want to book")
+                    self.assertEqual(delivered[1]["stitch_base_epoch_seq"], fences[0].epoch_seq)
+                elif ordinal < total_epochs - 1:
+                    empty_epoch_snapshots.append(lifecycle.candidate_stitcher_snapshot)
+                    self.assertIsNone(lifecycle.candidate_stitcher_snapshot.latest_text)
+                    self.assertEqual(len(delivered), 2, "empty epoch emitted an accepted candidate")
+
+                snapshot = handoff.snapshot()
+                cumulative_samples = 4000 * (ordinal + 1)
+                self.assertEqual(snapshot.received_samples, cumulative_samples)
+                self.assertEqual(snapshot.unique_primary_admitted_samples, cumulative_samples)
+                self.assertEqual(snapshot.unique_primary_admitted_cursor, cumulative_samples)
+                self.assertEqual(snapshot.processed_cursor, cumulative_samples)
+                self.assertEqual(snapshot.downstream_admission_rejected_samples, 0)
+                self.assertEqual(snapshot.explicit_source_rejected_samples, 0)
+                self.assertEqual(snapshot.replay_admitted_samples, 0)
+                self.assertEqual(snapshot.transition_queued_samples, 0)
+                self.assertFalse(snapshot.handoff_in_progress)
+
+                if ordinal < total_epochs - 1:
+                    result = await lifecycle.rollover()
+                    self.assertTrue(result.completed)
+                    successor = controller.current
+                    self.assertEqual(successor.epoch_seq, fence.epoch_seq + 1)
+                    self.assertEqual(successor.asr_job_id, fence.asr_job_id)
+                    self.assertEqual(successor.speech_segment_id, fence.speech_segment_id)
+                    self.assertNotEqual(successor.epoch_id, fence.epoch_id)
+                    fences.append(successor)
+
+            self.assertEqual(len(fences), total_epochs)
+            self.assertEqual(len(empty_epoch_snapshots), empty_epoch_count)
+            self.assertEqual(len(delivered), 3)
+            self.assertEqual(len(raw_successor_events), 1)
+            self.assertEqual(raw_successor_events[0]["text"], "to book a room")
+            successor_candidate = delivered[-1]
+            self.assertEqual(successor_candidate["stitch_raw_current_text"], "to book a room")
+
+            # This is the intended pre-fix failure: all epochs and PCM above
+            # are contiguous and complete, and the raw successor reached the
+            # real stitcher, yet v1 lost the accepted logical anchor.
+            self.assertEqual(
+                successor_candidate["text"],
+                "we want to book a room",
+                msg=(
+                    "actual stitch output: "
+                    f"mode={successor_candidate.get('stitch_mode')}, "
+                    f"reason={successor_candidate.get('stitch_reason')}, "
+                    f"base_epoch_seq={successor_candidate.get('stitch_base_epoch_seq')}, "
+                    f"text={successor_candidate.get('text')!r}"
+                ),
+            )
+            self.assertEqual(successor_candidate["stitch_mode"], "exact_overlap")
+            self.assertEqual(successor_candidate["stitch_overlap_token_count"], 2)
+            self.assertEqual(successor_candidate["stitch_base_epoch_seq"], fences[1].epoch_seq)
+            self.assertEqual(successor_candidate["stitch_anchor_continuity"], "verified_empty_epochs")
+            self.assertEqual(successor_candidate["stitch_anchor_epoch_distance"], empty_epoch_count + 1)
+            self.assertEqual(successor_candidate["stitch_empty_epoch_count"], empty_epoch_count)
+        finally:
+            worker.release_old_push.set()
+            worker.release_successor_push.set()
+            worker.release_second_init.set()
+            await runtime.close()
+
+    async def test_verified_single_empty_epoch_retains_logical_anchor(self):
+        await self._run_verified_empty_epoch_stitch_case(empty_epoch_count=1)
+
+    async def test_verified_consecutive_empty_epochs_retain_logical_anchor(self):
+        await self._run_verified_empty_epoch_stitch_case(empty_epoch_count=2)
+
+    async def test_trace_shaped_candidate_chain_finishes_across_verified_empty_epochs(self):
+        worker = CandidateLifecycleWorker()
+        worker.release_old_push.set()
+        worker.release_successor_push.set()
+        worker.release_second_init.set()
+        worker.push_texts_by_stream_ordinal = [
+            ["the order", "the order is", "the order is a pizza"],
+            ["is a pizza with"],
+            [""],
+            ["a pizza with cheese"],
+            ["with cheese and olives"],
+            [""],
+            ["and olives for delivery"],
+        ]
+        final_raw_text = "and olives for delivery please"
+        worker.finish_text_by_stream_ordinal = {6: final_raw_text}
+        delivered = []
+
+        async def sink(event):
+            delivered.append(dict(event))
+
+        worker, controller, handoff, runtime, lifecycle = await self.make_lifecycle(
+            worker,
+            event_sink=sink,
+            epoch_ids=tuple(f"trace-epoch-{seq}" for seq in range(17, 24)),
+        )
+        expected_partial_texts = [
+            ["the order", "the order is", "the order is a pizza"],
+            ["the order is a pizza with"],
+            [],
+            ["the order is a pizza with cheese"],
+            ["the order is a pizza with cheese and olives"],
+            [],
+            ["the order is a pizza with cheese and olives for delivery"],
+        ]
+        fences = []
+        local_stream_ids = []
+        total_pcm_samples = 0
+        try:
+            await lifecycle.initialize()
+            fences.append(controller.current)
+
+            for ordinal, raw_texts in enumerate(worker.push_texts_by_stream_ordinal):
+                fence = controller.current
+                stream_id = lifecycle.local_stream_id
+                self.assertIsNotNone(stream_id)
+                assert stream_id is not None
+                fences.append(fence) if ordinal and fences[-1] != fence else None
+                local_stream_ids.append(stream_id)
+                self.assertEqual(fence.epoch_seq, 17 + ordinal)
+                self.assertEqual(fence.asr_job_id, "job-stable")
+                self.assertEqual(fence.speech_segment_id, "segment-stable")
+
+                if ordinal in (3, 6):
+                    base = lifecycle.candidate_stitcher_snapshot.base
+                    self.assertIsNotNone(base)
+                    assert base is not None
+                    expected_anchor_ordinal = 1 if ordinal == 3 else 4
+                    expected_empty_ordinal = ordinal - 1
+                    self.assertEqual(base.fence, fences[expected_anchor_ordinal])
+                    self.assertEqual(base.lineage_tail_fence, fences[expected_empty_ordinal])
+                    self.assertEqual(base.empty_epoch_count, 1)
+
+                epoch_events = []
+                for push_index, raw_text in enumerate(raw_texts):
+                    prior_event_count = len(delivered)
+                    ack = await lifecycle.submit_pcm(b"\x51\x00" * 4000)
+                    assert ack is not None
+                    self.assertEqual(ack.accepted_samples, 4000)
+                    total_pcm_samples += ack.accepted_samples
+                    expected_processed = 4000 * (push_index + 1)
+                    await self.wait_until(
+                        lambda: worker.completed_push_streams.count(stream_id) >= push_index + 1
+                        and lifecycle.snapshot().observed_local_processed_cursor == expected_processed,
+                        f"epoch {fence.epoch_seq} push {push_index + 1} did not finish",
+                    )
+                    lifecycle._sync_processed()
+
+                    if raw_text.strip():
+                        await self.wait_until(
+                            lambda: len(delivered) == prior_event_count + 1,
+                            f"epoch {fence.epoch_seq} candidate was not delivered",
+                        )
+                        event = delivered[-1]
+                        epoch_events.append(event)
+                        self.assertEqual(event["event"], "partial_candidate")
+                        self.assertEqual(event["text"], expected_partial_texts[ordinal][push_index])
+                        self.assertEqual(event["stitch_raw_current_text"], raw_text)
+                        self.assertEqual(event["epoch_id"], fence.epoch_id)
+                        self.assertEqual(event["epoch_seq"], fence.epoch_seq)
+                        self.assertEqual(event["asr_job_id"], fence.asr_job_id)
+                        self.assertEqual(event["speech_segment_id"], fence.speech_segment_id)
+                        self.assertEqual(event["revision"], push_index + 1)
+                    else:
+                        self.assertEqual(
+                            len(delivered),
+                            prior_event_count,
+                            "empty epoch unexpectedly emitted an accepted candidate",
+                        )
+
+                self.assertEqual(len(epoch_events), len(expected_partial_texts[ordinal]))
+                if ordinal in (2, 5):
+                    snapshot = lifecycle.candidate_stitcher_snapshot
+                    self.assertIsNone(snapshot.latest_text)
+                    self.assertIsNotNone(snapshot.base)
+                    assert snapshot.base is not None
+                    self.assertEqual(snapshot.base.fence, fences[ordinal - 1])
+                    self.assertEqual(snapshot.base.lineage_tail_fence, fences[ordinal - 1])
+                    self.assertEqual(snapshot.base.empty_epoch_count, 0)
+
+                pcm = handoff.snapshot()
+                self.assertEqual(pcm.received_samples, total_pcm_samples)
+                self.assertEqual(pcm.unique_primary_admitted_samples, total_pcm_samples)
+                self.assertEqual(pcm.processed_cursor, total_pcm_samples)
+                self.assertEqual(pcm.downstream_admission_rejected_samples, 0)
+                self.assertEqual(pcm.explicit_source_rejected_samples, 0)
+                self.assertEqual(pcm.replay_admitted_samples, 0)
+                self.assertEqual(pcm.transition_queued_samples, 0)
+                self.assertFalse(pcm.handoff_in_progress)
+
+                if ordinal < len(worker.push_texts_by_stream_ordinal) - 1:
+                    result = await lifecycle.rollover()
+                    self.assertTrue(result.completed)
+                    successor = controller.current
+                    self.assertEqual(successor.epoch_seq, fence.epoch_seq + 1)
+                    self.assertEqual(successor.asr_job_id, fence.asr_job_id)
+                    self.assertEqual(successor.speech_segment_id, fence.speech_segment_id)
+                    self.assertNotEqual(successor.epoch_id, fence.epoch_id)
+
+            self.assertEqual(len(fences), 7)
+            self.assertEqual(len(set(fence.epoch_id for fence in fences)), 7)
+            self.assertEqual(len(local_stream_ids), 7)
+            self.assertEqual(len(set(local_stream_ids)), 7)
+            self.assertEqual(len(delivered), 7)
+            self.assertEqual(
+                [event["revision"] for event in delivered if event["epoch_seq"] == fences[0].epoch_seq],
+                [1, 2, 3],
+            )
+
+            final = await lifecycle.finish()
+            self.assertIsNotNone(final)
+            assert final is not None
+            self.assertEqual(final["event"], "final_candidate")
+            self.assertTrue(final["final"])
+            self.assertEqual(final["revision"], 2)
+            self.assertEqual(final["text"], "the order is a pizza with cheese and olives for delivery please")
+            self.assertEqual(final["stitch_raw_current_text"], final_raw_text)
+            self.assertEqual(final["stitch_base_epoch_id"], fences[4].epoch_id)
+            self.assertEqual(final["stitch_base_epoch_seq"], fences[4].epoch_seq)
+            self.assertEqual(final["stitch_anchor_continuity"], "verified_empty_epochs")
+            self.assertEqual(final["stitch_anchor_epoch_distance"], 2)
+            self.assertEqual(final["stitch_empty_epoch_count"], 1)
+            self.assertEqual(final["epoch_id"], fences[6].epoch_id)
+            self.assertEqual(final["epoch_seq"], fences[6].epoch_seq)
+            self.assertEqual(final["asr_job_id"], fences[6].asr_job_id)
+            self.assertEqual(final["speech_segment_id"], fences[6].speech_segment_id)
+            self.assertEqual(final["stream_id"], local_stream_ids[6])
+            self.assertEqual(lifecycle.state, QwenEpochLifecycleState.CLOSED)
+            self.assertEqual(
+                sum(operation == "finish" for operation, _ in worker.requests),
+                1,
+            )
+            completed_pcm = handoff.snapshot()
+            self.assertEqual(completed_pcm.received_samples, 36_000)
+            self.assertEqual(completed_pcm.unique_primary_admitted_samples, 36_000)
+            self.assertEqual(completed_pcm.processed_cursor, 36_000)
+            self.assertEqual(completed_pcm.downstream_admission_rejected_samples, 0)
+            self.assertEqual(completed_pcm.explicit_source_rejected_samples, 0)
+            self.assertEqual(completed_pcm.replay_admitted_samples, 0)
+            self.assertEqual(completed_pcm.transition_queued_samples, 0)
+        finally:
+            worker.release_old_push.set()
+            worker.release_successor_push.set()
+            worker.release_second_init.set()
+            await runtime.close()
 
     async def test_two_fresh_epochs_preserve_pcm_order_and_finish_only_successor(self):
         worker, controller, handoff, runtime, lifecycle = await self.make_lifecycle()
@@ -876,6 +1189,9 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(final["final"])
             self.assertEqual(final["epoch_seq"], third_fence.epoch_seq)
             self.assertEqual(final["stitch_base_epoch_seq"], second_fence.epoch_seq)
+            self.assertEqual(final["stitch_anchor_continuity"], "immediate_predecessor")
+            self.assertEqual(final["stitch_anchor_epoch_distance"], 1)
+            self.assertEqual(final["stitch_empty_epoch_count"], 0)
             self.assertEqual(final["truth_status"], "candidate_only")
         finally:
             worker.release_old_push.set()
@@ -883,7 +1199,7 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
             worker.release_second_init.set()
             await runtime.close()
 
-    async def test_epoch_without_candidate_breaks_stitch_base_chain(self):
+    async def test_epoch_without_candidate_preserves_anchor_across_verified_lineage(self):
         worker = CandidateLifecycleWorker()
         worker.release_old_push.set()
         worker.release_successor_push.set()
@@ -915,24 +1231,32 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(second_fence.epoch_seq, first_fence.epoch_seq + 1)
             self.assertEqual(lifecycle.candidate_stitcher_snapshot.base.fence, first_fence)
 
-            # Epoch 18 emits no candidate. Its lack of accepted logical output
-            # must break the base chain before epoch 19 is activated.
+            # Epoch 18 emits no candidate, but its canonical handoff and PCM
+            # processing complete. The accepted epoch 17 anchor remains valid.
             second_handoff = await lifecycle.rollover()
             self.assertTrue(second_handoff.completed)
             third_fence = controller.current
             self.assertEqual(third_fence.epoch_seq, second_fence.epoch_seq + 1)
-            self.assertIsNone(lifecycle.candidate_stitcher_snapshot.base)
+            carried_base = lifecycle.candidate_stitcher_snapshot.base
+            self.assertIsNotNone(carried_base)
+            assert carried_base is not None
+            self.assertEqual(carried_base.text, "text from epoch one")
+            self.assertEqual(carried_base.fence, first_fence)
+            self.assertEqual(carried_base.lineage_tail_fence, second_fence)
+            self.assertEqual(carried_base.empty_epoch_count, 1)
 
             await lifecycle.submit_pcm(b"\x25\x00" * 4000)
             await self.wait_until(lambda: len(delivered) == 2, "epoch 19 candidate missing")
             third_candidate = delivered[1]
-            self.assertEqual(third_candidate["text"], "new text from epoch three")
+            self.assertEqual(third_candidate["text"], "text from epoch one new text from epoch three")
             self.assertEqual(third_candidate["stitch_raw_current_text"], "new text from epoch three")
-            self.assertEqual(third_candidate["stitch_mode"], "current_only")
-            self.assertEqual(third_candidate["stitch_reason"], "no_predecessor")
-            self.assertIsNone(third_candidate["stitch_base_epoch_id"])
-            self.assertIsNone(third_candidate["stitch_base_epoch_seq"])
-            self.assertNotIn("text from epoch one", third_candidate["text"])
+            self.assertEqual(third_candidate["stitch_mode"], "no_overlap")
+            self.assertEqual(third_candidate["stitch_reason"], "no_exact_overlap")
+            self.assertEqual(third_candidate["stitch_base_epoch_id"], first_fence.epoch_id)
+            self.assertEqual(third_candidate["stitch_base_epoch_seq"], first_fence.epoch_seq)
+            self.assertEqual(third_candidate["stitch_anchor_continuity"], "verified_empty_epochs")
+            self.assertEqual(third_candidate["stitch_anchor_epoch_distance"], 2)
+            self.assertEqual(third_candidate["stitch_empty_epoch_count"], 1)
         finally:
             worker.release_old_push.set()
             worker.release_successor_push.set()

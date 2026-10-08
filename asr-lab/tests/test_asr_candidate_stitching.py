@@ -56,11 +56,19 @@ class ASRCandidateStitchingTests(unittest.TestCase):
         self.assertEqual(result["stitch_mode"], "current_only")
         self.assertEqual(result["stitch_reason"], "no_predecessor")
         self.assertIsNone(result["stitch_base_epoch_id"])
+        self.assertEqual(result["stitch_anchor_continuity"], "none")
+        self.assertIsNone(result["stitch_anchor_epoch_distance"])
+        self.assertIsNone(result["stitch_empty_epoch_count"])
 
-    def test_freeze_without_current_candidate_does_not_carry_inherited_base(self):
-        stitcher, _, current = self.make_stitcher("older epoch candidate")
+    def test_freeze_without_current_candidate_carries_only_verified_immediate_anchor(self):
+        stitcher, base_fence, current = self.make_stitcher("older epoch candidate")
         self.assertIsNone(stitcher.snapshot().latest_text)
-        self.assertIsNone(stitcher.freeze_for_successor(current))
+        carried = stitcher.freeze_for_successor(current)
+        self.assertIsNotNone(carried)
+        assert carried is not None
+        self.assertEqual(carried.fence, base_fence)
+        self.assertEqual(carried.lineage_tail_fence, current)
+        self.assertEqual(carried.empty_epoch_count, 1)
 
     def test_largest_exact_suffix_prefix_overlap_wins(self):
         stitcher, base_fence, current = self.make_stitcher("alpha beta gamma")
@@ -71,6 +79,58 @@ class ASRCandidateStitchingTests(unittest.TestCase):
         self.assertEqual(result["stitch_overlap_token_count"], 2)
         self.assertEqual(result["stitch_base_epoch_id"], base_fence.epoch_id)
         self.assertEqual(result["stitch_base_epoch_seq"], base_fence.epoch_seq)
+        self.assertEqual(result["stitch_anchor_continuity"], "immediate_predecessor")
+        self.assertEqual(result["stitch_anchor_epoch_distance"], 1)
+        self.assertEqual(result["stitch_empty_epoch_count"], 0)
+
+    def test_anchor_survives_two_verified_empty_epochs_and_reports_distance(self):
+        anchor_fence = fence(epoch="epoch-1", seq=1)
+        first_empty = fence(epoch="epoch-2", seq=2)
+        second_empty = fence(epoch="epoch-3", seq=3)
+        current = fence(epoch="epoch-4", seq=4)
+        stitcher = ASRCandidateStitcher()
+        stitcher.activate_epoch(first_empty, base=CandidateBase("we want to book", anchor_fence))
+
+        carried_once = stitcher.freeze_for_successor(first_empty)
+        self.assertIsNotNone(carried_once)
+        assert carried_once is not None
+        self.assertEqual(carried_once.fence, anchor_fence)
+        self.assertEqual(carried_once.lineage_tail_fence, first_empty)
+        self.assertEqual(carried_once.empty_epoch_count, 1)
+
+        stitcher.activate_epoch(second_empty, base=carried_once)
+        carried_twice = stitcher.freeze_for_successor(second_empty)
+        self.assertIsNotNone(carried_twice)
+        assert carried_twice is not None
+        self.assertEqual(carried_twice.fence, anchor_fence)
+        self.assertEqual(carried_twice.lineage_tail_fence, second_empty)
+        self.assertEqual(carried_twice.empty_epoch_count, 2)
+
+        stitcher.activate_epoch(current, base=carried_twice)
+        result = stitcher.reconcile(candidate("to book a room"), trusted_fence=current)
+        assert result is not None
+        self.assertEqual(result["text"], "we want to book a room")
+        self.assertEqual(result["stitch_mode"], "exact_overlap")
+        self.assertEqual(result["stitch_overlap_token_count"], 2)
+        self.assertEqual(result["stitch_base_epoch_id"], anchor_fence.epoch_id)
+        self.assertEqual(result["stitch_base_epoch_seq"], anchor_fence.epoch_seq)
+        self.assertEqual(result["stitch_anchor_continuity"], "verified_empty_epochs")
+        self.assertEqual(result["stitch_anchor_epoch_distance"], 3)
+        self.assertEqual(result["stitch_empty_epoch_count"], 2)
+
+    def test_rejected_candidate_breaks_empty_chain_fail_closed(self):
+        stitcher, _base_fence, current = self.make_stitcher("verified anchor")
+        rejected = candidate("candidate must not extend this chain")
+        rejected["revision"] = True
+        self.assertIsNone(stitcher.reconcile(rejected, trusted_fence=current))
+        self.assertEqual(stitcher.snapshot().last_rejection_reason, "invalid_candidate_revision")
+        self.assertIsNone(stitcher.freeze_for_successor(current))
+
+    def test_final_candidate_does_not_seed_a_successor_anchor(self):
+        stitcher, _, current = self.make_stitcher("prior words")
+        final = candidate("terminal words", event="final_candidate", final=True)
+        self.assertIsNotNone(stitcher.reconcile(final, trusted_fence=current))
+        self.assertIsNone(stitcher.freeze_for_successor(current))
 
     def test_strong_overlap_removes_only_the_current_prefix(self):
         stitcher, _, current = self.make_stitcher("I would like to book")
@@ -166,6 +226,9 @@ class ASRCandidateStitchingTests(unittest.TestCase):
                 self.assertEqual(result["text"], "base text plus")
                 self.assertEqual(result["stitch_mode"], "current_only")
                 self.assertEqual(result["stitch_reason"], "lineage_gap")
+                self.assertEqual(result["stitch_anchor_continuity"], "none")
+                self.assertIsNone(result["stitch_anchor_epoch_distance"])
+                self.assertIsNone(result["stitch_empty_epoch_count"])
 
     def test_higher_revision_recomputes_against_same_frozen_base(self):
         stitcher, _, current = self.make_stitcher("red green blue")
@@ -240,6 +303,9 @@ class ASRCandidateStitchingTests(unittest.TestCase):
         self.assertEqual(result["truth_status"], "candidate_only")
         self.assertTrue(result["replace"])
         self.assertEqual(result["stitch_policy_version"], STITCH_POLICY_VERSION)
+        self.assertEqual(result["stitch_anchor_continuity"], "immediate_predecessor")
+        self.assertEqual(result["stitch_anchor_epoch_distance"], 1)
+        self.assertEqual(result["stitch_empty_epoch_count"], 0)
 
     def test_current_fence_mismatch_fails_closed(self):
         stitcher, _, current = self.make_stitcher()

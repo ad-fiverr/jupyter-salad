@@ -11,6 +11,30 @@ export const MAX_CANVAS_DPR = 2;
 export const MAX_CANVAS_WIDTH = 4096;
 export const MAX_CANVAS_HEIGHT = 2048;
 
+export const CANDIDATE_STITCH_PROVENANCE_FIELDS = Object.freeze([
+  "asr_job_id", "speech_segment_id", "epoch_id", "epoch_seq",
+  "stitch_policy_version", "stitch_mode", "stitch_reason",
+  "stitch_overlap_token_count", "stitch_raw_current_text",
+  "stitch_base_epoch_id", "stitch_base_epoch_seq",
+  "stitch_anchor_continuity", "stitch_anchor_epoch_distance", "stitch_empty_epoch_count",
+]);
+
+const CANDIDATE_STITCH_PROVENANCE_TEXT_FIELDS = new Set([
+  "asr_job_id", "speech_segment_id", "epoch_id", "stitch_policy_version",
+  "stitch_mode", "stitch_reason", "stitch_raw_current_text",
+  "stitch_base_epoch_id", "stitch_anchor_continuity",
+]);
+
+export function safeCandidateStitchProvenance(source = {}) {
+  return Object.fromEntries(CANDIDATE_STITCH_PROVENANCE_FIELDS.map((field) => {
+    const value = source?.[field];
+    if (CANDIDATE_STITCH_PROVENANCE_TEXT_FIELDS.has(field)) {
+      return [field, typeof value === "string" ? value : null];
+    }
+    return [field, Number.isInteger(value) && value >= 0 ? value : null];
+  }));
+}
+
 export function canvasBackingSize(cssWidth, cssHeight, devicePixelRatio = 1) {
   if (![cssWidth, cssHeight, devicePixelRatio].every(Number.isFinite) || cssWidth <= 0 || cssHeight <= 0) {
     return null;
@@ -30,6 +54,7 @@ export function shouldDrawCanvas(hidden, cssWidth, cssHeight) {
 
 export const METRIC_DEFINITIONS = Object.freeze({
   AUDIO_DURATION_MS: "Duración del PCM enviado al modelo; no es latencia y puede incluir silencio final.",
+  QWEN_LOCAL_SESSION_AUDIO_DURATION_MS: "Duración local de audio de la sesión Qwen reportada por el candidato final; no es cobertura de transcripción y queda null si no está disponible.",
   SERVER_ENDPOINTING_MS: "perf_counter del servidor: último chunk clasificado como voz hasta entrega del job al broker; incluye cierre por VAD y scheduling previo a la cola.",
   SERVER_QUEUE_WAIT_MS: "perf_counter del servidor: entrega al broker hasta el inicio real de backend.transcribe().",
   SERVER_MODEL_INFERENCE_MS: "perf_counter del servidor alrededor de backend.transcribe(); wall time del adaptador, no tiempo de kernel GPU.",
