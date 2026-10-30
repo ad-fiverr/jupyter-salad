@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1.7
+
+# This child image preserves the complete ASR image and adds only the pinned
+# Tailscale userspace client and its startup wrapper.
+FROM myblockchaincompany/jupyter-salad:sha-80fbf5d@sha256:1c5d4a04f46ac878439fa40133b324038e426eefa9537dba4fef5b8087e8df09
+
+# Official Tailscale 1.104.4 linux/amd64 archive, verified against
+# https://pkgs.tailscale.com/stable/tailscale_1.104.4_amd64.tgz.sha256
+ADD --checksum=sha256:624ea093d47d62cf56f17b8332d74b8decda4a1faa610ebc60a1de334b2b3dc9 https://pkgs.tailscale.com/stable/tailscale_1.104.4_amd64.tgz /tmp/tailscale.tgz
+
+RUN tar -xzf /tmp/tailscale.tgz -C /tmp \
+    && install -m 0755 /tmp/tailscale_1.104.4_amd64/tailscale /usr/local/bin/tailscale \
+    && install -m 0755 /tmp/tailscale_1.104.4_amd64/tailscaled /usr/local/bin/tailscaled \
+    && /usr/local/bin/tailscale version >/dev/null \
+    && /usr/local/bin/tailscaled --version >/dev/null \
+    && rm -rf /tmp/tailscale.tgz /tmp/tailscale_1.104.4_amd64
+
+COPY tailscale-salad-entrypoint.sh /usr/local/bin/tailscale-salad-entrypoint
+RUN chmod 0755 /usr/local/bin/tailscale-salad-entrypoint
+
+# The base image's inherited NVIDIA entrypoint remains unchanged.
+CMD ["/usr/local/bin/tailscale-salad-entrypoint"]
