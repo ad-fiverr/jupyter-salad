@@ -1,6 +1,9 @@
 name: Build private Tailscale ASR variant
 
 on:
+  push:
+    branches:
+      - codex/private-tailscale-asr-transport
   workflow_dispatch:
 
 permissions:
