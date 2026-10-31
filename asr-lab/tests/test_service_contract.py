@@ -104,8 +104,9 @@ class FakeBroker:
 
 
 class FakeWebSocket:
-    def __init__(self, frames=()):
+    def __init__(self, frames=(), fail_send_event=None):
         self.frames = list(frames)
+        self.fail_send_event = fail_send_event
         self.closed = []
         self.accepted = False
         self.sent = []
@@ -125,6 +126,8 @@ class FakeWebSocket:
         return {"type": "websocket.disconnect"}
 
     async def send_json(self, payload):
+        if payload.get("event") == self.fail_send_event:
+            raise RuntimeError("synthetic send failure")
         self.sent.append(payload)
 
 
@@ -635,6 +638,133 @@ class ServiceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["stream_started", "partial_candidate", "final_candidate", "flush_complete"])
         self.assertEqual(socket.sent[1]["stream_id"], "owned-stream")
         self.assertEqual(socket.sent[2]["request_id"], "flush-1")
+        partial_trace = [
+            row for row in service._partial_delivery_trace
+            if row["partial_id"] == "owned-stream/0/1"
+        ]
+        self.assertEqual(
+            [(row["boundary"], row.get("phase"), row.get("outcome")) for row in partial_trace],
+            [
+                ("server_event", None, None),
+                ("ws_send", "pre", "pending"),
+                ("ws_send", "post", "sent"),
+            ],
+        )
+        self.assertTrue(all("text" not in row for row in partial_trace))
+        self.assertTrue(all(row["text_utf8_bytes"] == len("provisional".encode("utf-8")) for row in partial_trace))
+        self.assertTrue(all(row["text_hash_fnv1a32"] == partial_trace[0]["text_hash_fnv1a32"] for row in partial_trace))
+
+        service._partial_delivery_trace.clear()
+        failed_socket = FakeWebSocket(
+            [audio_frame(), {"type": "websocket.disconnect"}],
+            fail_send_event="partial_candidate",
+        )
+        await service.websocket_asr(failed_socket, token=TOKEN)
+        failed_trace = [row for row in service._partial_delivery_trace if row["boundary"] == "ws_send"]
+        self.assertEqual(
+            [(row["phase"], row["outcome"]) for row in failed_trace],
+            [("pre", "pending"), ("post", "error:RuntimeError")],
+        )
+
+    async def test_partial_delivery_trace_is_authenticated_filtered_and_content_free(self):
+        service = self.setup_service()
+        service._partial_delivery_trace.clear()
+        service._partial_delivery_trace_dropped_events = 0
+        service._record_partial_delivery_boundary(
+            "runtime_candidate", "stream-a", "local-a",
+            {
+                "event": "partial_candidate", "epoch_seq": 2, "revision": 7,
+                "text": "transcript secret", "language": "Spanish",
+                "pcm": "synthetic-pcm-sentinel", "context": "synthetic-context-sentinel",
+                "bearer_token": "synthetic-bearer-sentinel",
+                "TAILSCALE_AUTH_KEY": "synthetic-tailscale-key-sentinel",
+            },
+        )
+        service._record_partial_delivery_boundary(
+            "runtime_candidate", "stream-b", "local-b",
+            {"event": "partial_candidate", "epoch_seq": 0, "revision": 1, "text": "other stream", "language": "Spanish"},
+        )
+        service._record_partial_delivery_boundary(
+            "decode_push_result", "stream-a", "local-a",
+            {
+                "epoch_seq": 2, "revision_previous": 6, "revision_new": 7,
+                "partial_id": "stream-a/2/7",
+                "outcome": "changed_text_candidate", "cursor_end_samples": 112000,
+                "cursor_ms": 7000, "decode_steps_delta": 1,
+                "text": "transcript secret", "language": "Spanish",
+                "pcm": "synthetic-pcm-sentinel", "context": "synthetic-context-sentinel",
+                "bearer_token": "synthetic-bearer-sentinel",
+                "TAILSCALE_AUTH_KEY": "synthetic-tailscale-key-sentinel",
+            },
+        )
+        service._record_partial_delivery_boundary(
+            "canonical_filter", "stream-a", "local-a",
+            {
+                "event": "partial_candidate", "epoch_seq": 2, "revision": 7,
+                "diagnostic_outcome": "accepted", "text": "transcript secret",
+                "stitch_raw_current_text": "stitched transcript secret",
+                "language": "Spanish",
+                "pcm": "synthetic-pcm-sentinel", "context": "synthetic-context-sentinel",
+                "bearer_token": "synthetic-bearer-sentinel",
+                "TAILSCALE_AUTH_KEY": "synthetic-tailscale-key-sentinel",
+            },
+        )
+
+        denied = await service.partial_delivery_trace(stream_id="stream-a", authorization=None)
+        self.assertEqual(denied.status_code, 401)
+        missing_id = await service.partial_delivery_trace(
+            stream_id=None, authorization=f"Bearer {TOKEN}",
+        )
+        self.assertEqual(missing_id.status_code, 400)
+        allowed = await service.partial_delivery_trace(
+            stream_id="stream-a", authorization=f"Bearer {TOKEN}",
+        )
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.headers["Cache-Control"], "no-store")
+        self.assertEqual(allowed.content["event_count"], 3)
+        self.assertEqual({row["stream_id"] for row in allowed.content["events"]}, {"stream-a"})
+        self.assertEqual(
+            {row["partial_id"] for row in allowed.content["events"]},
+            {"stream-a/2/7"},
+        )
+        self.assertEqual(
+            {row["boundary"] for row in allowed.content["events"]},
+            {"runtime_candidate", "decode_push_result", "canonical_filter"},
+        )
+        self.assertTrue(all("text" not in row for row in allowed.content["events"]))
+        serialized = json.dumps(allowed.content)
+        for secret_value in (
+            "transcript secret", TOKEN, "synthetic-pcm-sentinel",
+            "stitched transcript secret", "stitch_raw_current_text",
+            "synthetic-context-sentinel", "synthetic-bearer-sentinel",
+            "synthetic-tailscale-key-sentinel",
+        ):
+            self.assertNotIn(secret_value, serialized)
+
+    async def test_no_text_decode_opportunities_never_get_partial_identity(self):
+        service = self.setup_service()
+        service._partial_delivery_trace.clear()
+        for outcome in ("empty_text", "unchanged_text"):
+            service._record_partial_delivery_boundary(
+                "decode_push_result", "stream-a", "local-a",
+                {
+                    "partial_id": "must-not-be-used",
+                    "epoch_seq": 3,
+                    "revision_previous": 8,
+                    "revision_new": 8,
+                    "outcome": outcome,
+                    "cursor_end_samples": 16_000,
+                    "cursor_ms": 1000,
+                    "decode_steps_delta": 0,
+                },
+            )
+
+        rows = list(service._partial_delivery_trace)
+        self.assertEqual([row["outcome"] for row in rows], ["empty_text", "unchanged_text"])
+        self.assertTrue(all(row["partial_id"] is None for row in rows))
+        self.assertTrue(all(row["candidate_partial_id"] is None for row in rows))
+        self.assertEqual([row["cursor_end_samples"] for row in rows], [16_000, 16_000])
+        self.assertEqual([row["decode_steps_delta"] for row in rows], [0, 0])
 
     async def test_qwen_websocket_flush_waits_for_capacity_during_pending_handoff(self):
         socket, worker, _elapsed = await self.run_capacity_wait_service_case(release_delay=0.05)

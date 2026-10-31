@@ -641,6 +641,7 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return response
 
         worker = SequenceWorker()
+        diagnostics = []
         runtime = QwenStreamingRuntime(
             worker=worker, model_id="qwen", model_revision="fixed", gpu_memory_utilization=0.65,
             max_active_sessions=2, max_stream_seconds=2, session_idle_ttl_seconds=120,
@@ -649,7 +650,12 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         await runtime.start()
         try:
-            await runtime.open_session(connection_id="ordinal", source="mic", model_chunk_ms=50)
+            await runtime.open_session(
+                connection_id="ordinal", source="mic", model_chunk_ms=50,
+                runtime_diagnostic_observer=lambda boundary, payload: diagnostics.append(
+                    (boundary, dict(payload))
+                ),
+            )
             frame = b"\x03\x00" * 800
             await runtime.push_audio(connection_id="ordinal", source="mic", pcm16le=frame)
             first = await runtime.receive_event(connection_id="ordinal", source="mic")
@@ -669,6 +675,30 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final["QWEN_DECODE_STEPS_DELTA_TOTAL"], 3)
             self.assertIsNotNone(final["FIRST_PARTIAL_MS"])
             self.assertEqual(final["SERVER_FIRST_PARTIAL_MS"], final["FIRST_PARTIAL_MS"])
+            push_results = [
+                payload for boundary, payload in diagnostics
+                if boundary == "decode_push_result"
+            ]
+            self.assertEqual(len(push_results), 4)
+            self.assertEqual(
+                [row["decode_steps_delta"] for row in push_results],
+                [1, 0, 1, 0],
+            )
+            self.assertEqual(
+                [row["cursor_end_samples"] for row in push_results],
+                [800, 1600, 2400, 2800],
+            )
+            self.assertEqual(
+                [(row["revision_previous"], row["revision_new"]) for row in push_results],
+                [(0, 1), (1, 1), (1, 2), (2, 2)],
+            )
+            self.assertEqual(
+                [row["outcome"] for row in push_results],
+                [
+                    "changed_text_candidate", "unchanged_text",
+                    "changed_text_candidate", "unchanged_text",
+                ],
+            )
         finally:
             await runtime.close()
 
@@ -759,6 +789,88 @@ class QwenStreamingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(filter_calls, ["partial_candidate", "final_candidate"])
         self.assertEqual(delivered, [])
         self.assertEqual(self.runtime.active_sessions, 0)
+
+    async def test_runtime_diagnostics_cover_decode_opportunities_and_prefilter_candidate(self):
+        self.worker.text_sequences["diagnostic outcomes"] = [
+            "candidate text", "candidate text", "",
+        ]
+        rows = []
+        changed = asyncio.Event()
+
+        def observe(boundary, payload):
+            rows.append({
+                "boundary": boundary,
+                "outcome": payload.get("outcome"),
+                "diagnostic_outcome": payload.get("diagnostic_outcome"),
+                "partial_candidate": payload.get("event") == "partial_candidate",
+                "cursor_end_samples": payload.get("cursor_end_samples"),
+                "revision_previous": payload.get("revision_previous"),
+                "revision_new": payload.get("revision_new"),
+                "revision": payload.get("revision"),
+                "text_utf8_bytes": payload.get("text_utf8_bytes"),
+                "text_hash_fnv1a32": payload.get("text_hash_fnv1a32"),
+                "has_text": "text" in payload,
+            })
+            changed.set()
+
+        def accept_filter(candidate):
+            rows.append({"boundary": "canonical_filter_callback", "has_text": False})
+            return candidate
+
+        async def wait_for_rows(count):
+            while len(rows) < count:
+                changed.clear()
+                if len(rows) < count:
+                    await asyncio.wait_for(changed.wait(), 1)
+
+        await self.runtime.open_session(
+            connection_id="diagnostics", source="mic", context="diagnostic outcomes",
+            chunk_size_ms=250, candidate_result_filter=accept_filter,
+            runtime_diagnostic_observer=observe,
+        )
+        frame = b"\x03\x00" * 4000
+        await self.runtime.push_audio(connection_id="diagnostics", source="mic", pcm16le=frame)
+        await wait_for_rows(4)
+        await self.runtime.push_audio(connection_id="diagnostics", source="mic", pcm16le=frame)
+        await wait_for_rows(5)
+        await self.runtime.push_audio(connection_id="diagnostics", source="mic", pcm16le=frame)
+        await wait_for_rows(6)
+
+        self.assertEqual(
+            [row["boundary"] for row in rows],
+            [
+                "decode_push_result", "runtime_candidate", "canonical_filter_callback",
+                "canonical_filter", "decode_push_result", "decode_push_result",
+            ],
+        )
+        decode_rows = [row for row in rows if row["boundary"] == "decode_push_result"]
+        self.assertEqual([row["outcome"] for row in decode_rows], [
+            "changed_text_candidate", "unchanged_text", "empty_text",
+        ])
+        self.assertEqual(
+            [(row["revision_previous"], row["revision_new"]) for row in decode_rows],
+            [(0, 1), (1, 1), (1, 1)],
+        )
+        self.assertEqual([row["diagnostic_outcome"] for row in rows if row["boundary"] == "canonical_filter"], ["accepted"])
+        self.assertTrue(all(not row["has_text"] for row in rows))
+        self.assertEqual(rows[1]["text_utf8_bytes"], len("candidate text".encode("utf-8")))
+        self.assertTrue(rows[1]["text_hash_fnv1a32"])
+
+    async def test_runtime_diagnostic_failure_does_not_change_partial_delivery(self):
+        def fail_observer(*_args):
+            raise RuntimeError("diagnostic failure")
+
+        await self.runtime.open_session(
+            connection_id="diagnostic-failure", source="mic", context="client B",
+            chunk_size_ms=250, runtime_diagnostic_observer=fail_observer,
+        )
+        await self.runtime.push_audio(
+            connection_id="diagnostic-failure", source="mic", pcm16le=b"\x04\x00" * 4000,
+        )
+        candidate = await asyncio.wait_for(
+            self.runtime.receive_event(connection_id="diagnostic-failure", source="mic"), 1,
+        )
+        self.assertEqual(candidate["text"], "cancelar mi cita")
 
 
 if __name__ == "__main__":

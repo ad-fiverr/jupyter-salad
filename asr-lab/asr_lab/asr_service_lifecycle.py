@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from .asr_epoch_controller import LocalAcousticEpochController
+from .asr_fencing import ExecutionFence
 from .asr_pcm_handoff import HandoffDrainResult, LocalPCMHandoffCoordinator, PCMHandoffError
 from .asr_qwen_epoch_lifecycle import (
     QwenEpochLifecycle,
@@ -16,12 +17,21 @@ from .asr_qwen_epoch_lifecycle import (
     QwenEpochLifecycleState,
 )
 from .config import Settings
-from .qwen_streaming import QwenStreamingRuntime, StreamingError, validate_candidate_event
+from .qwen_streaming import (
+    QwenStreamingRuntime,
+    StreamingError,
+    _candidate_diagnostic_payload,
+    validate_candidate_event,
+)
 
 
 ASR_LAB_LOCAL_INITIAL_EPOCH_SEQ = 0
 _HANDOFF_FLUSH_DRAIN_DEADLINE_SECONDS = 120.0
 CandidateEventSink = Callable[[dict[str, Any]], Awaitable[None]]
+PartialDiagnosticSink = Callable[[str, str, str, dict[str, Any]], None]
+RuntimeDiagnosticObserver = Callable[
+    [str, ExecutionFence | None, str | None, dict[str, Any]], None
+]
 
 
 @dataclass
@@ -42,11 +52,13 @@ class QwenServiceLifecycleRegistry:
         settings: Settings,
         connection_id: str,
         event_sink: CandidateEventSink,
+        diagnostic_sink: PartialDiagnosticSink | None = None,
     ) -> None:
         self.runtime = runtime
         self.settings = settings
         self.connection_id = connection_id
         self.event_sink = event_sink
+        self.diagnostic_sink = diagnostic_sink
         self._sources: dict[str, _SourceLifecycle] = {}
         self._closed = False
 
@@ -94,7 +106,13 @@ class QwenServiceLifecycleRegistry:
                 or not isinstance(entry.public_stream_id, str)
             ):
                 return
-            await self.event_sink(self._project_candidate(entry, candidate, local_stream_id))
+            projected = self._project_candidate(entry, candidate, local_stream_id)
+            if projected["event"] == "partial_candidate" and self.diagnostic_sink is not None:
+                self.diagnostic_sink(
+                    "server_event", entry.public_stream_id, local_stream_id,
+                    _candidate_diagnostic_payload(projected),
+                )
+            await self.event_sink(projected)
 
         job_id = f"asr-lab-job-{uuid4().hex}"
         segment_id = f"asr-lab-segment-{uuid4().hex}"
@@ -117,6 +135,49 @@ class QwenServiceLifecycleRegistry:
             max_retained_samples=max_retained_samples,
             max_transition_samples=transition_samples,
         )
+
+        def observe_runtime_diagnostic(
+            boundary: str,
+            fence: ExecutionFence | None,
+            local_stream_id: str | None,
+            payload: dict[str, Any],
+        ) -> None:
+            if (
+                self.diagnostic_sink is None
+                or entry.disposed
+                or self._sources.get(source) is not entry
+                or not isinstance(entry.public_stream_id, str)
+                or not isinstance(local_stream_id, str)
+            ):
+                return
+            diagnostic = dict(payload)
+            if fence is not None:
+                diagnostic.update({
+                    "epoch_id": fence.epoch_id,
+                    "epoch_seq": fence.epoch_seq,
+                    "asr_job_id": fence.asr_job_id,
+                    "speech_segment_id": fence.speech_segment_id,
+                })
+            if boundary == "decode_push_result":
+                revision = diagnostic.get("revision_new")
+                if (
+                    diagnostic.get("outcome") == "changed_text_candidate"
+                    and type(diagnostic.get("epoch_seq")) is int
+                    and type(revision) is int
+                ):
+                    diagnostic["partial_id"] = (
+                        f"{entry.public_stream_id}/{diagnostic['epoch_seq']}/{revision}"
+                    )
+            elif boundary in {"runtime_candidate", "canonical_filter"}:
+                revision = diagnostic.get("revision")
+                if type(diagnostic.get("epoch_seq")) is int and type(revision) is int:
+                    diagnostic["partial_id"] = (
+                        f"{entry.public_stream_id}/{diagnostic['epoch_seq']}/{revision}"
+                    )
+            self.diagnostic_sink(
+                boundary, entry.public_stream_id, local_stream_id, diagnostic,
+            )
+
         lifecycle = QwenEpochLifecycle(
             epoch_controller=controller,
             pcm_handoff=handoff,
@@ -128,6 +189,7 @@ class QwenServiceLifecycleRegistry:
             chunk_size_ms=model_chunk_ms,
             request_id=request_id,
             event_sink=forward_candidate,
+            diagnostic_observer=observe_runtime_diagnostic,
         )
         entry.lifecycle = lifecycle
         try:

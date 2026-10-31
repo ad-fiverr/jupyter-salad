@@ -7,7 +7,9 @@ import logging
 import math
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -31,6 +33,9 @@ broker: InferenceBroker | None = None
 qwen_runtime: QwenStreamingRuntime | None = None
 config_valid = settings.error is None
 connection_slots = asyncio.Semaphore(settings.max_connections)
+_PARTIAL_DELIVERY_TRACE_MAX_EVENTS = 8192
+_partial_delivery_trace: deque[dict[str, Any]] = deque(maxlen=_PARTIAL_DELIVERY_TRACE_MAX_EVENTS)
+_partial_delivery_trace_dropped_events = 0
 
 _SAFE_SCHEDULER_REASONS = {
     "per_stream_backlog_limit",
@@ -77,6 +82,94 @@ def _safe_scheduler_diagnostics(details: dict[str, Any]) -> dict[str, Any]:
         if safe_terminal:
             result["terminal_metrics"] = safe_terminal
     return result
+
+
+def _fnv1a32(data: bytes) -> str:
+    value = 0x811C9DC5
+    for byte in data:
+        value = ((value ^ byte) * 0x01000193) & 0xFFFFFFFF
+    return f"{value:08x}"
+
+
+def _record_partial_delivery_boundary(
+    boundary: str,
+    public_stream_id: str,
+    local_stream_id: str,
+    payload: dict[str, Any],
+    *,
+    phase: str | None = None,
+    outcome: str | None = None,
+) -> None:
+    global _partial_delivery_trace_dropped_events
+    if boundary == "decode_push_result":
+        if payload.get("outcome") not in {
+            "empty_text", "unchanged_text", "changed_text_candidate",
+        }:
+            return
+    elif payload.get("event") != "partial_candidate":
+        return
+    text = payload.get("text")
+    if isinstance(text, str):
+        text_bytes = text.encode("utf-8", errors="replace")
+        text_utf8_bytes = len(text_bytes)
+        text_hash = _fnv1a32(text_bytes)
+    else:
+        text_utf8_bytes = payload.get("text_utf8_bytes")
+        text_hash = payload.get("text_hash_fnv1a32")
+    partial_id = payload.get("partial_id")
+    epoch_seq = payload.get("epoch_seq")
+    revision = payload.get("revision", payload.get("revision_new"))
+    if boundary == "decode_push_result" and payload.get("outcome") != "changed_text_candidate":
+        partial_id = None
+    if (
+        boundary in {"runtime_candidate", "canonical_filter", "server_event", "ws_send"}
+        and not isinstance(partial_id, str)
+        and type(epoch_seq) is int
+        and type(revision) is int
+    ):
+        partial_id = f"{public_stream_id}/{epoch_seq}/{revision}"
+    record: dict[str, Any] = {
+        "boundary": boundary,
+        "partial_id": partial_id,
+        "stream_id": public_stream_id,
+        "qwen_local_stream_id": local_stream_id,
+        "epoch_seq": epoch_seq,
+        "revision": revision,
+        "utc_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "monotonic_timestamp_ms": time.perf_counter_ns() / 1_000_000,
+        "text_utf8_bytes": text_utf8_bytes,
+        "text_hash_fnv1a32": text_hash,
+        "language": payload.get("language"),
+    }
+    if boundary == "decode_push_result":
+        record.update({
+            "cursor_end_samples": payload.get("cursor_end_samples"),
+            "cursor_ms": payload.get("cursor_ms"),
+            "decode_steps_delta": payload.get("decode_steps_delta"),
+            "outcome": payload["outcome"],
+            "revision_previous": payload.get("revision_previous"),
+            "revision_new": payload.get("revision_new"),
+        })
+        record["candidate_partial_id"] = partial_id
+    else:
+        record["audio_cursor_ms"] = payload.get("audio_cursor_ms")
+    if boundary == "canonical_filter":
+        record["filter_outcome"] = payload.get("diagnostic_outcome")
+        diagnostic_code = payload.get("diagnostic_code")
+        if isinstance(diagnostic_code, str):
+            safe_code = "".join(
+                char for char in diagnostic_code[:120]
+                if char.isalnum() or char in "_.:-"
+            )
+            if safe_code:
+                record["filter_code"] = safe_code
+    if phase is not None:
+        record["phase"] = phase
+    if outcome is not None:
+        record["outcome"] = outcome
+    if len(_partial_delivery_trace) == _PARTIAL_DELIVERY_TRACE_MAX_EVENTS:
+        _partial_delivery_trace_dropped_events += 1
+    _partial_delivery_trace.append(record)
 
 
 @asynccontextmanager
@@ -197,6 +290,26 @@ async def telemetry(authorization: str | None = Header(default=None)) -> JSONRes
         snapshot["qwen_max_pending_jobs"] = settings.qwen_max_pending_jobs
         snapshot["qwen_max_backlog_chunks"] = settings.qwen_max_backlog_chunks
     return JSONResponse(snapshot, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/asr/partial-delivery-trace", include_in_schema=False)
+async def partial_delivery_trace(
+    stream_id: str | None = Query(default=None),
+    authorization: str | None = Header(default=None),
+) -> JSONResponse:
+    scheme, _, bearer = (authorization or "").partition(" ")
+    if scheme.casefold() != "bearer" or not settings.api_token or not token_matches(bearer, settings.api_token):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401, headers={"Cache-Control": "no-store"})
+    if not stream_id:
+        return JSONResponse({"detail": "stream_id is required"}, status_code=400, headers={"Cache-Control": "no-store"})
+    events = [dict(record) for record in _partial_delivery_trace if record["stream_id"] == stream_id]
+    return JSONResponse({
+        "schema_version": 1,
+        "stream_id": stream_id,
+        "event_count": len(events),
+        "dropped_event_count": _partial_delivery_trace_dropped_events,
+        "events": events,
+    }, headers={"Cache-Control": "no-store"})
 
 
 def _worker_metrics() -> list[dict[str, Any]]:
@@ -415,7 +528,27 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
 
     async def send_json(payload: dict[str, Any]) -> None:
         async with send_lock:
-            await websocket.send_json(payload)
+            if payload.get("event") != "partial_candidate":
+                await websocket.send_json(payload)
+                return
+            public_stream_id = payload["stream_id"]
+            local_stream_id = payload["qwen_local_stream_id"]
+            _record_partial_delivery_boundary(
+                "ws_send", public_stream_id, local_stream_id, payload,
+                phase="pre", outcome="pending",
+            )
+            try:
+                await websocket.send_json(payload)
+            except Exception as exc:
+                _record_partial_delivery_boundary(
+                    "ws_send", public_stream_id, local_stream_id, payload,
+                    phase="post", outcome=f"error:{type(exc).__name__}",
+                )
+                raise
+            _record_partial_delivery_boundary(
+                "ws_send", public_stream_id, local_stream_id, payload,
+                phase="post", outcome="sent",
+            )
 
     async def enqueue_result(payload: dict[str, Any]) -> None:
         try:
@@ -454,6 +587,7 @@ async def _websocket_qwen(websocket: WebSocket, connection_id: str) -> None:
         settings=settings,
         connection_id=connection_id,
         event_sink=enqueue_result,
+        diagnostic_sink=_record_partial_delivery_boundary,
     )
 
     async def open_default_session(source: str) -> None:

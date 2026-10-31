@@ -368,11 +368,12 @@ test("Qwen live UI exposes replaceable partial revisions, chunk experiments and 
 test("real WebSocket handler accepts successor revision reset and fences late predecessor partials", () => {
   const slices = [
     ["function renderQwenPartials() {", "function renderSegments()"],
-    ["function onPartialTranscript(message) {", "function appendLifecycleRow"],
-    ["function onTranscript(message, candidateOnly = false) {", "function onSocketMessage(raw) {"],
+    ["function partialDeliveryFields(message) {", "function appendLifecycleRow"],
+    ["function onTranscript(message, candidateOnly = false) {", "function onSocketMessage(raw, frameTiming = null) {"],
     ["function captureQwenEpochEvidence(message) {", "function renderQwenLifecycle()"],
-    ["function onSocketMessage(raw) {", "function recordRttFailure"],
+    ["function onSocketMessage(raw, frameTiming = null) {", "function recordRttFailure"],
     ["function safeResult() {", "function download("],
+    ["function exportJson() {", "function exportCsv() {"],
   ].map(([startMarker, endMarker]) => {
     const start = appSource.indexOf(startMarker);
     const end = appSource.indexOf(endMarker, start + startMarker.length);
@@ -400,6 +401,9 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     lastPartialRevision: 0,
     lastPartialAt: null,
     streamEvents: [],
+    partialDeliveryDiagnostics: [],
+    partialDeliveryDiagnosticsHead: 0,
+    partialDeliveryDiagnosticsDropped: 0,
     segments: [],
     requestTimes: new Map(),
     clientEosAt: null,
@@ -427,8 +431,14 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     runtimeProvenance: null,
   };
   let now = 0;
+  const nativeJson = JSON;
   const context = {
     state,
+    JSON: {
+      parse(raw) { now += 100; return nativeJson.parse(raw); },
+      stringify: nativeJson.stringify,
+    },
+    partialDeliveryTextEncoder: new TextEncoder(),
     $: (id) => elements.get(id),
     document: { createElement: (tag) => ({ tag, children: [], append(...items) { this.children.push(...items); } }) },
     performance: { now: () => ++now },
@@ -474,7 +484,7 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     qwen_local_stream_id: localId,
     qwen_epoch_observability: epochSnapshot(localId, epochSeq),
   }));
-  const partialMessage = (localId, epochSeq, revision, text) => context.onSocketMessage(JSON.stringify({
+  const partialMessage = (localId, epochSeq, revision, text, frameTiming = null) => context.onSocketMessage(JSON.stringify({
     event: "partial_candidate",
     stream_id: "public-stream-1",
     qwen_local_stream_id: localId,
@@ -498,7 +508,7 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
     stitch_empty_epoch_count: epochSeq > 0 ? epochSeq : null,
     revision,
     text,
-  }));
+  }), frameTiming);
 
   partialMessage("local-predecessor", 0, 1, "predecessor-one");
   partialMessage("local-predecessor", 0, 2, "predecessor-two");
@@ -507,7 +517,10 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
   partialMessage("local-successor", 1, 1, "successor-duplicate");
   partialMessage("local-successor", 1, 0, "successor-old");
   partialMessage("local-predecessor", 0, 99, "late-predecessor");
-  partialMessage("local-successor", 1, 2, "successor-two");
+  partialMessage("local-successor", 1, 2, "successor-two", {
+    message_event_monotonic_timestamp_ms: 0.5,
+    message_event_utc_timestamp: "2026-10-30T00:00:00.500Z",
+  });
   context.onSocketMessage(JSON.stringify({
     event: "final_candidate", stream_id: "public-stream-1", qwen_local_stream_id: "local-successor",
     qwen_epoch_observability: epochSnapshot("local-successor", 1), truth_status: "candidate_only",
@@ -550,6 +563,24 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
   assert.equal(exported.summary.QWEN_LOCAL_SESSION_AUDIO_DURATION_MS, 1250);
   assert.equal(finalRow.AUDIO_DURATION_MS, 1250);
 
+  context.exportJson();
+  const exportedJson = JSON.parse(context.downloaded[1]);
+  const boundaryRows = exportedJson.streaming.partial_delivery_diagnostics.events
+    .filter((row) => row.partial_id === "public-stream-1/1/2");
+  assert.deepEqual(boundaryRows.map((row) => row.boundary), [
+    "browser_message_event",
+    "browser_onmessage_parsed",
+    "stream_events_append",
+    "export_json",
+  ]);
+  assert.equal(boundaryRows[0].monotonic_timestamp_ms, 0.5);
+  assert.equal(boundaryRows[0].utc_timestamp, "2026-10-30T00:00:00.500Z");
+  assert.ok(boundaryRows[1].monotonic_timestamp_ms >= 100);
+  assert.ok(boundaryRows.every((row) => row.text_utf8_bytes === new TextEncoder().encode("successor-two").length));
+  assert.ok(boundaryRows.every((row) => row.text_hash_fnv1a32 === boundaryRows[0].text_hash_fnv1a32));
+  assert.ok(boundaryRows.every((row) => !Object.hasOwn(row, "text")));
+  assert.equal(exportedJson.streaming.partials.some((item) => item.text === "successor-two"), true);
+
   const csvStart = appSource.indexOf("function exportCsv() {");
   const csvEnd = appSource.indexOf('$("start-button")', csvStart);
   assert.ok(csvStart >= 0 && csvEnd > csvStart, "CSV exporter source boundary exists");
@@ -564,6 +595,22 @@ test("real WebSocket handler accepts successor revision reset and fences late pr
   assert.equal(finalCells[headerCells.indexOf("stitch_raw_current_text")], "to book");
   assert.equal(finalCells[headerCells.indexOf("stitch_anchor_continuity")], "verified_empty_epochs");
   assert.equal(finalCells[headerCells.indexOf("QWEN_LOCAL_SESSION_AUDIO_DURATION_MS")], "1250");
+
+  state.partialDeliveryDiagnostics = [];
+  state.partialDeliveryDiagnosticsHead = 0;
+  state.partialDeliveryDiagnosticsDropped = 0;
+  for (let index = 0; index <= 8192; index += 1) {
+    context.recordPartialDeliveryBoundary("bounded_test", { partial_id: `partial-${index}` });
+  }
+  assert.equal(state.partialDeliveryDiagnostics.length, 8192);
+  assert.equal(state.partialDeliveryDiagnosticsHead, 1);
+  assert.equal(state.partialDeliveryDiagnosticsDropped, 1);
+  const orderedDiagnostics = [
+    ...state.partialDeliveryDiagnostics.slice(state.partialDeliveryDiagnosticsHead),
+    ...state.partialDeliveryDiagnostics.slice(0, state.partialDeliveryDiagnosticsHead),
+  ];
+  assert.equal(orderedDiagnostics[0].partial_id, "partial-1");
+  assert.equal(orderedDiagnostics.at(-1).partial_id, "partial-8192");
 
   state.backend = "faster_whisper";
   const nonQwen = context.safeResult();

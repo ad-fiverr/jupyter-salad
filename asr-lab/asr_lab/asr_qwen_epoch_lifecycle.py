@@ -39,6 +39,7 @@ from .asr_epoch_rollover_policy import (
 from .qwen_streaming import (
     QwenStreamingRuntime,
     StreamingError,
+    _candidate_diagnostic_payload,
     validate_candidate_event,
 )
 
@@ -72,6 +73,9 @@ class QwenEpochLifecycleSnapshot:
 CandidateEventSink = Callable[[dict[str, Any]], Awaitable[None]]
 CandidateObserver = Callable[[ExecutionFence, dict[str, Any]], None]
 StaleRejectObserver = Callable[[str], None]
+RuntimeDiagnosticObserver = Callable[
+    [str, ExecutionFence | None, str | None, dict[str, Any]], None
+]
 
 
 @dataclass
@@ -86,7 +90,59 @@ class _QwenCandidateFenceBinding:
     base: CandidateBase | None = None
     candidate_observer: CandidateObserver | None = None
     stale_reject_observer: StaleRejectObserver | None = None
+    diagnostic_observer: RuntimeDiagnosticObserver | None = None
     stream_id: str | None = None
+
+    def observe_runtime_diagnostic(self, boundary: str, payload: dict[str, Any]) -> None:
+        self._observe_diagnostic(boundary, payload)
+
+    def _observe_diagnostic(
+        self,
+        boundary: str,
+        candidate: dict[str, Any],
+        *,
+        outcome: str | None = None,
+        diagnostic_code: str | None = None,
+    ) -> None:
+        observer = self.diagnostic_observer
+        if observer is None:
+            return
+        if boundary == "decode_push_result":
+            diagnostic = {
+                key: candidate[key]
+                for key in (
+                    "qwen_local_stream_id", "cursor_end_samples", "cursor_ms",
+                    "decode_steps_delta", "revision_previous", "revision_new",
+                    "outcome", "text_utf8_bytes", "text_hash_fnv1a32", "language",
+                )
+                if key in candidate
+            }
+        else:
+            diagnostic = _candidate_diagnostic_payload(candidate)
+            if boundary == "canonical_filter":
+                diagnostic_outcome = candidate.get("diagnostic_outcome")
+                candidate_diagnostic_code = candidate.get("diagnostic_code")
+                if isinstance(diagnostic_outcome, str):
+                    diagnostic["diagnostic_outcome"] = diagnostic_outcome
+                if isinstance(candidate_diagnostic_code, str):
+                    diagnostic["diagnostic_code"] = candidate_diagnostic_code[:120]
+        fence = self._fence
+        if fence is not None:
+            diagnostic.update({
+                "asr_job_id": fence.asr_job_id,
+                "speech_segment_id": fence.speech_segment_id,
+                "epoch_id": fence.epoch_id,
+                "epoch_seq": fence.epoch_seq,
+            })
+        if outcome is not None:
+            diagnostic["diagnostic_outcome"] = outcome
+        if diagnostic_code is not None:
+            diagnostic["diagnostic_code"] = diagnostic_code[:120]
+        try:
+            observer(boundary, fence, self.stream_id, diagnostic)
+        except Exception:
+            # Diagnostic collection must never change candidate admission.
+            pass
 
     def __post_init__(self) -> None:
         if self._fence is not None:
@@ -101,15 +157,31 @@ class _QwenCandidateFenceBinding:
     def filter_candidate(self, candidate: dict[str, Any]) -> dict[str, Any] | None:
         fence = self._fence
         if fence is None:
+            self._observe_diagnostic(
+                "canonical_filter", candidate, outcome="unbound_fence",
+            )
             return None
         try:
-            if self.epoch_controller.classify(fence) is not FenceOutcome.ACCEPT:
+            fence_outcome = self.epoch_controller.classify(fence)
+            if fence_outcome is not FenceOutcome.ACCEPT:
                 if self.stale_reject_observer is not None:
                     self.stale_reject_observer(self.stream_id or "")
+                self._observe_diagnostic(
+                    "canonical_filter",
+                    candidate,
+                    outcome="stale_fence" if fence_outcome is FenceOutcome.STALE else "invalid_scope",
+                )
                 return None
-        except Exception:
+        except Exception as exc:
             if self.stale_reject_observer is not None:
                 self.stale_reject_observer(self.stream_id or "")
+            error_code = getattr(exc, "code", None)
+            self._observe_diagnostic(
+                "canonical_filter",
+                candidate,
+                outcome="classify_error",
+                diagnostic_code=error_code if isinstance(error_code, str) else type(exc).__name__,
+            )
             return None
         accepted = dict(candidate)
         accepted.update({
@@ -120,10 +192,18 @@ class _QwenCandidateFenceBinding:
         })
         event = accepted.get("event")
         if not isinstance(event, str):
+            self._observe_diagnostic(
+                "canonical_filter", candidate, outcome="invalid_candidate",
+                diagnostic_code="event_missing_or_invalid",
+            )
             return None
         try:
             validate_candidate_event(accepted, event)
-        except StreamingError:
+        except StreamingError as exc:
+            self._observe_diagnostic(
+                "canonical_filter", candidate, outcome="invalid_candidate",
+                diagnostic_code=exc.code,
+            )
             return None
         reconciled = self.candidate_stitcher.reconcile(
             accepted,
@@ -131,6 +211,13 @@ class _QwenCandidateFenceBinding:
         )
         if reconciled is not None and self.candidate_observer is not None:
             self.candidate_observer(fence, reconciled)
+        if reconciled is None:
+            self._observe_diagnostic(
+                "canonical_filter",
+                candidate,
+                outcome="stitch_rejected",
+                diagnostic_code=self.candidate_stitcher.snapshot().last_rejection_reason,
+            )
         return reconciled
 
 
@@ -166,6 +253,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
         chunk_size_ms: int | None = None,
         request_id: str | None = None,
         event_sink: CandidateEventSink | None = None,
+        diagnostic_observer: RuntimeDiagnosticObserver | None = None,
         soft_rollover_policy: SoftRolloverPolicy | None = None,
         observability: ASREpochObservability | None = None,
         monotonic: Callable[[], float] = time.monotonic,
@@ -193,6 +281,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
         self.chunk_size_ms = chunk_size_ms
         self.request_id = request_id
         self.event_sink = event_sink
+        self.diagnostic_observer = diagnostic_observer
         if not callable(monotonic):
             raise QwenEpochLifecycleError("invalid_monotonic_clock")
         self._clock = monotonic
@@ -809,6 +898,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
             base=candidate_base,
             candidate_observer=self._observe_candidate,
             stale_reject_observer=self._observe_stale_candidate,
+            diagnostic_observer=self.diagnostic_observer,
         )
         if candidate_fence is not None:
             candidate_binding.bind(candidate_fence)
@@ -821,6 +911,7 @@ class QwenEpochLifecycle(PCMAdmissionSink):
             request_id=self.request_id,
             event_sink=self.event_sink,
             candidate_result_filter=candidate_binding.filter_candidate,
+            runtime_diagnostic_observer=candidate_binding.observe_runtime_diagnostic,
             processed_audio_observer=self._observe_processed,
             local_stale_reject_observer=self._observe_local_stale_reject,
         )

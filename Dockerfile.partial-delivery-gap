@@ -1,0 +1,7 @@
+FROM myblockchaincompany/jupyter-salad:private-tailscale-9125118440141e0e22796423b38c062565ccff7d@sha256:ea3df64f62cb5fdce643bb7a7fd175696f51ee04c9c61522f18d51aa783cb63b
+
+COPY asr-lab/asr_lab/asr_service_lifecycle.py /opt/asr-lab/asr_lab/asr_service_lifecycle.py
+COPY asr-lab/asr_lab/asr_qwen_epoch_lifecycle.py /opt/asr-lab/asr_lab/asr_qwen_epoch_lifecycle.py
+COPY asr-lab/asr_lab/qwen_streaming.py /opt/asr-lab/asr_lab/qwen_streaming.py
+COPY asr-lab/asr_lab/service.py /opt/asr-lab/asr_lab/service.py
+COPY asr-lab/asr_lab/benchmark_web/app.mjs /opt/asr-lab/asr_lab/benchmark_web/app.mjs

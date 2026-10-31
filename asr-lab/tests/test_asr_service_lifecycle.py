@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 
 from asr_lab.asr_service_lifecycle import QwenServiceLifecycleRegistry
@@ -67,6 +68,7 @@ class QwenServiceLifecycleRegistryTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.runtime.start()
         self.events: list[dict[str, object]] = []
+        self.partial_diagnostics: list[dict[str, object]] = []
         self.settings = Settings.from_env({
             "ASR_BACKEND": "parakeet",
             "ASR_API_TOKEN": "t" * 32,
@@ -76,11 +78,30 @@ class QwenServiceLifecycleRegistryTests(unittest.IsolatedAsyncioTestCase):
         async def collect_event(event: dict[str, object]) -> None:
             self.events.append(dict(event))
 
+        def collect_partial_diagnostic(boundary, public_stream_id, local_stream_id, candidate):
+            self.partial_diagnostics.append({
+                "boundary": boundary,
+                "stream_id": public_stream_id,
+                "qwen_local_stream_id": local_stream_id,
+                "epoch_seq": candidate.get("epoch_seq"),
+                "revision": candidate.get("revision", candidate.get("revision_new")),
+                "partial_id": candidate.get("partial_id"),
+                "decode_outcome": candidate.get("outcome"),
+                "filter_outcome": candidate.get("diagnostic_outcome"),
+                "cursor_end_samples": candidate.get("cursor_end_samples"),
+                "decode_steps_delta": candidate.get("decode_steps_delta"),
+                "revision_previous": candidate.get("revision_previous"),
+                "revision_new": candidate.get("revision_new"),
+                "diagnostic_payload": dict(candidate),
+                "has_text": "text" in candidate,
+            })
+
         self.registry = QwenServiceLifecycleRegistry(
             runtime=self.runtime,
             settings=self.settings,
             connection_id="connection-test",
             event_sink=collect_event,
+            diagnostic_sink=collect_partial_diagnostic,
         )
 
     async def asyncTearDown(self) -> None:
@@ -200,6 +221,88 @@ class QwenServiceLifecycleRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final["qwen_epoch_observability"]["logical_cumulative"]["EPOCH_ROLLOVER_COUNT"], 2)
         self.assertEqual(sum(operation == "finish" for operation, _ in self.worker.requests), 1)
         self.assertFalse(self.registry.has_active_source("mic"))
+
+    async def test_partial_diagnostic_identity_stays_public_across_epoch_rollover(self):
+        self.runtime.max_stream_seconds = 2.0
+        started = await self.registry.open_default_source("mic")
+        assert started is not None
+        public_stream_id = started["stream_id"]
+        first_local_id = started["qwen_local_stream_id"]
+        stitched_text_sentinel = "STITCHED_TRANSCRIPT_SENTINEL_DO_NOT_LOG"
+        self.worker.streams[first_local_id]["text"] = stitched_text_sentinel
+
+        pcm = b"\x11\x00" * 4_000
+        await self.registry.submit_pcm(source="mic", pcm16le=pcm)
+        await self.wait_until(lambda: len(self.events) >= 1, "epoch 0 partial candidate missing")
+        self.assertTrue((await self.registry.rollover_source("mic")).completed)
+        second_local_id = self.registry._sources["mic"].lifecycle.local_stream_id
+        await self.registry.submit_pcm(source="mic", pcm16le=pcm)
+        await self.wait_until(lambda: len(self.events) >= 2, "epoch 1 partial candidate missing")
+
+        decode_records = [row for row in self.partial_diagnostics if row["boundary"] == "decode_push_result"]
+        runtime_records = [row for row in self.partial_diagnostics if row["boundary"] == "runtime_candidate"]
+        filter_records = [row for row in self.partial_diagnostics if row["boundary"] == "canonical_filter"]
+        server_records = [row for row in self.partial_diagnostics if row["boundary"] == "server_event"]
+        self.assertEqual(len(decode_records), 2)
+        self.assertEqual(len(runtime_records), 2)
+        self.assertEqual(len(filter_records), 2)
+        self.assertEqual(len(server_records), 2)
+        self.assertEqual(
+            {row["stream_id"] for row in decode_records + runtime_records + filter_records + server_records},
+            {public_stream_id},
+        )
+        self.assertEqual({row["qwen_local_stream_id"] for row in runtime_records}, {first_local_id, second_local_id})
+        self.assertEqual(
+            [(row["epoch_seq"], row["revision"]) for row in runtime_records],
+            [(0, 1), (1, 1)],
+        )
+        self.assertEqual(
+            [(row["epoch_seq"], row["revision"]) for row in server_records],
+            [(0, 1), (1, 1)],
+        )
+        self.assertEqual(
+            [(row["stream_id"], row["epoch_seq"], row["revision"]) for row in runtime_records],
+            [(row["stream_id"], row["epoch_seq"], row["revision"]) for row in server_records],
+        )
+        self.assertEqual(
+            [(row["epoch_seq"], row["revision"], row["decode_outcome"]) for row in decode_records],
+            [(0, 1, "changed_text_candidate"), (1, 1, "changed_text_candidate")],
+        )
+        self.assertEqual([row["filter_outcome"] for row in filter_records], ["accepted", "accepted"])
+        self.assertEqual(
+            [row["partial_id"] for row in decode_records],
+            [row["partial_id"] for row in runtime_records],
+        )
+        self.assertFalse(any(row["has_text"] for row in decode_records + runtime_records + filter_records + server_records))
+        self.assertEqual(self.events[0]["stitch_raw_current_text"], stitched_text_sentinel)
+        canonical_diagnostics = [row for row in filter_records if row["filter_outcome"] == "accepted"]
+        self.assertEqual(len(canonical_diagnostics), 2)
+        diagnostic_json = json.dumps(self.partial_diagnostics)
+        self.assertNotIn("stitch_raw_current_text", diagnostic_json)
+        self.assertNotIn(stitched_text_sentinel, diagnostic_json)
+
+    async def test_unchanged_decode_has_no_candidate_identity_after_lifecycle_binding(self):
+        self.runtime.max_stream_seconds = 2.0
+        started = await self.registry.open_default_source("mic")
+        assert started is not None
+        public_stream_id = started["stream_id"]
+        pcm = b"\x12\x00" * 4_000
+
+        await self.registry.submit_pcm(source="mic", pcm16le=pcm)
+        await self.wait_until(lambda: len(self.events) == 1, "first candidate missing")
+        await self.registry.submit_pcm(source="mic", pcm16le=pcm)
+        await self.wait_until(
+            lambda: len([row for row in self.partial_diagnostics if row["boundary"] == "decode_push_result"]) == 2,
+            "unchanged decode opportunity missing",
+        )
+
+        decode_records = [row for row in self.partial_diagnostics if row["boundary"] == "decode_push_result"]
+        self.assertEqual(
+            [(row["decode_outcome"], row["revision_previous"], row["revision_new"]) for row in decode_records],
+            [("changed_text_candidate", 0, 1), ("unchanged_text", 1, 1)],
+        )
+        self.assertEqual(decode_records[0]["partial_id"], f"{public_stream_id}/0/1")
+        self.assertIsNone(decode_records[1]["partial_id"])
 
     async def test_100ms_ingress_crosses_three_rollovers_with_pcm_and_identity_continuity(self):
         self.runtime.max_stream_seconds = 0.25

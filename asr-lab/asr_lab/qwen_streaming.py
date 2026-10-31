@@ -42,6 +42,52 @@ class WorkerRPC(Protocol):
 ProcessedAudioObserver = Callable[[str, int], None]
 CandidateResultFilter = Callable[[dict[str, Any]], dict[str, Any] | None]
 LocalStaleRejectObserver = Callable[[str, str], None]
+RuntimeDiagnosticObserver = Callable[[str, dict[str, Any]], None]
+
+
+def _candidate_text_fingerprint(text: str) -> dict[str, Any]:
+    encoded = text.encode("utf-8", errors="replace")
+    value = 0x811C9DC5
+    for byte in encoded:
+        value = ((value ^ byte) * 0x01000193) & 0xFFFFFFFF
+    return {
+        "text_utf8_bytes": len(encoded),
+        "text_hash_fnv1a32": f"{value:08x}",
+    }
+
+
+def _candidate_diagnostic_payload(candidate: dict[str, Any]) -> dict[str, Any]:
+    diagnostic = {
+        key: candidate[key]
+        for key in (
+            "event", "stream_id", "qwen_local_stream_id", "epoch_seq", "partial_id",
+            "revision", "audio_cursor_ms", "language",
+        )
+        if key in candidate
+    }
+    text = candidate.get("text")
+    if isinstance(text, str):
+        diagnostic.update(_candidate_text_fingerprint(text))
+    return diagnostic
+
+
+def _observe_runtime_diagnostic(
+    observer: RuntimeDiagnosticObserver | None,
+    boundary: str,
+    payload: dict[str, Any],
+    *,
+    outcome: str | None = None,
+) -> None:
+    if observer is None:
+        return
+    try:
+        diagnostic = payload if outcome is None else {
+            **payload, "diagnostic_outcome": outcome,
+        }
+        observer(boundary, diagnostic)
+    except Exception:
+        # Diagnostic failure must not change ASR filtering or delivery.
+        pass
 
 
 class StreamingError(RuntimeError):
@@ -81,6 +127,7 @@ class StreamSession:
     max_stream_seconds: float
     event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None
     candidate_result_filter: CandidateResultFilter | None = None
+    runtime_diagnostic_observer: RuntimeDiagnosticObserver | None = None
     processed_audio_observer: ProcessedAudioObserver | None = None
     event_queue: asyncio.Queue[dict[str, Any]] = dataclass_field(default_factory=lambda: asyncio.Queue(maxsize=32))
     first_audio_at: float | None = None
@@ -250,6 +297,7 @@ class QwenStreamingRuntime:
         request_id: str | None = None,
         event_sink: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         candidate_result_filter: CandidateResultFilter | None = None,
+        runtime_diagnostic_observer: RuntimeDiagnosticObserver | None = None,
         processed_audio_observer: ProcessedAudioObserver | None = None,
         local_stale_reject_observer: LocalStaleRejectObserver | None = None,
     ) -> dict[str, Any]:
@@ -318,6 +366,7 @@ class QwenStreamingRuntime:
                 max_stream_seconds=self.max_stream_seconds,
                 event_sink=event_sink,
                 candidate_result_filter=candidate_result_filter,
+                runtime_diagnostic_observer=runtime_diagnostic_observer,
                 processed_audio_observer=processed_audio_observer,
                 stream_init_ms=(init_finished - init_started) * 1000.0,
                 stream_state_init_wall_ms=float(state_init_ms) if isinstance(state_init_ms, (int, float)) and not isinstance(state_init_ms, bool) else None,
@@ -434,6 +483,31 @@ class QwenStreamingRuntime:
             raise StreamingError("invalid_worker_response")
         if job.kind == "push" and session.processed_audio_observer is not None:
             session.processed_audio_observer(session.stream_id, job.cursor_end_samples)
+        if job.kind == "push":
+            previous_revision = session.revision
+            outcome = (
+                "empty_text" if not text.strip()
+                else "unchanged_text" if text == session.current_text
+                else "changed_text_candidate"
+            )
+            _observe_runtime_diagnostic(
+                session.runtime_diagnostic_observer,
+                "decode_push_result",
+                {
+                    "qwen_local_stream_id": session.stream_id,
+                    "cursor_end_samples": job.cursor_end_samples,
+                    "cursor_ms": job.cursor_end_samples * 1000.0 / 16_000,
+                    "decode_steps_delta": step_delta,
+                    "revision_previous": previous_revision,
+                    "revision_new": (
+                        previous_revision + 1
+                        if outcome == "changed_text_candidate" else previous_revision
+                    ),
+                    "outcome": outcome,
+                    **_candidate_text_fingerprint(text),
+                    "language": reply.get("language") if isinstance(reply.get("language"), str) else session.current_language,
+                },
+            )
         if not text.strip() or text == session.current_text:
             return None
 
@@ -514,6 +588,11 @@ class QwenStreamingRuntime:
             "ACTIVE_STREAM_COUNT": self.scheduler.active_stream_count,
             "DECODE_OVERRUN": bool(metrics.get("decode_overrun", False)),
         }
+        _observe_runtime_diagnostic(
+            session.runtime_diagnostic_observer,
+            "runtime_candidate",
+            _candidate_diagnostic_payload(event),
+        )
         event = self._filter_candidate_result(session, event, "partial_candidate")
         if event is None:
             return None
@@ -654,12 +733,27 @@ class QwenStreamingRuntime:
         """Apply an optional canonical gate after local freshness succeeds."""
         result_filter = session.candidate_result_filter
         if result_filter is None:
+            if expected_event == "partial_candidate":
+                _observe_runtime_diagnostic(
+                    session.runtime_diagnostic_observer,
+                    "canonical_filter",
+                    _candidate_diagnostic_payload(event),
+                    outcome="accepted",
+                )
             return event
         try:
             filtered = result_filter(event)
             if filtered is None or not isinstance(filtered, dict):
                 return None
-            return validate_candidate_event(filtered, expected_event)
+            accepted = validate_candidate_event(filtered, expected_event)
+            if expected_event == "partial_candidate":
+                _observe_runtime_diagnostic(
+                    session.runtime_diagnostic_observer,
+                    "canonical_filter",
+                    _candidate_diagnostic_payload(accepted),
+                    outcome="accepted",
+                )
+            return accepted
         except Exception:
             # A configured result gate is fail-closed: its failure cannot
             # allow an unverified candidate to reach a sink or caller.

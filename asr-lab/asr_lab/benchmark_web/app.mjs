@@ -5,6 +5,7 @@ import {
 } from "/asr/benchmark/core.mjs";
 
 const $ = (id) => document.getElementById(id);
+const partialDeliveryTextEncoder = new TextEncoder();
 const state = {
   token: null,
   ws: null,
@@ -49,6 +50,9 @@ const state = {
   streamStartRequestId: null,
   streamStartResolver: null,
   streamEvents: [],
+  partialDeliveryDiagnostics: [],
+  partialDeliveryDiagnosticsHead: 0,
+  partialDeliveryDiagnosticsDropped: 0,
   qwenPublicStreamId: null,
   qwenLocalStreamId: null,
   qwenEpochObservability: null,
@@ -458,7 +462,53 @@ async function pollTelemetry() {
   }
 }
 
-function onPartialTranscript(message) {
+function partialDeliveryFields(message) {
+  const streamId = typeof message.public_stream_id === "string"
+    ? message.public_stream_id
+    : typeof message.stream_id === "string" ? message.stream_id : null;
+  const epochSeq = Number.isInteger(message.epoch_seq) ? message.epoch_seq : null;
+  const revision = Number.isInteger(message.revision) ? message.revision : null;
+  const text = typeof message.text === "string" ? message.text : "";
+  const bytes = partialDeliveryTextEncoder.encode(text);
+  let hash = 0x811c9dc5;
+  for (const byte of bytes) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+  return {
+    partial_id: streamId !== null && epochSeq !== null && revision !== null
+      ? `${streamId}/${epochSeq}/${revision}`
+      : null,
+    stream_id: streamId,
+    qwen_local_stream_id: typeof message.qwen_local_stream_id === "string"
+      ? message.qwen_local_stream_id : null,
+    epoch_seq: epochSeq,
+    revision,
+    text_utf8_bytes: bytes.length,
+    text_hash_fnv1a32: hash.toString(16).padStart(8, "0"),
+    language: typeof message.language === "string" ? message.language : null,
+  };
+}
+
+function recordPartialDeliveryBoundary(boundary, fields, timing = null) {
+  const monotonicTimestampMs = timing?.monotonic_timestamp_ms ?? performance.now();
+  const utcTimestamp = timing?.utc_timestamp
+    ?? (Number.isFinite(performance.timeOrigin)
+      ? new Date(performance.timeOrigin + monotonicTimestampMs).toISOString()
+      : new Date().toISOString());
+  const record = {
+    boundary,
+    ...fields,
+    utc_timestamp: utcTimestamp,
+    monotonic_timestamp_ms: monotonicTimestampMs,
+  };
+  if (state.partialDeliveryDiagnostics.length >= 8192) {
+    state.partialDeliveryDiagnostics[state.partialDeliveryDiagnosticsHead] = record;
+    state.partialDeliveryDiagnosticsHead = (state.partialDeliveryDiagnosticsHead + 1) % 8192;
+    state.partialDeliveryDiagnosticsDropped += 1;
+    return;
+  }
+  state.partialDeliveryDiagnostics.push(record);
+}
+
+function onPartialTranscript(message, partialFields = partialDeliveryFields(message)) {
   if (message.stream_id !== state.streamId || message.final !== false || message.replace !== true) return;
   const currentEpoch = state.qwenEpochObservability?.current_epoch ?? null;
   const producerLocalId = typeof message.qwen_local_stream_id === "string"
@@ -548,6 +598,7 @@ function onPartialTranscript(message) {
     truth_status: message.truth_status ?? "candidate_only",
   };
   state.streamEvents.push(item);
+  recordPartialDeliveryBoundary("stream_events_append", partialFields);
   if (state.streamEvents.length > 1000) state.streamEvents.shift();
   state.lastPartialRevision = message.revision;
   state.lastPartialAt = receivedAt;
@@ -771,9 +822,34 @@ function onTranscript(message, candidateOnly = false) {
   updateQwenSummary();
 }
 
-function onSocketMessage(raw) {
+function onSocketMessage(raw, frameTiming = null) {
+  const handlerEntryTiming = {
+    utc_timestamp: new Date().toISOString(),
+    monotonic_timestamp_ms: performance.now(),
+  };
   let message;
   try { message = JSON.parse(raw); } catch { state.errors.push("invalid_server_message"); updateSummary(); return; }
+  const parsedTiming = {
+    utc_timestamp: new Date().toISOString(),
+    monotonic_timestamp_ms: performance.now(),
+  };
+  let partialFields = null;
+  if (message.event === "partial_candidate") {
+    partialFields = partialDeliveryFields(message);
+    const eventTimestamp = frameTiming?.message_event_monotonic_timestamp_ms;
+    const eventUtc = Number.isFinite(eventTimestamp) && Number.isFinite(performance.timeOrigin)
+      ? new Date(performance.timeOrigin + eventTimestamp).toISOString()
+      : frameTiming?.message_event_utc_timestamp ?? handlerEntryTiming.utc_timestamp;
+    recordPartialDeliveryBoundary("browser_message_event", partialFields, {
+      utc_timestamp: eventUtc,
+      monotonic_timestamp_ms: Number.isFinite(eventTimestamp)
+        ? eventTimestamp : handlerEntryTiming.monotonic_timestamp_ms,
+    });
+    recordPartialDeliveryBoundary("browser_onmessage_parsed", partialFields, {
+      utc_timestamp: parsedTiming.utc_timestamp,
+      monotonic_timestamp_ms: parsedTiming.monotonic_timestamp_ms,
+    });
+  }
   captureQwenEpochEvidence(message);
   if (state.backend === "qwen3_asr" && (
     message.event === "partial_transcript" || message.event === "transcript" || message.type === "transcript"
@@ -822,7 +898,7 @@ function onSocketMessage(raw) {
   }
   if (message.event === "partial_candidate") {
     if (message.truth_status !== "candidate_only" || message.final !== false) return;
-    onPartialTranscript(message);
+    onPartialTranscript(message, partialFields);
     return;
   }
   if (message.event === "final_candidate") {
@@ -920,7 +996,11 @@ function openSocket(token) {
     const ws = new WebSocket(url.href);
     state.ws = ws;
     ws.onopen = () => { status($("ws-status"), "WebSocket", "conectado", "open"); resolve(ws); };
-    ws.onmessage = (event) => onSocketMessage(event.data);
+    ws.onmessage = (event) => onSocketMessage(event.data, {
+      message_event_monotonic_timestamp_ms: Number.isFinite(event.timeStamp)
+        ? event.timeStamp : performance.now(),
+      message_event_utc_timestamp: new Date().toISOString(),
+    });
     ws.onerror = () => { status($("ws-status"), "WebSocket", "error", "error"); };
     ws.onclose = (event) => {
       status($("ws-status"), "WebSocket", "cerrado", "closed");
@@ -1264,6 +1344,9 @@ function resetRun() {
   state.lastQwenLifecycleError = null;
   state.streamStartRequestId = null;
   state.streamEvents = [];
+  state.partialDeliveryDiagnostics = [];
+  state.partialDeliveryDiagnosticsHead = 0;
+  state.partialDeliveryDiagnosticsDropped = 0;
   state.lastPartialProducerKey = null;
   state.lastPartialRevision = 0;
   state.lastPartialAt = null;
@@ -1415,6 +1498,7 @@ function safeResult() {
       language: state.qwenLanguage,
       context_supplied: Boolean(state.qwenContext),
       partials: [...state.streamEvents],
+      partial_delivery_diagnostics: null,
       metrics: {
         partial_count: state.streamEvents.length,
         client_first_partial_ms: state.streamEvents[0]?.CLIENT_FIRST_PARTIAL_MS ?? null,
@@ -1553,6 +1637,41 @@ function download(filename, contents, type) {
 
 function exportJson() {
   const result = safeResult();
+  if (result.streaming) {
+    const exportId = `partial-export-${Date.now()}-${Math.floor(performance.now())}`;
+    const orderedDiagnostics = state.partialDeliveryDiagnosticsHead === 0
+      ? [...state.partialDeliveryDiagnostics]
+      : [
+        ...state.partialDeliveryDiagnostics.slice(state.partialDeliveryDiagnosticsHead),
+        ...state.partialDeliveryDiagnostics.slice(0, state.partialDeliveryDiagnosticsHead),
+      ];
+    const exportedPartials = result.streaming.partials.map((partial) => ({
+      boundary: "export_json",
+      ...partialDeliveryFields(partial),
+      utc_timestamp: new Date().toISOString(),
+      monotonic_timestamp_ms: performance.now(),
+      export_id: exportId,
+      outcome: "included",
+    }));
+    const exportedPartialIds = new Set(exportedPartials.map((partial) => partial.partial_id));
+    const omittedRetainedPartials = state.streamEvents
+      .filter((partial) => partial.event === "partial_candidate")
+      .map((partial) => partialDeliveryFields(partial))
+      .filter((fields) => fields.partial_id !== null && !exportedPartialIds.has(fields.partial_id))
+      .map((fields) => ({
+        boundary: "export_json",
+        ...fields,
+        utc_timestamp: new Date().toISOString(),
+        monotonic_timestamp_ms: performance.now(),
+        export_id: exportId,
+        outcome: "retained_partial_omitted_from_export_array",
+      }));
+    result.streaming.partial_delivery_diagnostics = {
+      schema_version: 1,
+      dropped_event_count: state.partialDeliveryDiagnosticsDropped,
+      events: [...orderedDiagnostics, ...exportedPartials, ...omittedRetainedPartials],
+    };
+  }
   download(`asr-benchmark-${new Date().toISOString().replaceAll(":", "-")}.json`, JSON.stringify(result, null, 2), "application/json");
 }
 

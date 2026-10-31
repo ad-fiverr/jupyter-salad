@@ -978,9 +978,140 @@ class QwenEpochLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 # the public same-lineage successor API cannot create (for
                 # example, a wrong job or speech segment).
                 controller._current = authoritative_current
-                binding = _QwenCandidateFenceBinding(controller, producer)
+                diagnostics = []
+                binding = _QwenCandidateFenceBinding(
+                    controller,
+                    producer,
+                    diagnostic_observer=lambda boundary, fence, stream_id, payload: diagnostics.append({
+                        "boundary": boundary,
+                        "fence": fence,
+                        "stream_id": stream_id,
+                        **payload,
+                    }),
+                )
                 self.assertIsNone(binding.filter_candidate(accepted_payload))
                 self.assertIs(expected, controller.classify(producer))
+                self.assertEqual(len(diagnostics), 1)
+                self.assertEqual(diagnostics[0]["boundary"], "canonical_filter")
+                self.assertEqual(
+                    diagnostics[0]["diagnostic_outcome"],
+                    "stale_fence" if expected is FenceOutcome.STALE else "invalid_scope",
+                )
+                self.assertNotIn("text", diagnostics[0])
+
+    def test_candidate_filter_diagnostics_report_invalid_and_stitch_rejection_without_text(self):
+        from asr_lab.asr_qwen_epoch_lifecycle import _QwenCandidateFenceBinding
+
+        fence = ExecutionFence("job-diagnostic", "epoch-diagnostic", 0, "segment-diagnostic")
+        controller = LocalAcousticEpochController(
+            asr_job_id="job-diagnostic",
+            speech_segment_id="segment-diagnostic",
+            initial_epoch_seq=0,
+            epoch_id_allocator=SequenceAllocator("next-epoch"),
+        )
+        controller._current = fence
+        diagnostics = []
+        binding = _QwenCandidateFenceBinding(
+            controller,
+            fence,
+            diagnostic_observer=lambda boundary, _fence, _stream_id, payload: diagnostics.append({
+                "boundary": boundary,
+                **payload,
+            }),
+        )
+        invalid = {
+            "event": "partial_candidate",
+            "candidate_only": True,
+            "truth_status": "not_candidate_only",
+            "provisional": True,
+            "final": False,
+            "text": "must not be retained",
+            "revision": 1,
+        }
+        self.assertIsNone(binding.filter_candidate(invalid))
+        self.assertEqual(diagnostics[-1]["diagnostic_outcome"], "invalid_candidate")
+        self.assertEqual(diagnostics[-1]["diagnostic_code"], "invalid_candidate_event")
+        self.assertNotIn("text", diagnostics[-1])
+
+        valid = {
+            "event": "partial_candidate",
+            "candidate_only": True,
+            "truth_status": "candidate_only",
+            "provisional": True,
+            "final": False,
+            "text": "must not be retained",
+            "revision": 1,
+        }
+
+        def reject_stitch(_candidate, *, trusted_fence):
+            self.assertEqual(trusted_fence, fence)
+            binding.candidate_stitcher._last_rejection_reason = "diagnostic_reject"
+            return None
+
+        binding.candidate_stitcher.reconcile = reject_stitch
+        self.assertIsNone(binding.filter_candidate(valid))
+        self.assertEqual(diagnostics[-1]["diagnostic_outcome"], "stitch_rejected")
+        self.assertEqual(diagnostics[-1]["diagnostic_code"], "diagnostic_reject")
+        self.assertNotIn("text", diagnostics[-1])
+
+    def test_candidate_filter_classify_error_is_content_free_and_fails_closed_when_observer_raises(self):
+        from unittest.mock import patch
+
+        from asr_lab.asr_epoch_controller import EpochControllerError
+        from asr_lab.asr_qwen_epoch_lifecycle import _QwenCandidateFenceBinding
+
+        fence = ExecutionFence("job-classify-error", "epoch-classify-error", 3, "segment-classify-error")
+        controller = LocalAcousticEpochController(
+            asr_job_id=fence.asr_job_id,
+            speech_segment_id=fence.speech_segment_id,
+            initial_epoch_seq=fence.epoch_seq,
+            epoch_id_allocator=SequenceAllocator("next-epoch"),
+        )
+        controller._current = fence
+        diagnostics = []
+
+        def diagnostic_observer(boundary, observed_fence, stream_id, payload):
+            diagnostics.append({
+                "boundary": boundary,
+                "fence": observed_fence,
+                "stream_id": stream_id,
+                **payload,
+            })
+            raise RuntimeError("diagnostic observer failure")
+
+        binding = _QwenCandidateFenceBinding(
+            controller,
+            fence,
+            diagnostic_observer=diagnostic_observer,
+        )
+        candidate = {
+            "event": "partial_candidate",
+            "candidate_only": True,
+            "truth_status": "candidate_only",
+            "provisional": True,
+            "final": False,
+            "text": "private transcript sentinel",
+            "revision": 9,
+            "stitch_raw_current_text": "private stitch sentinel",
+        }
+
+        with patch.object(
+            controller,
+            "classify",
+            side_effect=EpochControllerError("classify_test_failure"),
+        ) as classify:
+            self.assertIsNone(binding.filter_candidate(candidate))
+
+        classify.assert_called_once_with(fence)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0]["boundary"], "canonical_filter")
+        self.assertEqual(diagnostics[0]["diagnostic_outcome"], "classify_error")
+        self.assertEqual(diagnostics[0]["diagnostic_code"], "classify_test_failure")
+        self.assertEqual(diagnostics[0]["epoch_seq"], fence.epoch_seq)
+        self.assertNotIn("text", diagnostics[0])
+        self.assertNotIn("stitch_raw_current_text", diagnostics[0])
+        self.assertNotIn("private transcript sentinel", repr(diagnostics))
+        self.assertNotIn("private stitch sentinel", repr(diagnostics))
 
     async def test_locally_stale_final_is_not_rescued_by_current_canonical_fence(self):
         worker = CandidateLifecycleWorker()
